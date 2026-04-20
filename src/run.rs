@@ -10,6 +10,7 @@ use std::process::{Command, ExitStatus};
 use anyhow::{Context, Result};
 
 use crate::db::{warn_untracked_rs_files, Db};
+use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest run`. Returns the exit code to propagate.
@@ -22,16 +23,29 @@ pub fn run(diff_base: Option<&str>, all: bool, verbose: bool) -> Result<i32> {
         return run_tests(project_root, None);
     }
 
-    let db = Db::open(project_root)?;
-
     let changed_files = git_changed_files(project_root, diff_base)?;
-
-    warn_untracked_rs_files(&db, &changed_files)?;
-
     if changed_files.is_empty() {
         eprintln!("no changed files detected");
         return Ok(0);
     }
+
+    let env_fingerprint = fingerprint::compute(&project)?;
+    let db = Db::open(project_root)?;
+
+    let all_tests = db.test_count(&env_fingerprint)?;
+    if all_tests == 0 {
+        if db.has_any_coverage()? {
+            eprintln!(
+                "coverage database has no data for the current environment \
+                 (Cargo.lock, Cargo.toml, rustc version, or build flags changed) — running all tests"
+            );
+            return run_tests(project_root, None);
+        }
+        eprintln!("no coverage data yet — run `cargo difftest collect` first");
+        return Ok(0);
+    }
+
+    warn_untracked_rs_files(&db, &env_fingerprint, &changed_files)?;
 
     eprintln!("{} changed files:", changed_files.len());
     for f in &changed_files {
@@ -39,8 +53,7 @@ pub fn run(diff_base: Option<&str>, all: bool, verbose: bool) -> Result<i32> {
     }
 
     let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
-    let all_tests = db.test_count()?;
-    let tests = db.tests_covering(&file_refs)?;
+    let tests = db.tests_covering(&env_fingerprint, &file_refs)?;
 
     if tests.is_empty() {
         eprintln!("no tests cover the changed files (run `cargo difftest collect` to update)");

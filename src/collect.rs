@@ -32,6 +32,7 @@ use camino::Utf8PathBuf;
 
 use crate::coverage;
 use crate::db::{db_path, difftest_dir, Db};
+use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest collect`. Returns nextest's exit code.
@@ -90,6 +91,12 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     // Clean up any stray profraw files left in the project root by build scripts.
     clean_profraw_files(project_root)?;
 
+    // Compute env fingerprint *after* the build. The build resolves
+    // dependencies and writes Cargo.lock for projects that didn't have one;
+    // subsequent `status`/`run` invocations will see that lockfile, so the
+    // fingerprint must be computed against the post-build state to match.
+    let env_fingerprint = fingerprint::compute(&project)?;
+
     let build_info =
         parse_test_binaries(&String::from_utf8_lossy(&build_output.stdout), project_root)?;
     eprintln!("found {} test binaries", build_info.len());
@@ -118,7 +125,8 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
         Some(base) => {
             let all_tests = discover_tests(&build_info, project_root)?;
             eprintln!("found {} tests", all_tests.len());
-            let selected = select_tests_for_incremental(base, project_root, &all_tests)?;
+            let selected =
+                select_tests_for_incremental(base, project_root, &env_fingerprint, &all_tests)?;
             if selected.is_empty() {
                 eprintln!("no tests to re-collect");
                 return Ok(0);
@@ -214,11 +222,11 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     if diff_base.is_some() {
         eprintln!("updating {} test mappings in database...", mappings.len());
         let mut db = Db::open(project_root)?;
-        db.update_coverage(&mappings)?;
+        db.update_coverage(&env_fingerprint, &mappings)?;
     } else {
         eprintln!("storing {} test mappings in database...", mappings.len());
         let mut db = Db::open(project_root)?;
-        db.store_coverage(&mappings)?;
+        db.store_coverage(&env_fingerprint, &mappings)?;
     }
 
     eprintln!(
@@ -333,6 +341,7 @@ fn nextest_filter_expr(names: &[String]) -> String {
 fn select_tests_for_incremental(
     diff_base: &str,
     project_root: &Path,
+    fingerprint: &str,
     all_test_names: &[String],
 ) -> Result<Vec<String>> {
     let changed_files = git_changed_files(project_root, Some(diff_base))?;
@@ -353,8 +362,8 @@ fn select_tests_for_incremental(
 
     let db = Db::open(project_root)?;
     let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
-    let affected_tests = db.tests_covering(&file_refs)?;
-    let known_tests = db.all_test_names()?;
+    let affected_tests = db.tests_covering(fingerprint, &file_refs)?;
+    let known_tests = db.all_test_names(fingerprint)?;
 
     let new_tests: BTreeSet<&str> = all_test_names
         .iter()

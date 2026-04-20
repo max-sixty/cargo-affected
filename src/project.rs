@@ -10,6 +10,10 @@ pub struct ProjectRoot {
     /// Workspace root directory. Git operations and the DB live here.
     /// For single-crate projects this equals the crate root.
     pub workspace_root: PathBuf,
+    /// All Cargo.toml files belonging to the workspace — the root manifest
+    /// plus every member's manifest. Sorted, deduplicated. Used for
+    /// environment fingerprinting.
+    pub manifest_paths: Vec<PathBuf>,
 }
 
 /// Find the project root via `cargo metadata`.
@@ -32,8 +36,31 @@ pub fn find_project_root() -> Result<ProjectRoot> {
     let workspace_root = meta["workspace_root"]
         .as_str()
         .context("cargo metadata missing workspace_root")?;
+    let workspace_root = PathBuf::from(workspace_root);
+
+    let mut manifest_paths: Vec<PathBuf> = meta["packages"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("manifest_path").and_then(|m| m.as_str()))
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Virtual workspaces have a root Cargo.toml that isn't listed in `packages[]`,
+    // yet its `[workspace]` section controls which crates are in the workspace
+    // and its `[workspace.dependencies]`/`[workspace.package]` sections propagate
+    // to members — changes must invalidate the fingerprint. Push only if absent
+    // to keep single-crate projects (where it IS a package) from double-hashing.
+    let root_manifest = workspace_root.join("Cargo.toml");
+    if root_manifest.exists() && !manifest_paths.contains(&root_manifest) {
+        manifest_paths.push(root_manifest);
+    }
+    manifest_paths.sort();
+
     Ok(ProjectRoot {
-        workspace_root: PathBuf::from(workspace_root),
+        workspace_root,
+        manifest_paths,
     })
 }
 

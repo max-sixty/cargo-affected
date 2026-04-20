@@ -6,6 +6,7 @@
 mod collect;
 mod coverage;
 mod db;
+mod fingerprint;
 mod project;
 mod run;
 mod shim;
