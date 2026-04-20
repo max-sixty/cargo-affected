@@ -12,7 +12,7 @@ mod run;
 mod shim;
 mod status;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 /// Run only the tests affected by your changes.
@@ -70,20 +70,22 @@ enum Action {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Delete the target/difftest/coverage.db coverage database.
+    /// Clear stored coverage data from target/difftest/coverage.db.
     Clean,
 }
 
 fn clean() -> Result<()> {
     let project = project::find_project_root()?;
     let path = db::db_path(&project.workspace_root);
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("failed to delete {}", path.display()))?;
-        eprintln!("deleted {}", path.display());
-    } else {
+    if !path.exists() {
         eprintln!("no coverage database found");
+        return Ok(());
     }
+    // Clear via SQL rather than unlinking: the open + write lock waits out any
+    // concurrent `collect`, so we can't silently orphan a mid-flight commit.
+    let mut db = db::Db::open(&project.workspace_root)?;
+    db.clear()?;
+    eprintln!("cleared {}", path.display());
     Ok(())
 }
 

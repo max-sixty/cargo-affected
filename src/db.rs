@@ -14,10 +14,33 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
+
+/// How long to wait for a conflicting lock before giving up. Long enough to
+/// ride out a concurrent `collect`'s commit phase; short enough that a
+/// genuinely stuck process surfaces as an error rather than hanging forever.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Translate `SQLITE_BUSY` (which can only surface after `BUSY_TIMEOUT` has
+/// already been exhausted) into a message that points at the actual cause.
+/// Non-busy rusqlite errors pass through unchanged.
+fn translate_busy(err: rusqlite::Error, ctx: &'static str) -> anyhow::Error {
+    if matches!(
+        &err,
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseBusy
+    ) {
+        anyhow::anyhow!(
+            "another cargo-difftest process appears to be holding the \
+             database lock — try again in a moment"
+        )
+    } else {
+        anyhow::Error::from(err).context(ctx)
+    }
+}
 
 /// Umbrella directory for all difftest artifacts (DB, profraw files).
 /// Lives under `target/` so it shares the gitignore and lifecycle
@@ -63,9 +86,11 @@ impl Db {
         }
         let conn = Connection::open(&path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("failed to configure SQLite busy_timeout")?;
         migrate_pre_fingerprint_schema(&conn)?;
         conn.execute_batch(SCHEMA)
-            .context("failed to initialize database schema")?;
+            .map_err(|e| translate_busy(e, "failed to initialize database schema"))?;
         Ok(Self { conn })
     }
 
@@ -97,7 +122,8 @@ impl Db {
         }
 
         write_last_collected(&tx)?;
-        tx.commit().context("failed to commit coverage data")?;
+        tx.commit()
+            .map_err(|e| translate_busy(e, "failed to commit coverage data"))?;
         Ok(())
     }
 
@@ -214,7 +240,26 @@ impl Db {
         }
 
         write_last_collected(&tx)?;
-        tx.commit().context("failed to commit coverage update")?;
+        tx.commit()
+            .map_err(|e| translate_busy(e, "failed to commit coverage update"))?;
+        Ok(())
+    }
+
+    /// Remove all coverage data (every fingerprint) and reset the `meta` table.
+    ///
+    /// Used by `cargo difftest clean`. Going through SQL (rather than unlinking
+    /// the file) means we acquire the normal write lock — so a concurrent
+    /// `collect` finishes cleanly before its data is discarded, instead of
+    /// being orphaned onto an unlinked inode.
+    pub fn clear(&mut self) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| translate_busy(e, "failed to start clear transaction"))?;
+        tx.execute("DELETE FROM test_files", [])?;
+        tx.execute("DELETE FROM meta", [])?;
+        tx.commit()
+            .map_err(|e| translate_busy(e, "failed to commit clear"))?;
         Ok(())
     }
 
@@ -507,6 +552,34 @@ mod tests {
             names,
             BTreeSet::from(["test_a".to_string(), "test_b".to_string()])
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_wipes_all_fingerprints() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![(
+            "test_a".to_string(),
+            BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
+        )];
+        db.store_coverage(FP_A, &mappings)?;
+        db.store_coverage(FP_B, &mappings)?;
+        assert!(db.has_any_coverage()?);
+        assert!(db.last_collected()?.is_some());
+
+        db.clear()?;
+
+        assert!(!db.has_any_coverage()?);
+        assert_eq!(db.test_count(FP_A)?, 0);
+        assert_eq!(db.test_count(FP_B)?, 0);
+        assert!(db.last_collected()?.is_none());
+
+        // DB still usable afterwards.
+        db.store_coverage(FP_A, &mappings)?;
+        assert_eq!(db.test_count(FP_A)?, 1);
 
         Ok(())
     }
