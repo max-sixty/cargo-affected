@@ -20,7 +20,7 @@
 //! files back to test names in one batch run. Running tests ourselves lets us
 //! set `LLVM_PROFILE_FILE` per test and know the mapping trivially.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -82,9 +82,16 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
     clean_profraw_files(project_root)?;
 
     // Step 2: Extract test binary paths and crate root src_paths from the build output.
-    let build_info =
-        parse_test_binaries(&String::from_utf8_lossy(&build_output.stdout), project_root)?;
+    let parsed = parse_build_artifacts(&String::from_utf8_lossy(&build_output.stdout), project_root)?;
+    let build_info = parsed.test_binaries;
+    let bin_exes = parsed.bin_exes;
     eprintln!("found {} test binaries", build_info.len());
+    if !bin_exes.is_empty() {
+        eprintln!(
+            "bin targets (CARGO_BIN_EXE_*): {}",
+            bin_exes.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // Collect crate root files (lib.rs/main.rs) as implicit dependencies.
     let crate_roots: BTreeSet<Utf8PathBuf> = build_info
@@ -138,6 +145,14 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
         Mutex::new(test_entries.into_iter().enumerate().collect());
     let mappings: Mutex<Vec<(String, BTreeSet<Utf8PathBuf>)>> = Mutex::new(Vec::new());
 
+    let ctx = CollectContext {
+        profraw_base: &profraw_dir,
+        llvm_profdata: &llvm_profdata,
+        llvm_cov: &llvm_cov,
+        project_root,
+        bin_exes: &bin_exes,
+    };
+
     std::thread::scope(|s| {
         for _ in 0..num_workers {
             s.spawn(|| loop {
@@ -145,15 +160,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
                     break;
                 };
                 let test_start = Instant::now();
-                let outcome = collect_one_test(
-                    idx,
-                    &test_name,
-                    &binary,
-                    &profraw_dir,
-                    &llvm_profdata,
-                    &llvm_cov,
-                    project_root,
-                );
+                let outcome = collect_one_test(&ctx, idx, &test_name, &binary);
                 let elapsed = test_start.elapsed().as_secs_f64();
                 // Hold the progress lock across increment + eprintln so the
                 // rendered sequence matches the counter.
@@ -228,36 +235,48 @@ enum CollectOutcome {
     Skipped(String),
 }
 
+/// Shared, read-only inputs reused for every test collection.
+struct CollectContext<'a> {
+    profraw_base: &'a Path,
+    llvm_profdata: &'a Path,
+    llvm_cov: &'a Path,
+    project_root: &'a Path,
+    bin_exes: &'a BTreeMap<String, PathBuf>,
+}
+
 /// Run one test and extract its coverage.
 ///
 /// Uses a per-test subdirectory `<profraw_base>/test-<idx>/` to isolate profraw
 /// files from concurrently-running tests. The `%p-%m.profraw` pattern lets
 /// subprocesses of the test emit distinct files.
 fn collect_one_test(
+    ctx: &CollectContext<'_>,
     idx: usize,
     test_name: &str,
     binary: &Path,
-    profraw_base: &Path,
-    llvm_profdata: &Path,
-    llvm_cov: &Path,
-    project_root: &Path,
 ) -> Result<CollectOutcome> {
-    let test_dir = profraw_base.join(format!("test-{idx}"));
+    let test_dir = ctx.profraw_base.join(format!("test-{idx}"));
     std::fs::create_dir_all(&test_dir).context("creating per-test profraw dir")?;
 
     let profraw_pattern = test_dir.join("%p-%m.profraw");
     let profdata_path = test_dir.join("coverage.profdata");
 
-    let status = Command::new(binary)
-        .arg("--exact")
+    let mut cmd = Command::new(binary);
+    cmd.arg("--exact")
         .arg(test_name)
         .arg("--nocapture")
         .env("LLVM_PROFILE_FILE", &profraw_pattern)
-        .current_dir(project_root)
+        .current_dir(ctx.project_root)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("failed to run test binary")?;
+        .stderr(std::process::Stdio::null());
+    // Integration tests commonly invoke workspace binaries as subprocesses via
+    // `env!("CARGO_BIN_EXE_<name>")` or `env::var("CARGO_BIN_EXE_<name>")`.
+    // cargo sets these when it runs tests; we're invoking the test binary
+    // directly, so we set them ourselves.
+    for (name, path) in ctx.bin_exes {
+        cmd.env(format!("CARGO_BIN_EXE_{name}"), path);
+    }
+    let status = cmd.status().context("failed to run test binary")?;
 
     let code = status.code();
 
@@ -266,7 +285,7 @@ fn collect_one_test(
         return Ok(CollectOutcome::Skipped("no profraw generated".into()));
     }
 
-    let mut merge_cmd = Command::new(llvm_profdata);
+    let mut merge_cmd = Command::new(ctx.llvm_profdata);
     merge_cmd.arg("merge").arg("--sparse");
     for f in &profraw_files {
         merge_cmd.arg(f);
@@ -282,7 +301,7 @@ fn collect_one_test(
         )));
     }
 
-    let export_output = Command::new(llvm_cov)
+    let export_output = Command::new(ctx.llvm_cov)
         .arg("export")
         .arg("--format=text")
         .arg(format!("--instr-profile={}", profdata_path.display()))
@@ -297,7 +316,7 @@ fn collect_one_test(
     }
 
     let json = String::from_utf8_lossy(&export_output.stdout);
-    match coverage::extract_covered_files(&json, project_root) {
+    match coverage::extract_covered_files(&json, ctx.project_root) {
         Ok(files) => Ok(CollectOutcome::Collected { files, code }),
         Err(e) => Ok(CollectOutcome::Skipped(format!("parse error: {e}"))),
     }
@@ -426,16 +445,27 @@ struct TestBinaryInfo {
     src_path: Option<Utf8PathBuf>,
 }
 
-/// Parse test binary paths from `cargo test --no-run --message-format=json` output.
+/// Parsed output from `cargo test --no-run --message-format=json`.
+struct BuildArtifacts {
+    /// Test executables — anything with `profile.test == true` and a non-null
+    /// `executable`. These are what we run to collect coverage per test.
+    test_binaries: Vec<TestBinaryInfo>,
+    /// Workspace bin targets (kind=["bin"], profile.test=false) keyed by name.
+    /// Passed through as `CARGO_BIN_EXE_<name>` env vars so integration tests
+    /// that shell out to built binaries can find them.
+    bin_exes: BTreeMap<String, PathBuf>,
+}
+
+/// Parse compiler-artifact messages from `cargo test --no-run --message-format=json`.
 ///
-/// Each JSON line with `"reason":"compiler-artifact"` and a `"test"` profile
-/// contains the executable path in `"executable"` and the crate root in
-/// `"target"."src_path"`.
-fn parse_test_binaries(json_output: &str, project_root: &Path) -> Result<Vec<TestBinaryInfo>> {
+/// Extracts both test binaries (to run for coverage) and workspace bin
+/// executables (for `CARGO_BIN_EXE_<name>` env vars).
+fn parse_build_artifacts(json_output: &str, project_root: &Path) -> Result<BuildArtifacts> {
     let root = project_root
         .canonicalize()
         .context("failed to canonicalize project root")?;
-    let mut binaries = Vec::new();
+    let mut test_binaries = Vec::new();
+    let mut bin_exes = BTreeMap::new();
     for line in json_output.lines() {
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -443,19 +473,25 @@ fn parse_test_binaries(json_output: &str, project_root: &Path) -> Result<Vec<Tes
         if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
-        // Only include test targets (profile.test == true).
+        let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) else {
+            continue;
+        };
         let is_test = msg
             .get("profile")
             .and_then(|p| p.get("test"))
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
-        if !is_test {
-            continue;
-        }
-        if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
+        let target = msg.get("target");
+        let kinds: Vec<&str> = target
+            .and_then(|t| t.get("kind"))
+            .and_then(|k| k.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let name = target.and_then(|t| t.get("name")).and_then(|n| n.as_str());
+
+        if is_test {
             // Extract the crate root path (target.src_path) and make it relative.
-            let src_path = msg
-                .get("target")
+            let src_path = target
                 .and_then(|t| t.get("src_path"))
                 .and_then(|s| s.as_str())
                 .and_then(|abs| {
@@ -464,13 +500,20 @@ fn parse_test_binaries(json_output: &str, project_root: &Path) -> Result<Vec<Tes
                         .ok()
                         .and_then(|rel| Utf8PathBuf::try_from(rel.to_path_buf()).ok())
                 });
-            binaries.push(TestBinaryInfo {
+            test_binaries.push(TestBinaryInfo {
                 executable: PathBuf::from(exe),
                 src_path,
             });
+        } else if kinds.contains(&"bin") {
+            if let Some(name) = name {
+                bin_exes.insert(name.to_string(), PathBuf::from(exe));
+            }
         }
     }
-    Ok(binaries)
+    Ok(BuildArtifacts {
+        test_binaries,
+        bin_exes,
+    })
 }
 
 /// Remove all .profraw files in the given directory.
