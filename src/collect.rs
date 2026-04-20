@@ -527,7 +527,7 @@ fn list_profraw_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Ensure `cargo nextest` is available. Fails with an install hint otherwise.
-fn require_nextest(project_root: &Path) -> Result<()> {
+pub(crate) fn require_nextest(project_root: &Path) -> Result<()> {
     let ok = Command::new("cargo")
         .arg("nextest")
         .arg("--version")
@@ -539,7 +539,7 @@ fn require_nextest(project_root: &Path) -> Result<()> {
         .unwrap_or(false);
     if !ok {
         bail!(
-            "cargo-difftest collect requires cargo-nextest. \
+            "cargo-difftest requires cargo-nextest. \
              Install it with `cargo install cargo-nextest --locked`."
         );
     }

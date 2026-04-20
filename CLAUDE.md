@@ -21,8 +21,16 @@ Requires `rustup component add llvm-tools` for coverage collection.
 - `coverage.rs` — Parses `llvm-cov export` JSON to extract covered source file paths.
 - `fingerprint.rs` — SHA-256 hex of `Cargo.lock`, every workspace `Cargo.toml`, `rustc -vV`, `RUSTFLAGS`, and `CARGO_BUILD_TARGET`; stored alongside each mapping so queries scoped to the current fingerprint naturally miss when any tracked input changes — no explicit invalidation path.
 - `db.rs` — SQLite storage at `target/difftest/coverage.db`. All difftest artifacts (DB + profraw dirs) live under `target/difftest/`, which cargo clean wipes. Schema: `test_files(test_name, source_file, env_fingerprint)` keyed on all three, with `idx_source_file_fp(source_file, env_fingerprint)` for fast lookups; every query is scoped by fingerprint, so stale environments read as "no data". `meta` table for timestamps.
-- `run.rs` — Queries DB for tests covering changed files, runs them via nextest (preferred) or cargo test.
+- `run.rs` — Queries DB for tests covering changed files and runs them via `cargo nextest run` with an exact-match `-E` filter expression.
 - `status.rs` — Dry-run variant of `run` — shows what would run without executing.
+
+## Principles
+
+This is an early-stage project. Prefer failing loudly over silently degrading.
+Do **not** add fallback paths (e.g., "try tool X, else tool Y") — they mask
+missing dependencies and double the surface area we have to reason about.
+If a required tool isn't installed, error out with an install hint and let the
+user fix it.
 
 ## Manual testing
 
