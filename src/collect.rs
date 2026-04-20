@@ -8,22 +8,23 @@
 //! and write test-to-file mappings to SQLite.
 //!
 //! Approach:
-//! 1. `cargo test --no-run --message-format=json` — build with coverage
-//!    instrumentation and harvest test-binary paths + crate roots (implicit
-//!    deps) from cargo's JSON output. nextest's subsequent build is a cache
-//!    hit because RUSTFLAGS match.
-//! 2. In incremental mode, list tests per binary to compute the affected-plus-new
-//!    set and translate it into a nextest `-E 'test(=…) | …'` filter.
-//! 3. `cargo nextest run` with the runner env set — nextest handles env vars,
-//!    cwd, parallelism, filtering, progress output.
-//! 4. Post-run: for each subdir of profraw_base, read the `name` sidecar,
+//! 1. Read crate roots (lib.rs/main.rs/tests/*.rs) from `cargo metadata` —
+//!    every test implicitly depends on these so edits re-select the
+//!    corresponding tests.
+//! 2. In incremental mode only: `cargo nextest list --message-format json`
+//!    to enumerate tests, then translate the affected-plus-new set into a
+//!    nextest `-E 'test(=…) | …'` filter.
+//! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
+//!    runner env set — one build step in full mode, a cache-hit second
+//!    invocation in incremental. nextest handles parallelism and progress.
+//! 4. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
 //!    merge with `llvm-profdata`, export with `llvm-cov`, parse covered files.
 //!    Parallelized across workers.
 //! 5. Store mappings in the DB.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -64,49 +65,9 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     }
     std::fs::create_dir_all(&profraw_dir).context("failed to create profraw dir")?;
 
-    // Step 1: Build with coverage instrumentation and capture binary paths +
-    // src_paths. nextest reuses the cache from this build.
-    eprintln!("building with coverage instrumentation...");
-    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    if !rustflags.is_empty() {
-        rustflags.push(' ');
-    }
-    rustflags.push_str("-C instrument-coverage");
-    let build_output = Command::new("cargo")
-        .arg("test")
-        .arg("--no-run")
-        .arg("--message-format=json")
-        .env("RUSTFLAGS", &rustflags)
-        .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
-        .current_dir(project_root)
-        .output()
-        .context("failed to run cargo test --no-run")?;
-    if !build_output.status.success() {
-        bail!(
-            "coverage build failed: {}",
-            String::from_utf8_lossy(&build_output.stderr)
-        );
-    }
-
-    // Clean up any stray profraw files left in the project root by build scripts.
-    clean_profraw_files(project_root)?;
-
-    // Compute env fingerprint *after* the build. The build resolves
-    // dependencies and writes Cargo.lock for projects that didn't have one;
-    // subsequent `status`/`run` invocations will see that lockfile, so the
-    // fingerprint must be computed against the post-build state to match.
-    let env_fingerprint = fingerprint::compute(&project)?;
-
-    let build_info =
-        parse_test_binaries(&String::from_utf8_lossy(&build_output.stdout), project_root)?;
-    eprintln!("found {} test binaries", build_info.len());
-
-    // Collect crate root files (lib.rs/main.rs) as implicit dependencies.
-    let crate_roots: BTreeSet<Utf8PathBuf> = build_info
-        .iter()
-        .filter_map(|b| b.src_path.as_ref())
-        .cloned()
-        .collect();
+    // Crate roots (lib.rs/main.rs/tests/*.rs) are added to every test's
+    // coverage set so edits to them re-select the corresponding tests.
+    let crate_roots = workspace_test_src_paths(project_root)?;
     if !crate_roots.is_empty() {
         eprintln!(
             "crate roots (implicit deps): {}",
@@ -118,24 +79,41 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
         );
     }
 
-    // Step 2: In incremental mode, compute the subset of tests to re-collect
-    // and translate it into a nextest filter expression.
-    let nextest_filter = match diff_base {
-        None => None,
+    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        rustflags.push(' ');
+    }
+    rustflags.push_str("-C instrument-coverage");
+
+    // In incremental mode, list tests so we can filter. The list step builds
+    // with the same RUSTFLAGS; the subsequent run is a cache hit. We compute
+    // the fingerprint here (post-list-build) so Cargo.lock is in its final
+    // state — status/run will compare against that same state.
+    let (nextest_filter, early_fingerprint) = match diff_base {
+        None => (None, None::<String>),
         Some(base) => {
-            let all_tests = discover_tests(&build_info, project_root)?;
+            eprintln!("listing tests with cargo nextest list...");
+            let all_tests = nextest_list_tests(project_root, &rustflags, &profraw_dir)?;
             eprintln!("found {} tests", all_tests.len());
+            let env_fingerprint = fingerprint::compute(&project)?;
             let selected =
                 select_tests_for_incremental(base, project_root, &env_fingerprint, &all_tests)?;
             if selected.is_empty() {
                 eprintln!("no tests to re-collect");
                 return Ok(0);
             }
-            Some(nextest_filter_expr(&selected))
+            (
+                Some(nextest_filter_expr(&selected)),
+                Some(env_fingerprint),
+            )
         }
     };
 
-    // Step 3: Run nextest with the runner shim + profraw base set.
+    // Stray profraw files left in project root by the list-step build.
+    clean_profraw_files(project_root)?;
+
+    // Build (or cache-hit) and run, with the runner shim wired up so each
+    // test writes to its own per-test profraw directory.
     eprintln!("running tests with cargo nextest run...");
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
@@ -143,6 +121,8 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
         .env("RUSTFLAGS", &rustflags)
         .env(&runner_env_name, &runner_env_value)
         .env("DIFFTEST_PROFRAW_BASE", &profraw_dir)
+        // Catches build-script profraw before the runner shim kicks in for tests.
+        .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
     if let Some(expr) = &nextest_filter {
         cmd.arg("-E").arg(expr);
@@ -157,6 +137,12 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
 
     // Sweep any stray profraw files instrumented subprocesses dropped in root.
     clean_profraw_files(project_root)?;
+
+    // In full mode the build happened during nextest run, so fingerprint now.
+    let env_fingerprint = match early_fingerprint {
+        Some(f) => f,
+        None => fingerprint::compute(&project)?,
+    };
 
     // Step 4: Walk profraw_base subdirs — one per test — and extract coverage.
     let test_dirs = list_test_dirs(&profraw_dir)?;
@@ -390,86 +376,114 @@ fn select_tests_for_incremental(
     Ok(tests_to_run.iter().map(|s| s.to_string()).collect())
 }
 
-/// Discover all tests across the built test binaries via `--list --format=terse`.
-fn discover_tests(test_binaries: &[TestBinaryInfo], project_root: &Path) -> Result<Vec<String>> {
-    let mut seen = BTreeSet::new();
-    for info in test_binaries {
-        let binary = &info.executable;
-        let list_output = Command::new(binary)
-            .arg("--list")
-            .arg("--format=terse")
-            .current_dir(project_root)
-            .output();
-        match list_output {
-            Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                for line in stdout.lines() {
-                    if let Some(name) = line.strip_suffix(": test") {
-                        seen.insert(name.to_string());
-                    }
-                }
-            }
-            Ok(o) => {
-                eprintln!(
-                    "warning: failed to list tests from {}: {}",
-                    binary.display(),
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-            }
-            Err(e) => {
-                eprintln!("warning: failed to execute {}: {e}", binary.display());
+/// Enumerate all test names via `cargo nextest list --message-format json`.
+///
+/// Builds test binaries with the given RUSTFLAGS (coverage instrumentation)
+/// and parses the single-object JSON on stdout for every test case. We don't
+/// set the runner env here — nextest just asks binaries for their listings.
+fn nextest_list_tests(
+    project_root: &Path,
+    rustflags: &str,
+    profraw_dir: &Path,
+) -> Result<Vec<String>> {
+    let child = Command::new("cargo")
+        .arg("nextest")
+        .arg("list")
+        .arg("--message-format")
+        .arg("json")
+        .env("RUSTFLAGS", rustflags)
+        // Contain any stray build-script profraw within our workspace.
+        .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .current_dir(project_root)
+        .spawn()
+        .context("failed to spawn cargo nextest list")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for cargo nextest list")?;
+    if !output.status.success() {
+        bail!("cargo nextest list failed (exit {:?})", output.status.code());
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("cargo nextest list stdout was not valid UTF-8")?;
+    let json: serde_json::Value =
+        serde_json::from_str(stdout).context("failed to parse nextest list JSON")?;
+
+    let mut names = BTreeSet::new();
+    if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
+        for suite in suites.values() {
+            let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for case in cases.keys() {
+                names.insert(case.clone());
             }
         }
     }
-    Ok(seen.into_iter().collect())
+    Ok(names.into_iter().collect())
 }
 
-/// Info about a test binary extracted from cargo's JSON output.
-struct TestBinaryInfo {
-    executable: PathBuf,
-    /// Crate root source path (lib.rs/main.rs), relative to project root.
-    src_path: Option<Utf8PathBuf>,
-}
+/// Crate roots of all test-producing workspace targets, relative to the
+/// project root. These are added as implicit deps for every test.
+fn workspace_test_src_paths(project_root: &Path) -> Result<BTreeSet<Utf8PathBuf>> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version=1"])
+        .current_dir(project_root)
+        .output()
+        .context("failed to run cargo metadata")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let meta: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse cargo metadata")?;
 
-/// Parse test binary paths from `cargo test --no-run --message-format=json`.
-fn parse_test_binaries(json_output: &str, project_root: &Path) -> Result<Vec<TestBinaryInfo>> {
     let root = project_root
         .canonicalize()
         .context("failed to canonicalize project root")?;
-    let mut binaries = Vec::new();
-    for line in json_output.lines() {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+
+    let mut src_paths = BTreeSet::new();
+    let Some(packages) = meta.get("packages").and_then(|v| v.as_array()) else {
+        return Ok(src_paths);
+    };
+    for pkg in packages {
+        let Some(targets) = pkg.get("targets").and_then(|v| v.as_array()) else {
             continue;
         };
-        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        let is_test = msg
-            .get("profile")
-            .and_then(|p| p.get("test"))
-            .and_then(|t| t.as_bool())
-            .unwrap_or(false);
-        if !is_test {
-            continue;
-        }
-        if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
-            let src_path = msg
-                .get("target")
-                .and_then(|t| t.get("src_path"))
-                .and_then(|s| s.as_str())
-                .and_then(|abs| {
-                    Path::new(abs)
-                        .strip_prefix(&root)
-                        .ok()
-                        .and_then(|rel| Utf8PathBuf::try_from(rel.to_path_buf()).ok())
-                });
-            binaries.push(TestBinaryInfo {
-                executable: PathBuf::from(exe),
-                src_path,
-            });
+        for target in targets {
+            let is_test_target = target
+                .get("test")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !is_test_target {
+                continue;
+            }
+            let kinds: Vec<&str> = target
+                .get("kind")
+                .and_then(|v| v.as_array())
+                .map(|ks| ks.iter().filter_map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            // Nextest builds and runs tests for lib/bin/test targets; skip
+            // examples, benches, and custom-build so their src_paths don't
+            // pollute the implicit-dep set.
+            if !kinds.iter().any(|k| matches!(*k, "lib" | "bin" | "test")) {
+                continue;
+            }
+            let Some(abs) = target.get("src_path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Ok(rel) = Path::new(abs).strip_prefix(&root) {
+                if let Ok(u) = Utf8PathBuf::try_from(rel.to_path_buf()) {
+                    src_paths.insert(u);
+                }
+            }
         }
     }
-    Ok(binaries)
+    Ok(src_paths)
 }
 
 /// List subdirectories of `profraw_dir` that look like per-test output
