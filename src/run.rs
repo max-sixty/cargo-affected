@@ -13,7 +13,7 @@ use crate::db::{warn_untracked_rs_files, Db};
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest run`. Returns the exit code to propagate.
-pub fn run(diff_base: Option<&str>, all: bool) -> Result<i32> {
+pub fn run(diff_base: Option<&str>, all: bool, verbose: bool) -> Result<i32> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
@@ -48,12 +48,19 @@ pub fn run(diff_base: Option<&str>, all: bool) -> Result<i32> {
     }
 
     let skipped = all_tests.saturating_sub(tests.len());
-    eprintln!(
-        "\n{} tests to run ({skipped} skipped out of {all_tests} total):",
-        tests.len()
-    );
-    for t in &tests {
-        eprintln!("  {t}");
+    if verbose {
+        eprintln!(
+            "\n{} tests to run ({skipped} skipped of {all_tests} total):",
+            tests.len()
+        );
+        for t in &tests {
+            eprintln!("  {t}");
+        }
+    } else {
+        eprintln!(
+            "\n{} tests to run ({skipped} skipped of {all_tests} total) — pass -v to list",
+            tests.len()
+        );
     }
     eprintln!();
 

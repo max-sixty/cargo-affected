@@ -6,7 +6,7 @@ use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest status`.
-pub fn status(diff_base: Option<&str>) -> Result<()> {
+pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
@@ -56,13 +56,19 @@ pub fn status(diff_base: Option<&str>) -> Result<()> {
         println!("\nno tracked tests cover these files");
     } else {
         let skipped = test_count.saturating_sub(tests.len());
-        println!(
-            "\ntests that would run ({}, {} skipped):",
-            tests.len(),
-            skipped
-        );
-        for t in &tests {
-            println!("  {t}");
+        if verbose {
+            println!(
+                "\n{} tests would run ({skipped} skipped of {test_count} total):",
+                tests.len()
+            );
+            for t in &tests {
+                println!("  {t}");
+            }
+        } else {
+            println!(
+                "\n{} tests would run ({skipped} skipped of {test_count} total) — pass -v to list",
+                tests.len()
+            );
         }
     }
 

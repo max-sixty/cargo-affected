@@ -52,6 +52,9 @@ enum Action {
         /// Run all tests, skipping coverage-based selection.
         #[arg(long)]
         all: bool,
+        /// List every selected test name before running. Default prints only a count.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Show stored coverage data and what would run for current changes.
     Status {
@@ -59,6 +62,9 @@ enum Action {
         /// Uses three-dot diff (`<ref>...HEAD`) to find changes since diverging from the ref.
         #[arg(long)]
         diff_base: Option<String>,
+        /// List every selected test name. Default prints only a count.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Delete the target/difftest/coverage.db coverage database.
     Clean,
@@ -97,9 +103,13 @@ fn run_action(action: Action) -> Result<i32> {
             collect::collect(diff_base.as_deref())?;
             Ok(0)
         }
-        Action::Run { diff_base, all } => run::run(diff_base.as_deref(), all),
-        Action::Status { diff_base } => {
-            status::status(diff_base.as_deref())?;
+        Action::Run {
+            diff_base,
+            all,
+            verbose,
+        } => run::run(diff_base.as_deref(), all, verbose),
+        Action::Status { diff_base, verbose } => {
+            status::status(diff_base.as_deref(), verbose)?;
             Ok(0)
         }
         Action::Clean => {
