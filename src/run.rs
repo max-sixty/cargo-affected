@@ -76,7 +76,7 @@ fn run_tests(project_root: &Path, test_names: Option<&[String]>) -> Result<i32> 
                     .map(|t| format!("test(={t})"))
                     .collect::<Vec<_>>()
                     .join(" | ");
-                eprintln!("running {} tests with nextest: -E '{filter_expr}'", names.len());
+                eprintln!("running {} tests with nextest", names.len());
                 cmd.arg("-E").arg(&filter_expr);
             }
             None => eprintln!("running all tests with nextest"),
