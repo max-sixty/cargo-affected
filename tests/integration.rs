@@ -76,6 +76,11 @@ edition = "2021"
     )
     .unwrap();
 
+    // Real cargo projects ignore target/. Without this, cargo-difftest's own
+    // profraw dirs (which include test names) leak into `git status` as
+    // untracked paths.
+    std::fs::write(dir.join(".gitignore"), "/target\n").unwrap();
+
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
 
@@ -226,7 +231,7 @@ fn test_full_pipeline() {
     std::fs::write(&math_path, format!("{content}\n// changed\n")).unwrap();
 
     // Run status and verify only math tests are listed.
-    let output = cargo_difftest(dir, &["difftest", "status"]);
+    let output = cargo_difftest(dir, &["difftest", "status", "-v"]);
     assert!(
         output.status.success(),
         "status failed: {}",

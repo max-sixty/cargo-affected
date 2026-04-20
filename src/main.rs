@@ -8,19 +8,16 @@ mod coverage;
 mod db;
 mod project;
 mod run;
+mod shim;
 mod status;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 /// Run only the tests affected by your changes.
-///
-/// Cargo subcommand that uses LLVM coverage to determine which tests cover
-/// which source files, then reruns only the tests touching changed files.
 #[derive(Parser)]
 #[command(name = "cargo-difftest", bin_name = "cargo-difftest")]
 struct Cli {
-    /// When invoked as `cargo difftest`, cargo passes "difftest" as the first arg.
     #[command(subcommand)]
     command: CargoSubcommand,
 }
@@ -42,6 +39,9 @@ enum Action {
         /// Discovers new tests too. Much faster than a full collection.
         #[arg(long)]
         diff_base: Option<String>,
+        /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        nextest_args: Vec<String>,
     },
     /// Run only tests affected by current git changes.
     Run {
@@ -84,6 +84,14 @@ fn clean() -> Result<()> {
 }
 
 fn main() {
+    // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
+    // via CARGO_TARGET_<TRIPLE>_RUNNER. Dispatch before clap — its trailing args
+    // include `--exact`/`--list`/etc. which clap would interpret if we let it.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("runner-shim") {
+        shim::run(&argv[2..]);
+    }
+
     let cli = Cli::parse();
     let CargoSubcommand::Difftest { action } = cli.command;
 
@@ -99,9 +107,8 @@ fn main() {
 
 fn run_action(action: Action) -> Result<i32> {
     match action {
-        Action::Collect { diff_base } => {
-            collect::collect(diff_base.as_deref())?;
-            Ok(0)
+        Action::Collect { diff_base, nextest_args } => {
+            collect::collect(diff_base.as_deref(), &nextest_args)
         }
         Action::Run {
             diff_base,
