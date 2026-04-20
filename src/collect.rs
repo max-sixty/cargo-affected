@@ -1,20 +1,29 @@
 //! Coverage collection pipeline.
 //!
 //! Builds with coverage instrumentation, discovers tests from the compiled
-//! binaries, then runs each test individually to collect per-test coverage
-//! data. The resulting test-to-file mappings are stored in SQLite.
+//! binaries, then runs each test individually (in parallel) to collect
+//! per-test coverage data. The resulting test-to-file mappings are stored
+//! in SQLite.
 //!
 //! Approach:
 //! 1. Find the project/workspace root.
 //! 2. Build with `-C instrument-coverage` via `cargo test --no-run`.
 //! 3. List tests by running each test binary with `--list --format=terse`.
-//! 4. For each test: run it alone with a unique profraw path, then
-//!    `llvm-profdata merge` + `llvm-cov export` to get coverage JSON.
+//! 4. For each test (in parallel across num_cpus workers): run it alone with
+//!    its own profraw directory, then `llvm-profdata merge` + `llvm-cov export`
+//!    to get coverage JSON.
 //! 5. Parse JSON, extract file list, store in DB.
+//!
+//! Why we orchestrate the workers ourselves instead of piggybacking on a single
+//! `cargo nextest run` pass: nextest's `libtest-json-plus` (v0.1 as of 0.9.132)
+//! does not emit per-test PIDs, so there's no way to correlate `%p.profraw`
+//! files back to test names in one batch run. Running tests ourselves lets us
+//! set `LLVM_PROFILE_FILE` per test and know the mapping trivially.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -50,10 +59,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
         .arg("--no-run")
         .arg("--message-format=json")
         .env("RUSTFLAGS", &rustflags)
-        .env(
-            "LLVM_PROFILE_FILE",
-            profraw_dir.path().join("%p-%m.profraw").to_str().unwrap(),
-        )
+        .env("LLVM_PROFILE_FILE", profraw_dir.path().join("%p-%m.profraw"))
         .current_dir(project_root)
         .output()
         .context("failed to run cargo test --no-run")?;
@@ -70,8 +76,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
     // Step 2: Extract test binary paths and crate root src_paths from the build output.
     let build_info =
         parse_test_binaries(&String::from_utf8_lossy(&build_output.stdout), project_root)?;
-    let test_binaries: Vec<PathBuf> = build_info.iter().map(|b| b.executable.clone()).collect();
-    eprintln!("found {} test binaries", test_binaries.len());
+    eprintln!("found {} test binaries", build_info.len());
 
     // Collect crate root files (lib.rs/main.rs) as implicit dependencies.
     let crate_roots: BTreeSet<Utf8PathBuf> = build_info
@@ -91,7 +96,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
     }
 
     // Discover tests and which binary owns each one.
-    let all_test_entries = discover_tests(&test_binaries, project_root)?;
+    let all_test_entries = discover_tests(&build_info, project_root)?;
     eprintln!("found {} tests", all_test_entries.len());
 
     if all_test_entries.is_empty() {
@@ -111,98 +116,73 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    // Step 4: Run each test individually and collect coverage.
-    let mut mappings: Vec<(String, BTreeSet<Utf8PathBuf>)> = Vec::new();
+    // Step 4: Run tests in parallel and collect coverage.
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let total = test_entries.len();
+    eprintln!("collecting coverage for {total} tests with {num_workers} workers...");
 
-    for (i, (test_name, binary)) in test_entries.iter().enumerate() {
-        eprint!("[{}/{}] {test_name}... ", i + 1, test_entries.len());
-        let test_start = Instant::now();
+    // `progress` guards both the done-counter and stderr writes so the [n/total]
+    // numbering never prints out of order across workers.
+    let progress: Mutex<usize> = Mutex::new(0);
+    let work: Mutex<VecDeque<(usize, (String, PathBuf))>> =
+        Mutex::new(test_entries.into_iter().enumerate().collect());
+    let mappings: Mutex<Vec<(String, BTreeSet<Utf8PathBuf>)>> = Mutex::new(Vec::new());
 
-        let profraw_path = profraw_dir.path().join(format!("test-{i}.profraw"));
-        let profdata_path = profraw_dir.path().join(format!("test-{i}.profdata"));
-
-        // Clean any leftover profraw from previous iteration.
-        clean_profraw_files(profraw_dir.path())?;
-
-        // Run the test on its owning binary.
-        let status = Command::new(binary)
-            .arg("--exact")
-            .arg(test_name)
-            .arg("--nocapture")
-            .env("LLVM_PROFILE_FILE", profraw_path.to_str().unwrap())
-            .current_dir(project_root)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        let test_failed = match status {
-            Ok(s) if s.success() => false,
-            Ok(s) => {
-                eprint!("FAIL (exit {}) ", s.code().unwrap_or(-1));
-                true
-            }
-            Err(e) => {
-                eprintln!("SKIP (failed to execute: {e})");
-                continue;
-            }
-        };
-
-        // Collect profraw even for failing tests -- they still generated coverage data.
-        let profraw_files = list_profraw_files(profraw_dir.path())?;
-        if profraw_files.is_empty() {
-            eprintln!("{}(no profraw generated)", if test_failed { "" } else { "SKIP " });
-            continue;
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            s.spawn(|| loop {
+                let Some((idx, (test_name, binary))) = work.lock().unwrap().pop_front() else {
+                    break;
+                };
+                let test_start = Instant::now();
+                let outcome = collect_one_test(
+                    idx,
+                    &test_name,
+                    &binary,
+                    profraw_dir.path(),
+                    &llvm_profdata,
+                    &llvm_cov,
+                    project_root,
+                );
+                let elapsed = test_start.elapsed().as_secs_f64();
+                // Hold the progress lock across increment + eprintln so the
+                // rendered sequence matches the counter.
+                let mut guard = progress.lock().unwrap();
+                *guard += 1;
+                let n = *guard;
+                match outcome {
+                    Ok(CollectOutcome::Collected { mut files, code }) => {
+                        files.extend(crate_roots.iter().cloned());
+                        let status = match code {
+                            Some(0) => String::new(),
+                            Some(c) => format!("FAIL (exit {c}) "),
+                            None => "FAIL (signal) ".to_string(),
+                        };
+                        eprintln!(
+                            "[{n}/{total}] {test_name}: {status}{} files ({elapsed:.1}s)",
+                            files.len()
+                        );
+                        drop(guard);
+                        mappings.lock().unwrap().push((test_name, files));
+                    }
+                    Ok(CollectOutcome::Skipped(reason)) => {
+                        eprintln!("[{n}/{total}] {test_name}: SKIP ({reason})");
+                    }
+                    Err(e) => {
+                        eprintln!("[{n}/{total}] {test_name}: ERROR ({e:#})");
+                    }
+                }
+            });
         }
+    });
 
-        // Merge profraw files into a single profdata.
-        let mut merge_cmd = Command::new(&llvm_profdata);
-        merge_cmd.arg("merge").arg("--sparse");
-        for f in &profraw_files {
-            merge_cmd.arg(f);
-        }
-        merge_cmd.arg("-o").arg(&profdata_path);
+    let mappings = mappings.into_inner().unwrap();
 
-        let merge_output = merge_cmd
-            .output()
-            .context("failed to run llvm-profdata merge")?;
-        if !merge_output.status.success() {
-            eprintln!(
-                "SKIP (llvm-profdata merge failed: {})",
-                String::from_utf8_lossy(&merge_output.stderr).trim()
-            );
-            continue;
-        }
-
-        // Export coverage JSON using only the test's own binary as the object file.
-        let export_output = Command::new(&llvm_cov)
-            .arg("export")
-            .arg("--format=text")
-            .arg(format!("--instr-profile={}", profdata_path.display()))
-            .arg(binary)
-            .output()
-            .context("failed to run llvm-cov export")?;
-        if !export_output.status.success() {
-            eprintln!(
-                "SKIP (llvm-cov export failed: {})",
-                String::from_utf8_lossy(&export_output.stderr).trim()
-            );
-            continue;
-        }
-
-        let json = String::from_utf8_lossy(&export_output.stdout);
-        match coverage::extract_covered_files(&json, project_root) {
-            Ok(mut files) => {
-                // Add crate roots as implicit dependencies for all tests.
-                files.extend(crate_roots.iter().cloned());
-                let elapsed = test_start.elapsed();
-                eprintln!("{} files ({:.1}s)", files.len(), elapsed.as_secs_f64());
-                mappings.push((test_name.clone(), files));
-            }
-            Err(e) => {
-                eprintln!("SKIP (parse error: {e})");
-            }
-        }
-    }
+    // Step 4b: Sweep any stray profraw files that instrumented subprocesses
+    // (those that didn't inherit our LLVM_PROFILE_FILE) dropped in project root.
+    clean_profraw_files(project_root)?;
 
     // Step 5: Store in DB.
     let total_elapsed = total_start.elapsed();
@@ -225,6 +205,94 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
         total_elapsed.as_secs_f64(),
     );
     Ok(())
+}
+
+/// Outcome of attempting coverage collection for a single test.
+enum CollectOutcome {
+    /// Coverage extracted. The test may have passed or failed — failing tests
+    /// still produce coverage data worth recording. `code` is the process exit
+    /// code (`None` means killed by signal); `Some(0)` implies pass.
+    Collected {
+        files: BTreeSet<Utf8PathBuf>,
+        code: Option<i32>,
+    },
+    /// Coverage collection could not complete (no profraw, tool failure, parse error).
+    Skipped(String),
+}
+
+/// Run one test and extract its coverage.
+///
+/// Uses a per-test subdirectory `<profraw_base>/test-<idx>/` to isolate profraw
+/// files from concurrently-running tests. The `%p-%m.profraw` pattern lets
+/// subprocesses of the test emit distinct files.
+fn collect_one_test(
+    idx: usize,
+    test_name: &str,
+    binary: &Path,
+    profraw_base: &Path,
+    llvm_profdata: &Path,
+    llvm_cov: &Path,
+    project_root: &Path,
+) -> Result<CollectOutcome> {
+    let test_dir = profraw_base.join(format!("test-{idx}"));
+    std::fs::create_dir_all(&test_dir).context("creating per-test profraw dir")?;
+
+    let profraw_pattern = test_dir.join("%p-%m.profraw");
+    let profdata_path = test_dir.join("coverage.profdata");
+
+    let status = Command::new(binary)
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env("LLVM_PROFILE_FILE", &profraw_pattern)
+        .current_dir(project_root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("failed to run test binary")?;
+
+    let code = status.code();
+
+    let profraw_files = list_profraw_files(&test_dir)?;
+    if profraw_files.is_empty() {
+        return Ok(CollectOutcome::Skipped("no profraw generated".into()));
+    }
+
+    let mut merge_cmd = Command::new(llvm_profdata);
+    merge_cmd.arg("merge").arg("--sparse");
+    for f in &profraw_files {
+        merge_cmd.arg(f);
+    }
+    merge_cmd.arg("-o").arg(&profdata_path);
+    let merge_output = merge_cmd
+        .output()
+        .context("failed to run llvm-profdata merge")?;
+    if !merge_output.status.success() {
+        return Ok(CollectOutcome::Skipped(format!(
+            "llvm-profdata merge failed: {}",
+            String::from_utf8_lossy(&merge_output.stderr).trim()
+        )));
+    }
+
+    let export_output = Command::new(llvm_cov)
+        .arg("export")
+        .arg("--format=text")
+        .arg(format!("--instr-profile={}", profdata_path.display()))
+        .arg(binary)
+        .output()
+        .context("failed to run llvm-cov export")?;
+    if !export_output.status.success() {
+        return Ok(CollectOutcome::Skipped(format!(
+            "llvm-cov export failed: {}",
+            String::from_utf8_lossy(&export_output.stderr).trim()
+        )));
+    }
+
+    let json = String::from_utf8_lossy(&export_output.stdout);
+    match coverage::extract_covered_files(&json, project_root) {
+        Ok(files) => Ok(CollectOutcome::Collected { files, code }),
+        Err(e) => Ok(CollectOutcome::Skipped(format!("parse error: {e}"))),
+    }
 }
 
 /// Select which tests need re-collection for incremental mode.
@@ -299,13 +367,14 @@ fn select_tests_for_incremental(
 /// Returns `(test_name, binary_path)` pairs. Each test is listed once, associated
 /// with the first binary that contains it.
 fn discover_tests(
-    test_binaries: &[PathBuf],
+    test_binaries: &[TestBinaryInfo],
     project_root: &Path,
 ) -> Result<Vec<(String, PathBuf)>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut entries = Vec::new();
 
-    for binary in test_binaries {
+    for info in test_binaries {
+        let binary = &info.executable;
         let list_output = Command::new(binary)
             .arg("--list")
             .arg("--format=terse")

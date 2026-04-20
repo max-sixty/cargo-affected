@@ -16,7 +16,7 @@ Requires `rustup component add llvm-tools` for coverage collection.
 
 - `main.rs` — CLI via clap. Three subcommands: `collect`, `run`, `status`.
 - `project.rs` — Project root detection via `cargo metadata` and git queries. `find_project_root()` returns a `ProjectRoot` with the workspace root for git ops and DB storage. `git_changed_files()` returns changed files via git diff or three-dot diff.
-- `collect.rs` — Coverage pipeline. Builds with `-C instrument-coverage`, discovers test binaries from cargo JSON output, runs each test individually, merges profraw via `llvm-profdata`, exports coverage via `llvm-cov`, stores test-to-file mappings in SQLite.
+- `collect.rs` — Coverage pipeline. Builds with `-C instrument-coverage`, discovers test binaries from cargo JSON output, runs tests in parallel (one process per test with per-test profraw dir), merges profraw via `llvm-profdata`, exports coverage via `llvm-cov`, stores test-to-file mappings in SQLite.
 - `coverage.rs` — Parses `llvm-cov export` JSON to extract covered source file paths.
 - `db.rs` — SQLite storage at `.difftest.db`. Schema: `test_files(test_name, source_file)` with index on `source_file` for fast lookups. `meta` table for timestamps.
 - `run.rs` — Queries DB for tests covering changed files, runs them via nextest (preferred) or cargo test.

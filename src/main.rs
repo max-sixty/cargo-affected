@@ -77,17 +77,34 @@ fn clean() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
-
     let CargoSubcommand::Difftest { action } = cli.command;
 
-    match action {
-        Action::Collect { diff_base } => collect::collect(diff_base.as_deref())?,
-        Action::Run { diff_base, all } => run::run(diff_base.as_deref(), all)?,
-        Action::Status { diff_base } => status::status(diff_base.as_deref())?,
-        Action::Clean => clean()?,
-    }
+    let exit_code = match run_action(action) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            1
+        }
+    };
+    std::process::exit(exit_code);
+}
 
-    Ok(())
+fn run_action(action: Action) -> Result<i32> {
+    match action {
+        Action::Collect { diff_base } => {
+            collect::collect(diff_base.as_deref())?;
+            Ok(0)
+        }
+        Action::Run { diff_base, all } => run::run(diff_base.as_deref(), all),
+        Action::Status { diff_base } => {
+            status::status(diff_base.as_deref())?;
+            Ok(0)
+        }
+        Action::Clean => {
+            clean()?;
+            Ok(0)
+        }
+    }
 }

@@ -183,6 +183,19 @@ impl Db {
     }
 }
 
+/// Warn (to stderr) about changed `.rs` files that have no coverage data yet.
+pub fn warn_untracked_rs_files(db: &Db, changed_files: &[String]) -> Result<()> {
+    for file in changed_files {
+        if file.ends_with(".rs") && !db.file_tracked(file)? {
+            eprintln!(
+                "warning: {file} has no coverage data \
+                 — run `cargo difftest collect` to include it"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// ISO-8601 UTC timestamp without external dependencies.
 fn chrono_free_timestamp() -> String {
     let secs = std::time::SystemTime::now()

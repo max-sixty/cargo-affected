@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::db::Db;
+use crate::db::{warn_untracked_rs_files, Db};
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest status`.
@@ -22,22 +22,16 @@ pub fn status(diff_base: Option<&str>) -> Result<()> {
     let mapping_count = db.mapping_count()?;
     let last_collected = db.last_collected()?.unwrap_or_else(|| "never".to_string());
 
-    println!("coverage database: .difftest.db");
-    println!("last collected: {last_collected}");
-    println!("tests tracked: {test_count}");
-    println!("test-file mappings: {mapping_count}");
+    println!(
+        "coverage database: .difftest.db\n\
+         last collected: {last_collected}\n\
+         tests tracked: {test_count}\n\
+         test-file mappings: {mapping_count}"
+    );
 
     let changed_files = git_changed_files(project_root, diff_base)?;
 
-    // Warn about changed .rs files not in the DB.
-    for f in &changed_files {
-        if f.ends_with(".rs") && !db.file_tracked(f)? {
-            println!(
-                "warning: {f} has no coverage data \
-                 — run `cargo difftest collect` to include it"
-            );
-        }
-    }
+    warn_untracked_rs_files(&db, &changed_files)?;
 
     if changed_files.is_empty() {
         if let Some(base) = diff_base {
