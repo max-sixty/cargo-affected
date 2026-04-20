@@ -45,7 +45,17 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
     eprintln!("llvm-profdata: {}", llvm_profdata.display());
     eprintln!("llvm-cov: {}", llvm_cov.display());
 
-    let profraw_dir = tempfile::tempdir().context("failed to create temp dir for profraw files")?;
+    // Our profraw files live under target/ — conventional build-artifact dir,
+    // already gitignored by cargo, and survives the run so users can inspect
+    // artifacts post-mortem. PID-suffixed so concurrent `collect` invocations
+    // in the same project don't wipe each other's in-flight files.
+    let profraw_dir = project_root
+        .join("target")
+        .join(format!(".difftest-profraw-{}", std::process::id()));
+    if profraw_dir.exists() {
+        std::fs::remove_dir_all(&profraw_dir).context("failed to clean profraw dir")?;
+    }
+    std::fs::create_dir_all(&profraw_dir).context("failed to create profraw dir")?;
 
     // Step 1: Build with coverage instrumentation and capture binary paths.
     eprintln!("building with coverage instrumentation...");
@@ -59,7 +69,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
         .arg("--no-run")
         .arg("--message-format=json")
         .env("RUSTFLAGS", &rustflags)
-        .env("LLVM_PROFILE_FILE", profraw_dir.path().join("%p-%m.profraw"))
+        .env("LLVM_PROFILE_FILE", profraw_dir.join("%p-%m.profraw"))
         .current_dir(project_root)
         .output()
         .context("failed to run cargo test --no-run")?;
@@ -141,7 +151,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
                     idx,
                     &test_name,
                     &binary,
-                    profraw_dir.path(),
+                    &profraw_dir,
                     &llvm_profdata,
                     &llvm_cov,
                     project_root,
