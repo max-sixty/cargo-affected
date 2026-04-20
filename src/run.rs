@@ -15,14 +15,19 @@ use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest run`. Returns the exit code to propagate.
-pub fn run(diff_base: Option<&str>, all: bool, verbose: bool) -> Result<i32> {
+pub fn run(
+    diff_base: Option<&str>,
+    all: bool,
+    verbose: bool,
+    nextest_args: &[String],
+) -> Result<i32> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
     require_nextest(project_root)?;
 
     if all {
         eprintln!("running all tests (--all)");
-        return run_tests(project_root, None);
+        return run_tests(project_root, None, nextest_args);
     }
 
     let changed_files = git_changed_files(project_root, diff_base)?;
@@ -41,7 +46,7 @@ pub fn run(diff_base: Option<&str>, all: bool, verbose: bool) -> Result<i32> {
                 "coverage database has no data for the current environment \
                  (Cargo.lock, Cargo.toml, rustc version, or build flags changed) — running all tests"
             );
-            return run_tests(project_root, None);
+            return run_tests(project_root, None, nextest_args);
         }
         eprintln!("no coverage data yet — run `cargo difftest collect` first");
         return Ok(0);
@@ -80,13 +85,17 @@ pub fn run(diff_base: Option<&str>, all: bool, verbose: bool) -> Result<i32> {
     eprintln!();
 
     let tests: Vec<String> = tests.into_iter().collect();
-    run_tests(project_root, Some(&tests))
+    run_tests(project_root, Some(&tests), nextest_args)
 }
 
 /// Run tests via `cargo nextest run`. `test_names == None` runs all tests;
 /// `Some(names)` filters to the given set via a nextest `-E` expression.
 /// Returns nextest's exit code so callers can propagate it to CI.
-fn run_tests(project_root: &Path, test_names: Option<&[String]>) -> Result<i32> {
+fn run_tests(
+    project_root: &Path,
+    test_names: Option<&[String]>,
+    nextest_args: &[String],
+) -> Result<i32> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest").arg("run");
     match test_names {
@@ -100,6 +109,9 @@ fn run_tests(project_root: &Path, test_names: Option<&[String]>) -> Result<i32> 
             cmd.arg("-E").arg(&filter_expr);
         }
         None => eprintln!("running all tests with nextest"),
+    }
+    for a in nextest_args {
+        cmd.arg(a);
     }
     let status = cmd
         .current_dir(project_root)

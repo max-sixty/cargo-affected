@@ -56,6 +56,9 @@ enum Action {
         /// List every selected test name before running. Default prints only a count.
         #[arg(short, long)]
         verbose: bool,
+        /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        nextest_args: Vec<String>,
     },
     /// Show stored coverage data and what would run for current changes.
     Status {
@@ -115,7 +118,8 @@ fn run_action(action: Action) -> Result<i32> {
             diff_base,
             all,
             verbose,
-        } => run::run(diff_base.as_deref(), all, verbose),
+            nextest_args,
+        } => run::run(diff_base.as_deref(), all, verbose, &nextest_args),
         Action::Status { diff_base, verbose } => {
             status::status(diff_base.as_deref(), verbose)?;
             Ok(0)
