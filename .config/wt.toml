@@ -1,0 +1,2 @@
+[post-merge]
+install = "cargo install --path ."
