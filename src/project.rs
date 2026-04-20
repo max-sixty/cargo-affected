@@ -87,8 +87,10 @@ pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result
         }
     }
 
-    // Filter out artifacts that are never source code.
-    files.retain(|f| !f.ends_with(".profraw") && f != ".difftest.db");
+    // Filter out stray profraw files (from instrumented subprocesses that
+    // didn't inherit our LLVM_PROFILE_FILE). The DB lives under target/ so
+    // git already ignores it.
+    files.retain(|f| !f.ends_with(".profraw"));
 
     files.sort();
     files.dedup();

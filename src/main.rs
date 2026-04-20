@@ -60,19 +60,19 @@ enum Action {
         #[arg(long)]
         diff_base: Option<String>,
     },
-    /// Delete the .difftest.db coverage database.
+    /// Delete the target/difftest/coverage.db coverage database.
     Clean,
 }
 
 fn clean() -> Result<()> {
     let project = project::find_project_root()?;
-    let db_path = project.workspace_root.join(".difftest.db");
-    if db_path.exists() {
-        std::fs::remove_file(&db_path)
-            .with_context(|| format!("failed to delete {}", db_path.display()))?;
-        eprintln!("deleted {}", db_path.display());
+    let path = db::db_path(&project.workspace_root);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to delete {}", path.display()))?;
+        eprintln!("deleted {}", path.display());
     } else {
-        eprintln!("no .difftest.db found");
+        eprintln!("no coverage database found");
     }
     Ok(())
 }

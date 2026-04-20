@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::db::{warn_untracked_rs_files, Db};
+use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest status`.
@@ -10,8 +10,8 @@ pub fn status(diff_base: Option<&str>) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
-    let db_path = project_root.join(".difftest.db");
-    if !db_path.exists() {
+    let path = db_path(project_root);
+    if !path.exists() {
         println!("no coverage data found — run `cargo difftest collect` first");
         return Ok(());
     }
@@ -22,11 +22,13 @@ pub fn status(diff_base: Option<&str>) -> Result<()> {
     let mapping_count = db.mapping_count()?;
     let last_collected = db.last_collected()?.unwrap_or_else(|| "never".to_string());
 
+    let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
     println!(
-        "coverage database: .difftest.db\n\
+        "coverage database: {}\n\
          last collected: {last_collected}\n\
          tests tracked: {test_count}\n\
-         test-file mappings: {mapping_count}"
+         test-file mappings: {mapping_count}",
+        rel_path.display(),
     );
 
     let changed_files = git_changed_files(project_root, diff_base)?;

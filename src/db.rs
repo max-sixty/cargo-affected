@@ -6,11 +6,23 @@
 //!   for fast "which tests cover this file?" queries.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
+
+/// Umbrella directory for all difftest artifacts (DB, profraw files).
+/// Lives under `target/` so it shares the gitignore and lifecycle
+/// (cargo clean wipes it) of other build artifacts.
+pub fn difftest_dir(project_root: &Path) -> PathBuf {
+    project_root.join("target").join("difftest")
+}
+
+/// Canonical DB location within the difftest dir.
+pub fn db_path(project_root: &Path) -> PathBuf {
+    difftest_dir(project_root).join("coverage.db")
+}
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (
@@ -30,11 +42,15 @@ pub struct Db {
 }
 
 impl Db {
-    /// Open (or create) the database at `project_root/.difftest.db`.
+    /// Open (or create) the database at `project_root/target/difftest/coverage.db`.
     pub fn open(project_root: &Path) -> Result<Self> {
-        let db_path = project_root.join(".difftest.db");
-        let conn = Connection::open(&db_path)
-            .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+        let path = db_path(project_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let conn = Connection::open(&path)
+            .with_context(|| format!("failed to open database at {}", path.display()))?;
         conn.execute_batch(SCHEMA)
             .context("failed to initialize database schema")?;
         Ok(Self { conn })

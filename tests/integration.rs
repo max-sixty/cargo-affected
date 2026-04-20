@@ -170,8 +170,11 @@ fn test_full_pipeline() {
     );
 
     // Verify the DB was created.
-    let db_path = dir.join(".difftest.db");
-    assert!(db_path.exists(), ".difftest.db should exist after collect");
+    let db_path = dir.join("target").join("difftest").join("coverage.db");
+    assert!(
+        db_path.exists(),
+        "target/difftest/coverage.db should exist after collect"
+    );
 
     // Read the DB and verify mappings.
     let conn = rusqlite::Connection::open(&db_path).unwrap();

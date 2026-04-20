@@ -30,7 +30,7 @@ use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
 use crate::coverage;
-use crate::db::Db;
+use crate::db::{db_path, difftest_dir, Db};
 use crate::project::{find_project_root, git_changed_files};
 
 /// Entry point for `cargo difftest collect`.
@@ -45,13 +45,11 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
     eprintln!("llvm-profdata: {}", llvm_profdata.display());
     eprintln!("llvm-cov: {}", llvm_cov.display());
 
-    // Our profraw files live under target/ — conventional build-artifact dir,
-    // already gitignored by cargo, and survives the run so users can inspect
-    // artifacts post-mortem. PID-suffixed so concurrent `collect` invocations
-    // in the same project don't wipe each other's in-flight files.
-    let profraw_dir = project_root
-        .join("target")
-        .join(format!(".difftest-profraw-{}", std::process::id()));
+    // Our profraw files live under target/difftest/ alongside the DB — a
+    // conventional build-artifact location, gitignored by cargo, and surviving
+    // the run so users can inspect artifacts post-mortem. PID-suffixed so
+    // concurrent `collect` invocations don't wipe each other's in-flight files.
+    let profraw_dir = difftest_dir(project_root).join(format!("profraw-{}", std::process::id()));
     if profraw_dir.exists() {
         std::fs::remove_dir_all(&profraw_dir).context("failed to clean profraw dir")?;
     }
@@ -209,7 +207,7 @@ pub fn collect(diff_base: Option<&str>) -> Result<()> {
     }
 
     eprintln!(
-        "done. {} tests, {} mappings stored in .difftest.db ({:.1}s total)",
+        "done. {} tests, {} mappings stored in target/difftest/coverage.db ({:.1}s total)",
         mappings.len(),
         mapping_count,
         total_elapsed.as_secs_f64(),
@@ -329,8 +327,7 @@ fn select_tests_for_incremental(
         eprintln!("  {f}");
     }
 
-    let db_path = project_root.join(".difftest.db");
-    if !db_path.exists() {
+    if !db_path(project_root).exists() {
         eprintln!("no existing DB — collecting all tests");
         return Ok(all_test_entries.to_vec());
     }
