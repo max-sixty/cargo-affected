@@ -5,6 +5,10 @@
 //! - `test_files` — (test_name, source_file, env_fingerprint) triples with
 //!   index on (source_file, env_fingerprint) for fast "which tests under the
 //!   current env cover this file?" queries.
+//! - `fingerprints` — (fingerprint, last_seen) used for LRU garbage
+//!   collection. Touched on every write and on every non-empty read; `gc()`
+//!   evicts the oldest fingerprints once more than `FINGERPRINT_KEEP` are
+//!   tracked, never evicting the caller's current fingerprint.
 //!
 //! `env_fingerprint` is a SHA-256 hex of inputs that would globally invalidate
 //! cached coverage (Cargo.lock, Cargo.toml files, rustc version, RUSTFLAGS,
@@ -66,7 +70,31 @@ CREATE TABLE IF NOT EXISTS test_files (
     PRIMARY KEY (test_name, source_file, env_fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_source_file_fp ON test_files(source_file, env_fingerprint);
+CREATE TABLE IF NOT EXISTS fingerprints (
+    fingerprint TEXT PRIMARY KEY,
+    last_seen TEXT NOT NULL
+);
 ";
+
+/// How many distinct fingerprints to retain. `gc()` evicts the least-recently-
+/// used fingerprints beyond this cap, always keeping the caller's current one.
+/// Chosen to comfortably cover typical workflows (a handful of branches plus
+/// the occasional toolchain bump) while keeping the DB from accumulating
+/// forever if a user rapidly cycles through many build environments.
+pub const FINGERPRINT_KEEP: usize = 10;
+
+/// Upsert `fingerprint`'s `last_seen` to now. Creates the row if absent; this
+/// is safe for writes (we just inserted data under this fingerprint) but
+/// callers doing bare reads of a fingerprint that has no data should gate the
+/// call on actually finding rows.
+fn touch_fingerprint(conn: &Connection, fingerprint: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fingerprints (fingerprint, last_seen) VALUES (?1, ?2) \
+         ON CONFLICT(fingerprint) DO UPDATE SET last_seen = excluded.last_seen",
+        rusqlite::params![fingerprint, chrono_free_timestamp()],
+    )?;
+    Ok(())
+}
 
 pub struct Db {
     conn: Connection,
@@ -91,6 +119,7 @@ impl Db {
         migrate_pre_fingerprint_schema(&conn)?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| translate_busy(e, "failed to initialize database schema"))?;
+        backfill_fingerprints(&conn)?;
         Ok(Self { conn })
     }
 
@@ -121,6 +150,7 @@ impl Db {
             }
         }
 
+        touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit coverage data"))?;
@@ -129,6 +159,11 @@ impl Db {
 
     /// Find all test names under the current fingerprint covering any of the
     /// given source files.
+    ///
+    /// Bumps the fingerprint's `last_seen` when the result is non-empty — a
+    /// successful read counts as "the user is actively using this cache" for
+    /// GC purposes. Empty reads (no matching rows, or a fingerprint that has
+    /// never been collected) don't create a spurious tracking entry.
     pub fn tests_covering(&self, fingerprint: &str, files: &[&str]) -> Result<BTreeSet<String>> {
         if files.is_empty() {
             return Ok(BTreeSet::new());
@@ -153,6 +188,9 @@ impl Db {
         let mut tests = BTreeSet::new();
         for row in rows {
             tests.insert(row?);
+        }
+        if !tests.is_empty() {
+            touch_fingerprint(&self.conn, fingerprint)?;
         }
         Ok(tests)
     }
@@ -239,6 +277,7 @@ impl Db {
             }
         }
 
+        touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit coverage update"))?;
@@ -257,10 +296,55 @@ impl Db {
             .transaction()
             .map_err(|e| translate_busy(e, "failed to start clear transaction"))?;
         tx.execute("DELETE FROM test_files", [])?;
+        tx.execute("DELETE FROM fingerprints", [])?;
         tx.execute("DELETE FROM meta", [])?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit clear"))?;
         Ok(())
+    }
+
+    /// Evict the least-recently-used fingerprints beyond `keep`, never
+    /// evicting `current`. Returns the number evicted.
+    ///
+    /// Of all fingerprints other than `current`, the `keep - 1` most recent
+    /// are retained so the total stays at most `keep`. Data and tracking rows
+    /// for evicted fingerprints are removed in a single transaction.
+    pub fn gc(&mut self, current: &str, keep: usize) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| translate_busy(e, "failed to start gc transaction"))?;
+
+        let to_evict: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT fingerprint FROM fingerprints \
+                 WHERE fingerprint != ?1 \
+                 ORDER BY last_seen DESC, fingerprint ASC \
+                 LIMIT -1 OFFSET ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![current, keep.saturating_sub(1) as i64],
+                |r| r.get::<_, String>(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+
+        for fp in &to_evict {
+            tx.execute("DELETE FROM test_files WHERE env_fingerprint = ?1", [fp])?;
+            tx.execute("DELETE FROM fingerprints WHERE fingerprint = ?1", [fp])?;
+        }
+
+        tx.commit()
+            .map_err(|e| translate_busy(e, "failed to commit gc"))?;
+        Ok(to_evict.len())
+    }
+
+    /// Count of distinct tracked fingerprints (after any GC).
+    pub fn fingerprint_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))?;
+        Ok(count as usize)
     }
 
     /// Return the last collection timestamp, if any.
@@ -318,6 +402,20 @@ fn migrate_pre_fingerprint_schema(conn: &Connection) -> Result<()> {
         conn.execute("DROP TABLE test_files", [])?;
         conn.execute("DROP INDEX IF EXISTS idx_source_file", [])?;
     }
+    Ok(())
+}
+
+/// Seed `fingerprints` with an entry for every distinct fingerprint in
+/// `test_files` that doesn't already have one. Runs on every open so DBs
+/// written by pre-GC code (which have `test_files` rows but no tracking
+/// entries) get backfilled at `last_seen = now`, giving them full grace until
+/// the next collect before they become eviction candidates.
+fn backfill_fingerprints(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO fingerprints (fingerprint, last_seen) \
+         SELECT DISTINCT env_fingerprint, ?1 FROM test_files",
+        [&chrono_free_timestamp()],
+    )?;
     Ok(())
 }
 
@@ -580,6 +678,182 @@ mod tests {
         // DB still usable afterwards.
         db.store_coverage(FP_A, &mappings)?;
         assert_eq!(db.test_count(FP_A)?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn store_tracks_fingerprint_last_seen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![(
+            "test_a".to_string(),
+            BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
+        )];
+        db.store_coverage(FP_A, &mappings)?;
+        assert_eq!(db.fingerprint_count()?, 1);
+
+        db.store_coverage(FP_B, &mappings)?;
+        assert_eq!(db.fingerprint_count()?, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_read_does_not_create_tracking_entry() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Db::open(dir.path())?;
+
+        // No data under FP_A; reading shouldn't register it as a fingerprint.
+        let hits = db.tests_covering(FP_A, &["src/lib.rs"])?;
+        assert!(hits.is_empty());
+        assert_eq!(db.fingerprint_count()?, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn gc_keeps_current_and_most_recent_others() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![(
+            "t".to_string(),
+            BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
+        )];
+
+        // Four fingerprints, ordered by last_seen via explicit update.
+        for fp in ["fp1", "fp2", "fp3", "fp4"] {
+            db.store_coverage(fp, &mappings)?;
+            // Space out last_seen so ordering is unambiguous. We have
+            // second-granularity timestamps; bump directly.
+            db.conn.execute(
+                "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
+                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+            )?;
+        }
+        assert_eq!(db.fingerprint_count()?, 4);
+
+        // Keep 2 with fp4 current: fp4 stays + the one most-recent other = fp3.
+        // fp1 and fp2 are evicted (oldest last_seen).
+        let evicted = db.gc("fp4", 2)?;
+        assert_eq!(evicted, 2);
+        assert_eq!(db.fingerprint_count()?, 2);
+        assert_eq!(db.test_count("fp1")?, 0);
+        assert_eq!(db.test_count("fp2")?, 0);
+        assert_eq!(db.test_count("fp3")?, 1);
+        assert_eq!(db.test_count("fp4")?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn gc_keeps_current_even_when_oldest() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![(
+            "t".to_string(),
+            BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
+        )];
+
+        for (fp, ts) in [
+            ("old_current", "2020-01-01T00:00:00Z"),
+            ("mid", "2020-01-02T00:00:00Z"),
+            ("new", "2020-01-03T00:00:00Z"),
+        ] {
+            db.store_coverage(fp, &mappings)?;
+            db.conn.execute(
+                "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
+                rusqlite::params![fp, ts],
+            )?;
+        }
+
+        // Keep 2 with old_current as current — current always survives, and
+        // the single most-recent other (new) stays. mid gets evicted.
+        let evicted = db.gc("old_current", 2)?;
+        assert_eq!(evicted, 1);
+        assert_eq!(db.test_count("old_current")?, 1);
+        assert_eq!(db.test_count("new")?, 1);
+        assert_eq!(db.test_count("mid")?, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn gc_noop_when_under_keep() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![(
+            "t".to_string(),
+            BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
+        )];
+        db.store_coverage(FP_A, &mappings)?;
+        db.store_coverage(FP_B, &mappings)?;
+
+        let evicted = db.gc(FP_A, 10)?;
+        assert_eq!(evicted, 0);
+        assert_eq!(db.fingerprint_count()?, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn gc_noop_on_empty_db() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+        assert_eq!(db.gc("any_fp", 10)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_backfills_fingerprints_for_pre_gc_db() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        // Simulate a DB written by code that had fingerprinted test_files but
+        // no `fingerprints` table yet.
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE test_files (
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (test_name, source_file, env_fingerprint)
+                );
+                INSERT INTO test_files VALUES ('t1', 'src/lib.rs', 'fp_old_a');
+                INSERT INTO test_files VALUES ('t2', 'src/lib.rs', 'fp_old_b');
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert_eq!(db.fingerprint_count()?, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_also_wipes_fingerprints_table() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![(
+            "t".to_string(),
+            BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
+        )];
+        db.store_coverage(FP_A, &mappings)?;
+        db.store_coverage(FP_B, &mappings)?;
+        assert_eq!(db.fingerprint_count()?, 2);
+
+        db.clear()?;
+        assert_eq!(db.fingerprint_count()?, 0);
 
         Ok(())
     }

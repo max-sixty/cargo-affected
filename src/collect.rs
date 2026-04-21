@@ -32,7 +32,7 @@ use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
 use crate::coverage;
-use crate::db::{db_path, difftest_dir, Db};
+use crate::db::{db_path, difftest_dir, Db, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
@@ -205,14 +205,20 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     let total_elapsed = total_start.elapsed();
     let mapping_count: usize = mappings.iter().map(|(_, f)| f.len()).sum();
 
+    let mut db = Db::open(project_root)?;
     if diff_base.is_some() {
         eprintln!("updating {} test mappings in database...", mappings.len());
-        let mut db = Db::open(project_root)?;
         db.update_coverage(&env_fingerprint, &mappings)?;
     } else {
         eprintln!("storing {} test mappings in database...", mappings.len());
-        let mut db = Db::open(project_root)?;
         db.store_coverage(&env_fingerprint, &mappings)?;
+    }
+
+    let evicted = db.gc(&env_fingerprint, FINGERPRINT_KEEP)?;
+    if evicted > 0 {
+        let kept = db.fingerprint_count()?;
+        let s = if evicted == 1 { "" } else { "s" };
+        eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
     eprintln!(
