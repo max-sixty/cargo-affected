@@ -257,4 +257,40 @@ fn test_full_pipeline() {
         stdout.contains("1 skipped"),
         "status should report 1 skipped test, got:\n{stdout}"
     );
+
+    // Add a new integration test that didn't exist at collect time. No
+    // existing test covers it, so the only way it should be selected is via
+    // nextest-list-based new-test detection.
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("tests/integration_new.rs"),
+        "#[test]\nfn test_brand_new() {\n    assert_eq!(1 + 1, 2);\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_affected(dir, &["affected", "status", "-v"]);
+    assert!(
+        output.status.success(),
+        "status (with new test) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("test_brand_new"),
+        "status should list the new test, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(new)"),
+        "status should tag new tests with (new), got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 new"),
+        "status should report 1 new test in the summary, got:\n{stdout}"
+    );
+    // The math tests still appear (math.rs is still modified).
+    assert!(
+        stdout.contains("test_add"),
+        "status should still list test_add (math.rs still modified), got:\n{stdout}"
+    );
 }

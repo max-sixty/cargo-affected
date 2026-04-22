@@ -95,7 +95,7 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     // cache hit. Fingerprint is taken now so Cargo.lock is in its final state
     // — status/run will compare against that same state.
     eprintln!("listing tests with cargo nextest list...");
-    let listing = nextest_list(project_root, &rustflags, &profraw_dir)?;
+    let listing = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
     eprintln!(
         "found {} tests across {} binaries",
         listing.tests.len(),
@@ -420,31 +420,39 @@ fn select_tests_for_incremental(
 
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
 /// pair, plus a binary_path → binary_id map for the runner shim.
-struct Listing {
-    tests: Vec<TestId>,
-    binary_map: HashMap<String, String>,
+pub(crate) struct Listing {
+    pub(crate) tests: Vec<TestId>,
+    pub(crate) binary_map: HashMap<String, String>,
 }
 
 /// Enumerate all tests via `cargo nextest list --message-format json`.
 ///
-/// Builds test binaries with the given RUSTFLAGS (coverage instrumentation)
-/// and parses the JSON on stdout. We don't set the runner env here —
-/// nextest just asks binaries for their listings.
-fn nextest_list(project_root: &Path, rustflags: &str, profraw_dir: &Path) -> Result<Listing> {
-    let child = Command::new("cargo")
-        .arg("nextest")
+/// `rustflags_override` sets RUSTFLAGS in the child env (collect passes
+/// `-C instrument-coverage`; run/status leave it `None` to inherit the user's
+/// environment). `profraw_dir`, when set, redirects any build-script profraw
+/// so stray files don't land in the project root — only collect needs this.
+pub(crate) fn nextest_list(
+    project_root: &Path,
+    rustflags_override: Option<&str>,
+    profraw_dir: Option<&Path>,
+) -> Result<Listing> {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("nextest")
         .arg("list")
         .arg("--message-format")
         .arg("json")
-        .env("RUSTFLAGS", rustflags)
-        // Contain any stray build-script profraw within our workspace.
-        .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .current_dir(project_root)
+        .current_dir(project_root);
+    if let Some(rf) = rustflags_override {
+        cmd.env("RUSTFLAGS", rf);
+    }
+    if let Some(dir) = profraw_dir {
+        cmd.env("LLVM_PROFILE_FILE", dir.join("build-%p-%m.profraw"));
+    }
+    let output = cmd
         .spawn()
-        .context("failed to spawn cargo nextest list")?;
-    let output = child
+        .context("failed to spawn cargo nextest list")?
         .wait_with_output()
         .context("failed to wait for cargo nextest list")?;
     if !output.status.success() {
