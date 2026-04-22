@@ -14,7 +14,7 @@ use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
-/// Entry point for `cargo difftest run`. Returns the exit code to propagate.
+/// Entry point for `cargo affected run`. Returns the exit code to propagate.
 pub fn run(
     diff_base: Option<&str>,
     all: bool,
@@ -48,7 +48,7 @@ pub fn run(
             );
             return run_tests(project_root, None, nextest_args);
         }
-        eprintln!("no coverage data yet — run `cargo difftest collect` first");
+        eprintln!("no coverage data yet — run `cargo affected collect` first");
         return Ok(0);
     }
 
@@ -63,7 +63,7 @@ pub fn run(
     let tests = db.tests_covering(&env_fingerprint, &file_refs)?;
 
     if tests.is_empty() {
-        eprintln!("no tests cover the changed files (run `cargo difftest collect` to update)");
+        eprintln!("no tests cover the changed files (run `cargo affected collect` to update)");
         return Ok(0);
     }
 

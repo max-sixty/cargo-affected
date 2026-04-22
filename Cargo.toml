@@ -1,10 +1,10 @@
 [package]
-name = "cargo-difftest"
+name = "cargo-affected"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "cargo-difftest"
+name = "cargo-affected"
 path = "src/main.rs"
 
 [dependencies]

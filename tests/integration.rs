@@ -1,4 +1,4 @@
-//! Integration test for the full cargo-difftest pipeline.
+//! Integration test for the full cargo-affected pipeline.
 //!
 //! Creates a temp Rust project, initializes git, runs collect, then verifies
 //! that status correctly identifies affected tests after a source change.
@@ -9,14 +9,14 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Run cargo-difftest binary with the given args in the given directory.
-fn cargo_difftest(dir: &Path, args: &[&str]) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_cargo-difftest");
+/// Run cargo-affected binary with the given args in the given directory.
+fn cargo_affected(dir: &Path, args: &[&str]) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_cargo-affected");
     Command::new(bin)
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap_or_else(|e| panic!("failed to run cargo-difftest: {e}"))
+        .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
 }
 
 /// Run a git command in the given directory, panicking on failure.
@@ -76,7 +76,7 @@ edition = "2021"
     )
     .unwrap();
 
-    // Real cargo projects ignore target/. Without this, cargo-difftest's own
+    // Real cargo projects ignore target/. Without this, cargo-affected's own
     // profraw dirs (which include test names) leak into `git status` as
     // untracked paths.
     std::fs::write(dir.join(".gitignore"), "/target\n").unwrap();
@@ -162,7 +162,7 @@ fn test_full_pipeline() {
     git(dir, &["commit", "-m", "initial"]);
 
     // Run collect.
-    let output = cargo_difftest(dir, &["difftest", "collect"]);
+    let output = cargo_affected(dir, &["affected", "collect"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -175,10 +175,10 @@ fn test_full_pipeline() {
     );
 
     // Verify the DB was created.
-    let db_path = dir.join("target").join("difftest").join("coverage.db");
+    let db_path = dir.join("target").join("affected").join("coverage.db");
     assert!(
         db_path.exists(),
-        "target/difftest/coverage.db should exist after collect"
+        "target/affected/coverage.db should exist after collect"
     );
 
     // Read the DB and verify mappings.
@@ -231,7 +231,7 @@ fn test_full_pipeline() {
     std::fs::write(&math_path, format!("{content}\n// changed\n")).unwrap();
 
     // Run status and verify only math tests are listed.
-    let output = cargo_difftest(dir, &["difftest", "status", "-v"]);
+    let output = cargo_affected(dir, &["affected", "status", "-v"]);
     assert!(
         output.status.success(),
         "status failed: {}",

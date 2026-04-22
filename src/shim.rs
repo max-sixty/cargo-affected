@@ -1,17 +1,17 @@
 //! Per-test coverage runner shim.
 //!
 //! Invoked by cargo/nextest through `CARGO_TARGET_<TRIPLE>_RUNNER`. Cargo sets
-//! that var to `<cargo-difftest> runner-shim` and calls it with the test binary
+//! that var to `<cargo-affected> runner-shim` and calls it with the test binary
 //! and its args:
 //!
 //! ```text
-//! cargo-difftest runner-shim <test-binary> <test-args…>
+//! cargo-affected runner-shim <test-binary> <test-args…>
 //! ```
 //!
 //! The shim recovers the test name from `--exact <name>`, looks up the
 //! invoking binary's stable `binary_id` via a path→id map serialized by
-//! `collect` (env `DIFFTEST_BINARY_MAP`), points `LLVM_PROFILE_FILE` at a
-//! per-test subdirectory under `DIFFTEST_PROFRAW_BASE`, writes a sidecar
+//! `collect` (env `CARGO_AFFECTED_BINARY_MAP`), points `LLVM_PROFILE_FILE` at a
+//! per-test subdirectory under `CARGO_AFFECTED_PROFRAW_BASE`, writes a sidecar
 //! `meta` file (test name + binary path + binary_id), then `exec`s the test
 //! binary. No other setup — nextest and cargo already provide the full test
 //! environment.
@@ -34,23 +34,23 @@ use std::process::Command;
 /// Never returns — either `exec`s the test binary or exits with an error.
 pub fn run(args: &[String]) -> ! {
     let Some((binary, rest)) = args.split_first() else {
-        eprintln!("cargo-difftest runner-shim: missing test binary argument");
+        eprintln!("cargo-affected runner-shim: missing test binary argument");
         std::process::exit(2);
     };
 
     if let Some(name) = find_exact(rest) {
-        let base = std::env::var("DIFFTEST_PROFRAW_BASE").unwrap_or_else(|_| {
-            eprintln!("cargo-difftest runner-shim: DIFFTEST_PROFRAW_BASE not set");
+        let base = std::env::var("CARGO_AFFECTED_PROFRAW_BASE").unwrap_or_else(|_| {
+            eprintln!("cargo-affected runner-shim: CARGO_AFFECTED_PROFRAW_BASE not set");
             std::process::exit(2);
         });
-        let map_path = std::env::var("DIFFTEST_BINARY_MAP").unwrap_or_else(|_| {
-            eprintln!("cargo-difftest runner-shim: DIFFTEST_BINARY_MAP not set");
+        let map_path = std::env::var("CARGO_AFFECTED_BINARY_MAP").unwrap_or_else(|_| {
+            eprintln!("cargo-affected runner-shim: CARGO_AFFECTED_BINARY_MAP not set");
             std::process::exit(2);
         });
         let binary_path = PathBuf::from(binary);
         let binary_id = resolve_binary_id(Path::new(&map_path), &binary_path).unwrap_or_else(|e| {
             eprintln!(
-                "cargo-difftest runner-shim: failed to resolve binary_id for {}: {e}",
+                "cargo-affected runner-shim: failed to resolve binary_id for {}: {e}",
                 binary_path.display()
             );
             std::process::exit(2);
@@ -60,7 +60,7 @@ pub fn run(args: &[String]) -> ! {
         let dir = Path::new(&base).join(subdir);
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
-                "cargo-difftest runner-shim: failed to create {}: {e}",
+                "cargo-affected runner-shim: failed to create {}: {e}",
                 dir.display()
             );
             std::process::exit(2);
@@ -78,7 +78,7 @@ pub fn run(args: &[String]) -> ! {
 
     let err = Command::new(binary).args(rest).exec();
     eprintln!(
-        "cargo-difftest runner-shim: exec {} failed: {err}",
+        "cargo-affected runner-shim: exec {} failed: {err}",
         binary
     );
     std::process::exit(127);

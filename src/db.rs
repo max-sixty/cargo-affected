@@ -41,7 +41,7 @@ fn translate_busy(err: rusqlite::Error, ctx: &'static str) -> anyhow::Error {
         rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseBusy
     ) {
         anyhow::anyhow!(
-            "another cargo-difftest process appears to be holding the \
+            "another cargo-affected process appears to be holding the \
              database lock — try again in a moment"
         )
     } else {
@@ -49,16 +49,16 @@ fn translate_busy(err: rusqlite::Error, ctx: &'static str) -> anyhow::Error {
     }
 }
 
-/// Umbrella directory for all difftest artifacts (DB, profraw files).
+/// Umbrella directory for all cargo-affected artifacts (DB, profraw files).
 /// Lives under `target/` so it shares the gitignore and lifecycle
 /// (cargo clean wipes it) of other build artifacts.
-pub fn difftest_dir(project_root: &Path) -> PathBuf {
-    project_root.join("target").join("difftest")
+pub fn affected_dir(project_root: &Path) -> PathBuf {
+    project_root.join("target").join("affected")
 }
 
-/// Canonical DB location within the difftest dir.
+/// Canonical DB location within the affected dir.
 pub fn db_path(project_root: &Path) -> PathBuf {
-    difftest_dir(project_root).join("coverage.db")
+    affected_dir(project_root).join("coverage.db")
 }
 
 const SCHEMA: &str = "\
@@ -128,11 +128,11 @@ pub struct Db {
 }
 
 impl Db {
-    /// Open (or create) the database at `project_root/target/difftest/coverage.db`.
+    /// Open (or create) the database at `project_root/target/affected/coverage.db`.
     ///
     /// Migrates older schemas (pre-fingerprint, pre-binary_id) by dropping the
     /// old `test_files` table — old rows can't be retroactively tagged, and
-    /// `target/difftest/` is cargo-clean territory, so this is a safe reset.
+    /// `target/affected/` is cargo-clean territory, so this is a safe reset.
     pub fn open(project_root: &Path) -> Result<Self> {
         let path = db_path(project_root);
         if let Some(parent) = path.parent() {
@@ -333,7 +333,7 @@ impl Db {
 
     /// Remove all coverage data (every fingerprint) and reset the `meta` table.
     ///
-    /// Used by `cargo difftest clean`. Going through SQL (rather than unlinking
+    /// Used by `cargo affected clean`. Going through SQL (rather than unlinking
     /// the file) means we acquire the normal write lock — so a concurrent
     /// `collect` finishes cleanly before its data is discarded, instead of
     /// being orphaned onto an unlinked inode.
@@ -420,7 +420,7 @@ pub fn warn_untracked_rs_files(
         if file.ends_with(".rs") && !db.file_tracked(fingerprint, file)? {
             eprintln!(
                 "warning: {file} has no coverage data \
-                 — run `cargo difftest collect` to include it"
+                 — run `cargo affected collect` to include it"
             );
         }
     }
@@ -429,7 +429,7 @@ pub fn warn_untracked_rs_files(
 
 /// Drop `test_files` if it predates any column the current schema requires
 /// (`env_fingerprint`, `binary_id`). Old rows can't be retroactively tagged
-/// with missing columns, and `target/difftest/` is cargo-clean territory, so
+/// with missing columns, and `target/affected/` is cargo-clean territory, so
 /// resetting is safe — the user re-collects.
 fn migrate_legacy_test_files(conn: &Connection) -> Result<()> {
     let exists: bool = conn.query_row(

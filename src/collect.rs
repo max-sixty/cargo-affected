@@ -1,7 +1,7 @@
 //! Coverage collection pipeline.
 //!
 //! Delegates build and test execution to `cargo nextest run`. We insert a
-//! small runner shim (`cargo-difftest runner-shim`) via
+//! small runner shim (`cargo-affected runner-shim`) via
 //! `CARGO_TARGET_<TRIPLE>_RUNNER` that points `LLVM_PROFILE_FILE` at a
 //! per-test subdirectory before `exec`ing the real test binary. After nextest
 //! finishes we walk those subdirectories, merge profraws, export coverage,
@@ -13,7 +13,7 @@
 //!    corresponding tests.
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
 //!    (id + path) and every testcase. We write a binary_path → binary_id map
-//!    to disk and hand it to the shim via `DIFFTEST_BINARY_MAP` — the shim
+//!    to disk and hand it to the shim via `CARGO_AFFECTED_BINARY_MAP` — the shim
 //!    needs binary_id to disambiguate same-named tests across binaries. In
 //!    incremental mode, the listing also drives the nextest `-E` filter.
 //! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
@@ -34,11 +34,11 @@ use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
 use crate::coverage;
-use crate::db::{db_path, difftest_dir, Db, TestId, FINGERPRINT_KEEP};
+use crate::db::{affected_dir, db_path, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
-/// Entry point for `cargo difftest collect`. Returns nextest's exit code.
+/// Entry point for `cargo affected collect`. Returns nextest's exit code.
 pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> {
     let total_start = Instant::now();
     let project = find_project_root()?;
@@ -59,9 +59,9 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     eprintln!("llvm-profdata: {}", llvm_profdata.display());
     eprintln!("llvm-cov: {}", llvm_cov.display());
 
-    // Profraw files live under target/difftest/ alongside the DB. PID suffix
+    // Profraw files live under target/affected/ alongside the DB. PID suffix
     // so concurrent `collect` invocations don't wipe each other's files.
-    let profraw_dir = difftest_dir(project_root).join(format!("profraw-{}", std::process::id()));
+    let profraw_dir = affected_dir(project_root).join(format!("profraw-{}", std::process::id()));
     if profraw_dir.exists() {
         std::fs::remove_dir_all(&profraw_dir).context("failed to clean profraw dir")?;
     }
@@ -130,8 +130,8 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
         .arg("run")
         .env("RUSTFLAGS", &rustflags)
         .env(&runner_env_name, &runner_env_value)
-        .env("DIFFTEST_PROFRAW_BASE", &profraw_dir)
-        .env("DIFFTEST_BINARY_MAP", &binary_map_path)
+        .env("CARGO_AFFECTED_PROFRAW_BASE", &profraw_dir)
+        .env("CARGO_AFFECTED_BINARY_MAP", &binary_map_path)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -232,7 +232,7 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     }
 
     eprintln!(
-        "done. {} tests, {} mappings stored in target/difftest/coverage.db ({:.1}s total)",
+        "done. {} tests, {} mappings stored in target/affected/coverage.db ({:.1}s total)",
         mappings.len(),
         mapping_count,
         total_elapsed.as_secs_f64(),
@@ -604,7 +604,7 @@ pub(crate) fn require_nextest(project_root: &Path) -> Result<()> {
         .unwrap_or(false);
     if !ok {
         bail!(
-            "cargo-difftest requires cargo-nextest. \
+            "cargo-affected requires cargo-nextest. \
              Install it with `cargo install cargo-nextest --locked`."
         );
     }

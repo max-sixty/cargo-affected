@@ -1,4 +1,4 @@
-//! cargo-difftest: Run only the tests affected by your changes.
+//! cargo-affected: Run only the tests affected by your changes.
 //!
 //! Uses LLVM coverage data to map each test to the source files it touches,
 //! then queries git for changed files to select which tests to rerun.
@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 
 /// Run only the tests affected by your changes.
 #[derive(Parser)]
-#[command(name = "cargo-difftest", bin_name = "cargo-difftest")]
+#[command(name = "cargo-affected", bin_name = "cargo-affected")]
 struct Cli {
     #[command(subcommand)]
     command: CargoSubcommand,
@@ -25,8 +25,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CargoSubcommand {
-    /// The actual difftest subcommand (invoked as `cargo difftest <action>`).
-    Difftest {
+    /// The actual affected subcommand (invoked as `cargo affected <action>`).
+    Affected {
         #[command(subcommand)]
         action: Action,
     },
@@ -70,7 +70,7 @@ enum Action {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Clear stored coverage data from target/difftest/coverage.db.
+    /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
 }
 
@@ -99,7 +99,7 @@ fn main() {
     }
 
     let cli = Cli::parse();
-    let CargoSubcommand::Difftest { action } = cli.command;
+    let CargoSubcommand::Affected { action } = cli.command;
 
     let exit_code = match run_action(action) {
         Ok(code) => code,

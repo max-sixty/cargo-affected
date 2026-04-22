@@ -6,14 +6,14 @@ use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
-/// Entry point for `cargo difftest status`.
+/// Entry point for `cargo affected status`.
 pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
     let path = db_path(project_root);
     if !path.exists() {
-        println!("no coverage data found — run `cargo difftest collect` first");
+        println!("no coverage data found — run `cargo affected collect` first");
         return Ok(());
     }
 
@@ -36,7 +36,7 @@ pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
         println!(
             "coverage database: {}\n\
              last collected: {last_collected}\n\
-             {reason} — run `cargo difftest collect`",
+             {reason} — run `cargo affected collect`",
             rel_path.display(),
         );
         return Ok(());
