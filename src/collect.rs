@@ -11,18 +11,20 @@
 //! 1. Read crate roots (lib.rs/main.rs/tests/*.rs) from `cargo metadata` —
 //!    every test implicitly depends on these so edits re-select the
 //!    corresponding tests.
-//! 2. In incremental mode only: `cargo nextest list --message-format json`
-//!    to enumerate tests, then translate the affected-plus-new set into a
-//!    nextest `-E 'test(=…) | …'` filter.
+//! 2. `cargo nextest list --message-format json` to enumerate every binary
+//!    (id + path) and every testcase. We write a binary_path → binary_id map
+//!    to disk and hand it to the shim via `DIFFTEST_BINARY_MAP` — the shim
+//!    needs binary_id to disambiguate same-named tests across binaries. In
+//!    incremental mode, the listing also drives the nextest `-E` filter.
 //! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
-//!    runner env set — one build step in full mode, a cache-hit second
-//!    invocation in incremental. nextest handles parallelism and progress.
+//!    runner env set. The preceding `list` step built the binaries, so `run`
+//!    is a cache hit on cargo. nextest handles parallelism and progress.
 //! 4. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
 //!    merge with `llvm-profdata`, export with `llvm-cov`, parse covered files.
 //!    Parallelized across workers.
-//! 5. Store mappings in the DB.
+//! 5. Store mappings in the DB keyed by (binary_id, test_name).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -32,7 +34,7 @@ use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
 use crate::coverage;
-use crate::db::{db_path, difftest_dir, Db, FINGERPRINT_KEEP};
+use crate::db::{db_path, difftest_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
@@ -85,27 +87,35 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     }
     rustflags.push_str("-C instrument-coverage");
 
-    // In incremental mode, list tests so we can filter. The list step builds
-    // with the same RUSTFLAGS; the subsequent run is a cache hit. We compute
-    // the fingerprint here (post-list-build) so Cargo.lock is in its final
-    // state — status/run will compare against that same state.
-    let (nextest_filter, early_fingerprint) = match diff_base {
-        None => (None, None::<String>),
+    // List first (always). Gives us:
+    //   (a) binary_path → binary_id map for the shim
+    //   (b) every (binary_id, test_name) pair, used in incremental mode to
+    //       compute the rerun set
+    // The list step builds with the same RUSTFLAGS; the subsequent run is a
+    // cache hit. Fingerprint is taken now so Cargo.lock is in its final state
+    // — status/run will compare against that same state.
+    eprintln!("listing tests with cargo nextest list...");
+    let listing = nextest_list(project_root, &rustflags, &profraw_dir)?;
+    eprintln!(
+        "found {} tests across {} binaries",
+        listing.tests.len(),
+        listing.binary_map.len()
+    );
+    let env_fingerprint = fingerprint::compute(&project)?;
+
+    let binary_map_path = profraw_dir.join("binary_map.json");
+    write_binary_map(&binary_map_path, &listing.binary_map)?;
+
+    let nextest_filter = match diff_base {
+        None => None,
         Some(base) => {
-            eprintln!("listing tests with cargo nextest list...");
-            let all_tests = nextest_list_tests(project_root, &rustflags, &profraw_dir)?;
-            eprintln!("found {} tests", all_tests.len());
-            let env_fingerprint = fingerprint::compute(&project)?;
             let selected =
-                select_tests_for_incremental(base, project_root, &env_fingerprint, &all_tests)?;
+                select_tests_for_incremental(base, project_root, &env_fingerprint, &listing.tests)?;
             if selected.is_empty() {
                 eprintln!("no tests to re-collect");
                 return Ok(0);
             }
-            (
-                Some(nextest_filter_expr(&selected)),
-                Some(env_fingerprint),
-            )
+            Some(nextest_filter_expr(&selected))
         }
     };
 
@@ -121,6 +131,7 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
         .env("RUSTFLAGS", &rustflags)
         .env(&runner_env_name, &runner_env_value)
         .env("DIFFTEST_PROFRAW_BASE", &profraw_dir)
+        .env("DIFFTEST_BINARY_MAP", &binary_map_path)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -137,12 +148,6 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
 
     // Sweep any stray profraw files instrumented subprocesses dropped in root.
     clean_profraw_files(project_root)?;
-
-    // In full mode the build happened during nextest run, so fingerprint now.
-    let env_fingerprint = match early_fingerprint {
-        Some(f) => f,
-        None => fingerprint::compute(&project)?,
-    };
 
     // Step 4: Walk profraw_base subdirs — one per test — and extract coverage.
     let test_dirs = list_test_dirs(&profraw_dir)?;
@@ -161,7 +166,7 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
     let progress: Mutex<usize> = Mutex::new(0);
     let work: Mutex<VecDeque<(usize, PathBuf)>> =
         Mutex::new(test_dirs.into_iter().enumerate().collect());
-    let mappings: Mutex<Vec<(String, BTreeSet<Utf8PathBuf>)>> = Mutex::new(Vec::new());
+    let mappings: Mutex<Vec<(TestId, BTreeSet<Utf8PathBuf>)>> = Mutex::new(Vec::new());
 
     std::thread::scope(|s| {
         for _ in 0..num_workers {
@@ -176,17 +181,22 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
                 *guard += 1;
                 let n = *guard;
                 match outcome {
-                    Ok(ExtractOutcome::Collected { test_name, mut files }) => {
+                    Ok(ExtractOutcome::Collected { test_id, mut files }) => {
                         files.extend(crate_roots.iter().cloned());
                         eprintln!(
-                            "[{n}/{total}] {test_name}: {} files ({elapsed:.1}s)",
+                            "[{n}/{total}] {}::{}: {} files ({elapsed:.1}s)",
+                            test_id.binary_id,
+                            test_id.test_name,
                             files.len()
                         );
                         drop(guard);
-                        mappings.lock().unwrap().push((test_name, files));
+                        mappings.lock().unwrap().push((test_id, files));
                     }
-                    Ok(ExtractOutcome::Skipped { test_name, reason }) => {
-                        eprintln!("[{n}/{total}] {test_name}: SKIP ({reason})");
+                    Ok(ExtractOutcome::Skipped { test_id, reason }) => {
+                        eprintln!(
+                            "[{n}/{total}] {}::{}: SKIP ({reason})",
+                            test_id.binary_id, test_id.test_name
+                        );
                     }
                     Err(e) => {
                         eprintln!(
@@ -233,19 +243,20 @@ pub fn collect(diff_base: Option<&str>, nextest_args: &[String]) -> Result<i32> 
 /// Outcome of coverage extraction for a single per-test directory.
 enum ExtractOutcome {
     Collected {
-        test_name: String,
+        test_id: TestId,
         files: BTreeSet<Utf8PathBuf>,
     },
     Skipped {
-        test_name: String,
+        test_id: TestId,
         reason: String,
     },
 }
 
 /// Merge profraws in `dir` and export coverage.
 ///
-/// Reads the `meta` sidecar the shim wrote (test name + binary path) so we
-/// know exactly which binary to pass to `llvm-cov export`.
+/// Reads the `meta` sidecar the shim wrote (test name + binary path +
+/// binary_id) so we know exactly which binary to pass to `llvm-cov export`
+/// and how to store the result in the DB.
 fn extract_one(
     dir: &Path,
     llvm_profdata: &Path,
@@ -263,12 +274,17 @@ fn extract_one(
         .next()
         .context("meta sidecar missing binary path")?
         .to_string();
+    let binary_id = lines
+        .next()
+        .context("meta sidecar missing binary_id")?
+        .to_string();
+    let test_id = TestId::new(binary_id, test_name);
     let binary = PathBuf::from(binary);
 
     let profraw_files = list_profraw_files(dir)?;
     if profraw_files.is_empty() {
         return Ok(ExtractOutcome::Skipped {
-            test_name,
+            test_id,
             reason: "no profraw generated".into(),
         });
     }
@@ -285,7 +301,7 @@ fn extract_one(
         .context("failed to run llvm-profdata merge")?;
     if !merge_output.status.success() {
         return Ok(ExtractOutcome::Skipped {
-            test_name,
+            test_id,
             reason: format!(
                 "llvm-profdata merge failed: {}",
                 String::from_utf8_lossy(&merge_output.stderr).trim()
@@ -302,7 +318,7 @@ fn extract_one(
         .context("failed to run llvm-cov export")?;
     if !export_output.status.success() {
         return Ok(ExtractOutcome::Skipped {
-            test_name,
+            test_id,
             reason: format!(
                 "llvm-cov export failed: {}",
                 String::from_utf8_lossy(&export_output.stderr).trim()
@@ -312,19 +328,40 @@ fn extract_one(
 
     let json = String::from_utf8_lossy(&export_output.stdout);
     match coverage::extract_covered_files(&json, project_root) {
-        Ok(files) => Ok(ExtractOutcome::Collected { test_name, files }),
+        Ok(files) => Ok(ExtractOutcome::Collected { test_id, files }),
         Err(e) => Ok(ExtractOutcome::Skipped {
-            test_name,
+            test_id,
             reason: format!("parse error: {e}"),
         }),
     }
 }
 
-/// Build a nextest `-E` filter expression matching exactly the given test names.
-fn nextest_filter_expr(names: &[String]) -> String {
-    names
-        .iter()
-        .map(|n| format!("test(={n})"))
+/// Build a nextest `-E` filter expression matching exactly the given tests,
+/// grouped by binary_id so one `binary_id(=X)` predicate covers each crate's
+/// tests: `(binary_id(=X) & (test(=a) | test(=b))) | (binary_id(=Y) & test(=c))`.
+///
+/// `binary_id()` (not `binary()`) is the right predicate: the latter matches
+/// the short binary name (e.g. `builds`) and so doesn't disambiguate
+/// same-named binaries across workspace crates.
+pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
+    let mut by_binary: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for t in tests {
+        by_binary
+            .entry(t.binary_id.as_str())
+            .or_default()
+            .push(t.test_name.as_str());
+    }
+    by_binary
+        .into_iter()
+        .map(|(binary_id, names)| {
+            let inner = names
+                .iter()
+                .map(|n| format!("test(={n})"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("(binary_id(={binary_id}) & ({inner}))")
+        })
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -334,8 +371,8 @@ fn select_tests_for_incremental(
     diff_base: &str,
     project_root: &Path,
     fingerprint: &str,
-    all_test_names: &[String],
-) -> Result<Vec<String>> {
+    all_tests: &[TestId],
+) -> Result<Vec<TestId>> {
     let changed_files = git_changed_files(project_root, Some(diff_base))?;
     if changed_files.is_empty() {
         eprintln!("no changed files vs {diff_base}");
@@ -349,24 +386,23 @@ fn select_tests_for_incremental(
 
     if !db_path(project_root).exists() {
         eprintln!("no existing DB — collecting all tests");
-        return Ok(all_test_names.to_vec());
+        return Ok(all_tests.to_vec());
     }
 
     let db = Db::open(project_root)?;
     let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
     let affected_tests = db.tests_covering(fingerprint, &file_refs)?;
-    let known_tests = db.all_test_names(fingerprint)?;
+    let known_tests = db.all_tests(fingerprint)?;
 
-    let new_tests: BTreeSet<&str> = all_test_names
+    let new_tests: BTreeSet<&TestId> = all_tests
         .iter()
-        .map(|s| s.as_str())
-        .filter(|name| !known_tests.contains(*name))
+        .filter(|t| !known_tests.contains(*t))
         .collect();
 
-    let tests_to_run: BTreeSet<&str> = affected_tests
+    let tests_to_run: BTreeSet<TestId> = affected_tests
         .iter()
-        .map(|s| s.as_str())
-        .chain(new_tests.iter().copied())
+        .cloned()
+        .chain(new_tests.iter().map(|t| (*t).clone()))
         .collect();
 
     if !new_tests.is_empty() {
@@ -379,19 +415,22 @@ fn select_tests_for_incremental(
         new_tests.len()
     );
 
-    Ok(tests_to_run.iter().map(|s| s.to_string()).collect())
+    Ok(tests_to_run.into_iter().collect())
 }
 
-/// Enumerate all test names via `cargo nextest list --message-format json`.
+/// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
+/// pair, plus a binary_path → binary_id map for the runner shim.
+struct Listing {
+    tests: Vec<TestId>,
+    binary_map: HashMap<String, String>,
+}
+
+/// Enumerate all tests via `cargo nextest list --message-format json`.
 ///
 /// Builds test binaries with the given RUSTFLAGS (coverage instrumentation)
-/// and parses the single-object JSON on stdout for every test case. We don't
-/// set the runner env here — nextest just asks binaries for their listings.
-fn nextest_list_tests(
-    project_root: &Path,
-    rustflags: &str,
-    profraw_dir: &Path,
-) -> Result<Vec<String>> {
+/// and parses the JSON on stdout. We don't set the runner env here —
+/// nextest just asks binaries for their listings.
+fn nextest_list(project_root: &Path, rustflags: &str, profraw_dir: &Path) -> Result<Listing> {
     let child = Command::new("cargo")
         .arg("nextest")
         .arg("list")
@@ -417,18 +456,38 @@ fn nextest_list_tests(
     let json: serde_json::Value =
         serde_json::from_str(stdout).context("failed to parse nextest list JSON")?;
 
-    let mut names = BTreeSet::new();
+    let mut tests = BTreeSet::new();
+    let mut binary_map = HashMap::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
+            let binary_id = suite
+                .get("binary-id")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing binary-id")?
+                .to_string();
+            if let Some(binary_path) = suite.get("binary-path").and_then(|v| v.as_str()) {
+                binary_map.insert(binary_path.to_string(), binary_id.clone());
+            }
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
             };
             for case in cases.keys() {
-                names.insert(case.clone());
+                tests.insert(TestId::new(binary_id.clone(), case.clone()));
             }
         }
     }
-    Ok(names.into_iter().collect())
+    Ok(Listing {
+        tests: tests.into_iter().collect(),
+        binary_map,
+    })
+}
+
+/// Write the binary_path → binary_id map as JSON for the runner shim.
+fn write_binary_map(path: &Path, map: &HashMap<String, String>) -> Result<()> {
+    let json = serde_json::to_string(map).context("serializing binary map")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("writing binary map to {}", path.display()))?;
+    Ok(())
 }
 
 /// Crate roots of all test-producing workspace targets, relative to the
@@ -608,5 +667,35 @@ fn current_target() -> String {
                 .map(|l| l.trim_start_matches("host:").trim().to_string())
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_expr_empty() {
+        assert_eq!(nextest_filter_expr(&[]), "");
+    }
+
+    #[test]
+    fn filter_expr_groups_by_binary() {
+        // Tests sharing a name across binaries must both appear, each scoped
+        // to its own binary — the whole point of the (binary, test) tuple.
+        let tests = vec![
+            TestId::new("mock-stub::builds", "builds"),
+            TestId::new("wt-perf::builds", "builds"),
+            TestId::new("worktrunk", "utils::tests::test_x"),
+            TestId::new("worktrunk", "utils::tests::test_y"),
+        ];
+        let expr = nextest_filter_expr(&tests);
+        // Grouping is by binary (BTreeMap order, so alphabetic by binary_id).
+        assert_eq!(
+            expr,
+            "(binary_id(=mock-stub::builds) & (test(=builds))) | \
+             (binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y))) | \
+             (binary_id(=wt-perf::builds) & (test(=builds)))"
+        );
+    }
 }
 

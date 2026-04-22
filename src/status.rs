@@ -81,7 +81,7 @@ pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
                 tests.len()
             );
             for t in &tests {
-                println!("  {t}");
+                println!("  {}::{}", t.binary_id, t.test_name);
             }
         } else {
             println!(

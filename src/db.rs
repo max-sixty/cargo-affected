@@ -2,9 +2,12 @@
 //!
 //! Schema:
 //! - `meta` — key/value pairs (e.g. last collection timestamp)
-//! - `test_files` — (test_name, source_file, env_fingerprint) triples with
-//!   index on (source_file, env_fingerprint) for fast "which tests under the
-//!   current env cover this file?" queries.
+//! - `test_files` — (binary_id, test_name, source_file, env_fingerprint)
+//!   tuples with index on (source_file, env_fingerprint) for fast "which tests
+//!   under the current env cover this file?" queries. `binary_id` is
+//!   nextest's stable package-qualified identifier (e.g.
+//!   `mock-stub::builds`) — without it two tests sharing a name across
+//!   binaries collide and lose coverage silently.
 //! - `fingerprints` — (fingerprint, last_seen) used for LRU garbage
 //!   collection. Touched on every write and on every non-empty read; `gc()`
 //!   evicts the oldest fingerprints once more than `FINGERPRINT_KEEP` are
@@ -64,10 +67,11 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS test_files (
+    binary_id TEXT NOT NULL,
     test_name TEXT NOT NULL,
     source_file TEXT NOT NULL,
     env_fingerprint TEXT NOT NULL,
-    PRIMARY KEY (test_name, source_file, env_fingerprint)
+    PRIMARY KEY (binary_id, test_name, source_file, env_fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_source_file_fp ON test_files(source_file, env_fingerprint);
 CREATE TABLE IF NOT EXISTS fingerprints (
@@ -75,6 +79,29 @@ CREATE TABLE IF NOT EXISTS fingerprints (
     last_seen TEXT NOT NULL
 );
 ";
+
+/// Identifier for a single test: nextest's stable `binary_id`
+/// (e.g. `mock-stub::builds`) paired with the test name inside that binary.
+///
+/// Before binary_id was tracked, two tests with the same name in different
+/// binaries collapsed into one DB row and one test's coverage was silently
+/// overwritten. The (binary_id, test_name) tuple is nextest's actual unit of
+/// test identity, so we use it everywhere — storage keys, filter expressions,
+/// counts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TestId {
+    pub binary_id: String,
+    pub test_name: String,
+}
+
+impl TestId {
+    pub fn new(binary_id: impl Into<String>, test_name: impl Into<String>) -> Self {
+        Self {
+            binary_id: binary_id.into(),
+            test_name: test_name.into(),
+        }
+    }
+}
 
 /// How many distinct fingerprints to retain. `gc()` evicts the least-recently-
 /// used fingerprints beyond this cap, always keeping the caller's current one.
@@ -103,9 +130,9 @@ pub struct Db {
 impl Db {
     /// Open (or create) the database at `project_root/target/difftest/coverage.db`.
     ///
-    /// Migrates pre-fingerprint schemas by dropping the old `test_files` table —
-    /// old rows can't be retroactively keyed, and `target/difftest/` is
-    /// cargo-clean territory, so this is a safe reset.
+    /// Migrates older schemas (pre-fingerprint, pre-binary_id) by dropping the
+    /// old `test_files` table — old rows can't be retroactively tagged, and
+    /// `target/difftest/` is cargo-clean territory, so this is a safe reset.
     pub fn open(project_root: &Path) -> Result<Self> {
         let path = db_path(project_root);
         if let Some(parent) = path.parent() {
@@ -116,7 +143,7 @@ impl Db {
             .with_context(|| format!("failed to open database at {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to configure SQLite busy_timeout")?;
-        migrate_pre_fingerprint_schema(&conn)?;
+        migrate_legacy_test_files(&conn)?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| translate_busy(e, "failed to initialize database schema"))?;
         backfill_fingerprints(&conn)?;
@@ -130,7 +157,7 @@ impl Db {
     pub fn store_coverage(
         &mut self,
         fingerprint: &str,
-        mappings: &[(String, BTreeSet<Utf8PathBuf>)],
+        mappings: &[(TestId, BTreeSet<Utf8PathBuf>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -140,12 +167,17 @@ impl Db {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO test_files (test_name, source_file, env_fingerprint) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO test_files (binary_id, test_name, source_file, env_fingerprint) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for (test_name, files) in mappings {
+            for (test_id, files) in mappings {
                 for file in files {
-                    stmt.execute(rusqlite::params![test_name, file.as_str(), fingerprint])?;
+                    stmt.execute(rusqlite::params![
+                        test_id.binary_id,
+                        test_id.test_name,
+                        file.as_str(),
+                        fingerprint,
+                    ])?;
                 }
             }
         }
@@ -157,21 +189,21 @@ impl Db {
         Ok(())
     }
 
-    /// Find all test names under the current fingerprint covering any of the
-    /// given source files.
+    /// Find all tests under the current fingerprint covering any of the given
+    /// source files.
     ///
     /// Bumps the fingerprint's `last_seen` when the result is non-empty — a
     /// successful read counts as "the user is actively using this cache" for
     /// GC purposes. Empty reads (no matching rows, or a fingerprint that has
     /// never been collected) don't create a spurious tracking entry.
-    pub fn tests_covering(&self, fingerprint: &str, files: &[&str]) -> Result<BTreeSet<String>> {
+    pub fn tests_covering(&self, fingerprint: &str, files: &[&str]) -> Result<BTreeSet<TestId>> {
         if files.is_empty() {
             return Ok(BTreeSet::new());
         }
 
         let placeholders: Vec<&str> = files.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT DISTINCT test_name FROM test_files \
+            "SELECT DISTINCT binary_id, test_name FROM test_files \
              WHERE env_fingerprint = ? AND source_file IN ({})",
             placeholders.join(", ")
         );
@@ -183,7 +215,9 @@ impl Db {
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
 
         let mut tests = BTreeSet::new();
         for row in rows {
@@ -198,7 +232,8 @@ impl Db {
     /// Count of distinct tests tracked under the current fingerprint.
     pub fn test_count(&self, fingerprint: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT test_name) FROM test_files WHERE env_fingerprint = ?1",
+            "SELECT COUNT(*) FROM \
+             (SELECT DISTINCT binary_id, test_name FROM test_files WHERE env_fingerprint = ?1)",
             [fingerprint],
             |r| r.get(0),
         )?;
@@ -226,12 +261,14 @@ impl Db {
         Ok(count > 0)
     }
 
-    /// All distinct test names under the current fingerprint.
-    pub fn all_test_names(&self, fingerprint: &str) -> Result<BTreeSet<String>> {
+    /// All distinct (binary_id, test_name) pairs under the current fingerprint.
+    pub fn all_tests(&self, fingerprint: &str) -> Result<BTreeSet<TestId>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT test_name FROM test_files WHERE env_fingerprint = ?1",
+            "SELECT DISTINCT binary_id, test_name FROM test_files WHERE env_fingerprint = ?1",
         )?;
-        let rows = stmt.query_map([fingerprint], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map([fingerprint], |row| {
+            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut tests = BTreeSet::new();
         for row in rows {
             tests.insert(row?);
@@ -256,23 +293,33 @@ impl Db {
     pub fn update_coverage(
         &mut self,
         fingerprint: &str,
-        mappings: &[(String, BTreeSet<Utf8PathBuf>)],
+        mappings: &[(TestId, BTreeSet<Utf8PathBuf>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
 
         {
             let mut delete_stmt = tx.prepare(
-                "DELETE FROM test_files WHERE test_name = ?1 AND env_fingerprint = ?2",
+                "DELETE FROM test_files \
+                 WHERE binary_id = ?1 AND test_name = ?2 AND env_fingerprint = ?3",
             )?;
             let mut insert_stmt = tx.prepare(
-                "INSERT INTO test_files (test_name, source_file, env_fingerprint) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO test_files (binary_id, test_name, source_file, env_fingerprint) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
 
-            for (test_name, files) in mappings {
-                delete_stmt.execute(rusqlite::params![test_name, fingerprint])?;
+            for (test_id, files) in mappings {
+                delete_stmt.execute(rusqlite::params![
+                    test_id.binary_id,
+                    test_id.test_name,
+                    fingerprint,
+                ])?;
                 for file in files {
-                    insert_stmt.execute(rusqlite::params![test_name, file.as_str(), fingerprint])?;
+                    insert_stmt.execute(rusqlite::params![
+                        test_id.binary_id,
+                        test_id.test_name,
+                        file.as_str(),
+                        fingerprint,
+                    ])?;
                 }
             }
         }
@@ -380,11 +427,11 @@ pub fn warn_untracked_rs_files(
     Ok(())
 }
 
-/// If `test_files` exists without the `env_fingerprint` column, drop it.
-/// Rows written by a pre-fingerprint version of the tool can't be retroactively
-/// tagged with a meaningful environment, so the safe move is to discard them
-/// and let the user re-collect.
-fn migrate_pre_fingerprint_schema(conn: &Connection) -> Result<()> {
+/// Drop `test_files` if it predates any column the current schema requires
+/// (`env_fingerprint`, `binary_id`). Old rows can't be retroactively tagged
+/// with missing columns, and `target/difftest/` is cargo-clean territory, so
+/// resetting is safe — the user re-collects.
+fn migrate_legacy_test_files(conn: &Connection) -> Result<()> {
     let exists: bool = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='test_files'",
         [],
@@ -397,10 +444,13 @@ fn migrate_pre_fingerprint_schema(conn: &Connection) -> Result<()> {
     let columns: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<_, _>>()?;
-    if !columns.iter().any(|c| c == "env_fingerprint") {
+    let has_fingerprint = columns.iter().any(|c| c == "env_fingerprint");
+    let has_binary_id = columns.iter().any(|c| c == "binary_id");
+    if !has_fingerprint || !has_binary_id {
         drop(stmt);
         conn.execute("DROP TABLE test_files", [])?;
         conn.execute("DROP INDEX IF EXISTS idx_source_file", [])?;
+        conn.execute("DROP INDEX IF EXISTS idx_source_file_fp", [])?;
     }
     Ok(())
 }
@@ -468,6 +518,12 @@ mod tests {
 
     const FP_A: &str = "aaaaaaaa";
     const FP_B: &str = "bbbbbbbb";
+    const BIN_A: &str = "crate_a";
+    const BIN_B: &str = "crate_b";
+
+    fn tid(binary_id: &str, test_name: &str) -> TestId {
+        TestId::new(binary_id, test_name)
+    }
 
     #[test]
     fn test_roundtrip() -> Result<()> {
@@ -482,8 +538,8 @@ mod tests {
         files_b.insert(Utf8PathBuf::from("src/lib.rs"));
 
         let mappings = vec![
-            ("test_a".to_string(), files_a),
-            ("test_b".to_string(), files_b),
+            (tid(BIN_A, "test_a"), files_a),
+            (tid(BIN_A, "test_b"), files_b),
         ];
 
         db.store_coverage(FP_A, &mappings)?;
@@ -493,17 +549,69 @@ mod tests {
 
         let covering_lib = db.tests_covering(FP_A, &["src/lib.rs"])?;
         assert_eq!(covering_lib.len(), 2);
-        assert!(covering_lib.contains("test_a"));
-        assert!(covering_lib.contains("test_b"));
+        assert!(covering_lib.contains(&tid(BIN_A, "test_a")));
+        assert!(covering_lib.contains(&tid(BIN_A, "test_b")));
 
         let covering_utils = db.tests_covering(FP_A, &["src/utils.rs"])?;
         assert_eq!(covering_utils.len(), 1);
-        assert!(covering_utils.contains("test_a"));
+        assert!(covering_utils.contains(&tid(BIN_A, "test_a")));
 
         let covering_none = db.tests_covering(FP_A, &["src/nonexistent.rs"])?;
         assert!(covering_none.is_empty());
 
         assert!(db.last_collected()?.is_some());
+
+        Ok(())
+    }
+
+    /// Two tests with the same name in different binaries must round-trip
+    /// independently. Regression guard: before binary_id tracking, the second
+    /// test's coverage silently overwrote the first.
+    #[test]
+    fn same_test_name_in_different_binaries() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings = vec![
+            (
+                tid(BIN_A, "builds"),
+                BTreeSet::from([Utf8PathBuf::from("crate_a/tests/builds.rs")]),
+            ),
+            (
+                tid(BIN_B, "builds"),
+                BTreeSet::from([Utf8PathBuf::from("crate_b/tests/builds.rs")]),
+            ),
+        ];
+        db.store_coverage(FP_A, &mappings)?;
+
+        assert_eq!(db.test_count(FP_A)?, 2);
+        assert_eq!(db.mapping_count(FP_A)?, 2);
+
+        // Each binary's `builds` is selected by its own source file.
+        let a = db.tests_covering(FP_A, &["crate_a/tests/builds.rs"])?;
+        assert_eq!(a, BTreeSet::from([tid(BIN_A, "builds")]));
+        let b = db.tests_covering(FP_A, &["crate_b/tests/builds.rs"])?;
+        assert_eq!(b, BTreeSet::from([tid(BIN_B, "builds")]));
+
+        // update_coverage is scoped by (binary_id, test_name), not just name.
+        let update = vec![(
+            tid(BIN_A, "builds"),
+            BTreeSet::from([Utf8PathBuf::from("crate_a/src/lib.rs")]),
+        )];
+        db.update_coverage(FP_A, &update)?;
+
+        // BIN_A's mapping moved, BIN_B's survived intact.
+        assert!(db
+            .tests_covering(FP_A, &["crate_a/tests/builds.rs"])?
+            .is_empty());
+        assert_eq!(
+            db.tests_covering(FP_A, &["crate_b/tests/builds.rs"])?,
+            BTreeSet::from([tid(BIN_B, "builds")])
+        );
+        assert_eq!(
+            db.tests_covering(FP_A, &["crate_a/src/lib.rs"])?,
+            BTreeSet::from([tid(BIN_A, "builds")])
+        );
 
         Ok(())
     }
@@ -514,7 +622,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         db.store_coverage(FP_A, &mappings)?;
@@ -524,7 +632,7 @@ mod tests {
         assert_eq!(db.mapping_count(FP_B)?, 0);
         assert!(db.tests_covering(FP_B, &["src/lib.rs"])?.is_empty());
         assert!(!db.file_tracked(FP_B, "src/lib.rs")?);
-        assert!(db.all_test_names(FP_B)?.is_empty());
+        assert!(db.all_tests(FP_B)?.is_empty());
 
         // But the original fingerprint still sees its rows.
         assert_eq!(db.test_count(FP_A)?, 1);
@@ -541,11 +649,11 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let a = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         let b = vec![(
-            "test_b".to_string(),
+            tid(BIN_A, "test_b"),
             BTreeSet::from([Utf8PathBuf::from("src/other.rs")]),
         )];
         db.store_coverage(FP_A, &a)?;
@@ -553,15 +661,19 @@ mod tests {
 
         // Rewriting FP_A's data leaves FP_B untouched.
         let a2 = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([Utf8PathBuf::from("src/new.rs")]),
         )];
         db.store_coverage(FP_A, &a2)?;
 
         assert_eq!(db.test_count(FP_A)?, 1);
         assert_eq!(db.test_count(FP_B)?, 1);
-        assert!(db.tests_covering(FP_B, &["src/other.rs"])?.contains("test_b"));
-        assert!(db.tests_covering(FP_A, &["src/new.rs"])?.contains("test_a"));
+        assert!(db
+            .tests_covering(FP_B, &["src/other.rs"])?
+            .contains(&tid(BIN_A, "test_b")));
+        assert!(db
+            .tests_covering(FP_A, &["src/new.rs"])?
+            .contains(&tid(BIN_A, "test_a")));
         assert!(db.tests_covering(FP_A, &["src/lib.rs"])?.is_empty());
 
         Ok(())
@@ -574,14 +686,14 @@ mod tests {
 
         let mappings = vec![
             (
-                "test_a".to_string(),
+                tid(BIN_A, "test_a"),
                 BTreeSet::from([
                     Utf8PathBuf::from("src/lib.rs"),
                     Utf8PathBuf::from("src/utils.rs"),
                 ]),
             ),
             (
-                "test_b".to_string(),
+                tid(BIN_A, "test_b"),
                 BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
             ),
         ];
@@ -590,7 +702,7 @@ mod tests {
         assert_eq!(db.mapping_count(FP_A)?, 3);
 
         let update = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([
                 Utf8PathBuf::from("src/lib.rs"),
                 Utf8PathBuf::from("src/new.rs"),
@@ -601,12 +713,14 @@ mod tests {
         assert_eq!(db.test_count(FP_A)?, 2);
         assert_eq!(db.mapping_count(FP_A)?, 3);
 
-        assert!(db.tests_covering(FP_A, &["src/new.rs"])?.contains("test_a"));
+        assert!(db
+            .tests_covering(FP_A, &["src/new.rs"])?
+            .contains(&tid(BIN_A, "test_a")));
         assert!(db.tests_covering(FP_A, &["src/utils.rs"])?.is_empty());
 
         let covering_lib = db.tests_covering(FP_A, &["src/lib.rs"])?;
-        assert!(covering_lib.contains("test_a"));
-        assert!(covering_lib.contains("test_b"));
+        assert!(covering_lib.contains(&tid(BIN_A, "test_a")));
+        assert!(covering_lib.contains(&tid(BIN_A, "test_b")));
 
         Ok(())
     }
@@ -617,7 +731,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         db.store_coverage(FP_A, &mappings)?;
@@ -629,26 +743,26 @@ mod tests {
     }
 
     #[test]
-    fn test_all_test_names() -> Result<()> {
+    fn test_all_tests() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![
             (
-                "test_a".to_string(),
+                tid(BIN_A, "test_a"),
                 BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
             ),
             (
-                "test_b".to_string(),
+                tid(BIN_B, "test_a"),
                 BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
             ),
         ];
         db.store_coverage(FP_A, &mappings)?;
 
-        let names = db.all_test_names(FP_A)?;
+        let names = db.all_tests(FP_A)?;
         assert_eq!(
             names,
-            BTreeSet::from(["test_a".to_string(), "test_b".to_string()])
+            BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_B, "test_a")])
         );
 
         Ok(())
@@ -660,7 +774,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         db.store_coverage(FP_A, &mappings)?;
@@ -688,7 +802,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "test_a".to_string(),
+            tid(BIN_A, "test_a"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         db.store_coverage(FP_A, &mappings)?;
@@ -719,7 +833,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "t".to_string(),
+            tid(BIN_A, "t"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
 
@@ -754,7 +868,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "t".to_string(),
+            tid(BIN_A, "t"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
 
@@ -787,7 +901,7 @@ mod tests {
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "t".to_string(),
+            tid(BIN_A, "t"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         db.store_coverage(FP_A, &mappings)?;
@@ -808,27 +922,30 @@ mod tests {
         Ok(())
     }
 
+    /// A DB written by code that had the current-schema test_files (with
+    /// binary_id and env_fingerprint) but no `fingerprints` tracking table
+    /// yet should backfill fingerprint tracking from the existing rows on
+    /// reopen, so GC has something to reason about from the first open.
     #[test]
     fn reopen_backfills_fingerprints_for_pre_gc_db() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = db_path(dir.path());
         std::fs::create_dir_all(path.parent().unwrap())?;
 
-        // Simulate a DB written by code that had fingerprinted test_files but
-        // no `fingerprints` table yet.
         {
             let conn = Connection::open(&path)?;
             conn.execute_batch(
                 "\
                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE test_files (
+                    binary_id TEXT NOT NULL,
                     test_name TEXT NOT NULL,
                     source_file TEXT NOT NULL,
                     env_fingerprint TEXT NOT NULL,
-                    PRIMARY KEY (test_name, source_file, env_fingerprint)
+                    PRIMARY KEY (binary_id, test_name, source_file, env_fingerprint)
                 );
-                INSERT INTO test_files VALUES ('t1', 'src/lib.rs', 'fp_old_a');
-                INSERT INTO test_files VALUES ('t2', 'src/lib.rs', 'fp_old_b');
+                INSERT INTO test_files VALUES ('bin1', 't1', 'src/lib.rs', 'fp_old_a');
+                INSERT INTO test_files VALUES ('bin1', 't2', 'src/lib.rs', 'fp_old_b');
                 ",
             )?;
         }
@@ -839,13 +956,43 @@ mod tests {
         Ok(())
     }
 
+    /// A pre-binary_id DB (fingerprinted but no binary_id column) must be
+    /// dropped on open. The user re-collects — the rows can't be retroactively
+    /// tagged with a binary_id.
+    #[test]
+    fn pre_binary_id_schema_is_dropped() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE test_files (
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (test_name, source_file, env_fingerprint)
+                );
+                INSERT INTO test_files VALUES ('t1', 'src/lib.rs', 'fp_x');
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
+
+        Ok(())
+    }
+
     #[test]
     fn clear_also_wipes_fingerprints_table() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
         let mappings = vec![(
-            "t".to_string(),
+            tid(BIN_A, "t"),
             BTreeSet::from([Utf8PathBuf::from("src/lib.rs")]),
         )];
         db.store_coverage(FP_A, &mappings)?;

@@ -9,8 +9,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::collect::require_nextest;
-use crate::db::{warn_untracked_rs_files, Db};
+use crate::collect::{nextest_filter_expr, require_nextest};
+use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
 
@@ -74,7 +74,7 @@ pub fn run(
             tests.len()
         );
         for t in &tests {
-            eprintln!("  {t}");
+            eprintln!("  {}::{}", t.binary_id, t.test_name);
         }
     } else {
         eprintln!(
@@ -84,28 +84,25 @@ pub fn run(
     }
     eprintln!();
 
-    let tests: Vec<String> = tests.into_iter().collect();
+    let tests: Vec<TestId> = tests.into_iter().collect();
     run_tests(project_root, Some(&tests), nextest_args)
 }
 
-/// Run tests via `cargo nextest run`. `test_names == None` runs all tests;
-/// `Some(names)` filters to the given set via a nextest `-E` expression.
+/// Run tests via `cargo nextest run`. `tests == None` runs all tests;
+/// `Some(tests)` filters to the given set via a nextest `-E` expression of
+/// the form `(binary(=X) & (test(=a) | test(=b))) | ...`.
 /// Returns nextest's exit code so callers can propagate it to CI.
 fn run_tests(
     project_root: &Path,
-    test_names: Option<&[String]>,
+    tests: Option<&[TestId]>,
     nextest_args: &[String],
 ) -> Result<i32> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest").arg("run");
-    match test_names {
-        Some(names) => {
-            let filter_expr = names
-                .iter()
-                .map(|t| format!("test(={t})"))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            eprintln!("running {} tests with nextest", names.len());
+    match tests {
+        Some(ts) => {
+            let filter_expr = nextest_filter_expr(ts);
+            eprintln!("running {} tests with nextest", ts.len());
             cmd.arg("-E").arg(&filter_expr);
         }
         None => eprintln!("running all tests with nextest"),
