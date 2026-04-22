@@ -9,6 +9,7 @@ mod db;
 mod fingerprint;
 mod project;
 mod run;
+mod selection;
 mod shim;
 mod status;
 
