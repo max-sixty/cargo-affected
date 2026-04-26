@@ -309,10 +309,20 @@ fn extract_one(
         });
     }
 
+    // POSIX ERE — no negative lookahead, so we enumerate the prefixes to drop
+    // rather than expressing "everything outside the project root". A
+    // git-tracked-files derived list would be more precise but no more correct:
+    // coverage.rs's `strip_prefix(project_root)` is the authoritative gate, and
+    // anything outside project root is necessarily under one of these prefixes
+    // (sysroot, cargo registry, build dir). Empirically this only shrinks
+    // `files[]` in the JSON exporter (1234 → 113 on a worktrunk-scale test),
+    // not `functions[]`, but `files[]` is what coverage.rs iterates so the
+    // parse-time savings are real.
     let export_output = Command::new(llvm_cov)
         .arg("export")
         .arg("--format=text")
         .arg(format!("--instr-profile={}", profdata_path.display()))
+        .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
         .arg(&binary)
         .output()
         .context("failed to run llvm-cov export")?;
