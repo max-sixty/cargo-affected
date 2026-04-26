@@ -84,26 +84,28 @@ pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result
             "--no-color",
             "--no-ext-diff",
             "--name-only",
+            "-z",
             range.as_str(),
         ];
-        for line in run_git(project_root, &args)? {
-            files.push(line);
+        for path in run_git(project_root, &args)? {
+            files.push(path);
         }
     } else {
         for args in [
-            vec!["diff", "--no-color", "--no-ext-diff", "--name-only"],
+            vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
             vec![
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
                 "--name-only",
                 "--cached",
+                "-z",
             ],
-            vec!["ls-files", "--others", "--exclude-standard"],
+            vec!["ls-files", "-z", "--others", "--exclude-standard"],
         ] {
-            for line in run_git(project_root, &args)? {
-                if !files.contains(&line) {
-                    files.push(line);
+            for path in run_git(project_root, &args)? {
+                if !files.contains(&path) {
+                    files.push(path);
                 }
             }
         }
@@ -119,10 +121,12 @@ pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result
     Ok(files)
 }
 
-/// Run `git <args>` in `project_root` and return non-empty stdout lines.
-/// Errors include the full command, exit code, and stderr — silent skips
-/// here would mask repo corruption, bad refs, or missing objects as a clean
-/// tree.
+/// Run `git <args>` in `project_root` and return NUL-separated stdout entries.
+/// Callers must pass `-z` so paths come through verbatim — without it, git
+/// quotes paths containing special characters and a path with a literal
+/// newline would be split into two phantom entries. Errors include the full
+/// command, exit code, and stderr; silent skips here would mask repo
+/// corruption, bad refs, or missing objects as a clean tree.
 fn run_git(project_root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let output = Command::new("git")
         .args(args)
@@ -143,10 +147,11 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<Vec<String>> {
         );
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
+    Ok(output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect())
 }
 
@@ -192,6 +197,24 @@ mod tests {
         assert!(
             files.iter().any(|f| f == "new.txt"),
             "expected new.txt in {files:?}"
+        );
+        Ok(())
+    }
+
+    /// Paths with spaces or non-ASCII characters would be C-style quoted by
+    /// `git diff --name-only` without `-z` (e.g. `"a b.txt"`); `-z` plus
+    /// NUL-splitting returns them verbatim.
+    #[test]
+    fn awkward_filename_round_trips() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let awkward = "a b — \"weird\".txt";
+        std::fs::write(dir.path().join(awkward), b"x")?;
+
+        let files = git_changed_files(dir.path(), None)?;
+        assert!(
+            files.iter().any(|f| f == awkward),
+            "expected verbatim {awkward:?} in {files:?}"
         );
         Ok(())
     }
