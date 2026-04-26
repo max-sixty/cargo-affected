@@ -70,45 +70,40 @@ pub fn find_project_root() -> Result<ProjectRoot> {
 /// (working tree mode). When `diff_base` is `Some(ref)`, returns files changed
 /// between the merge-base of `ref` and HEAD (three-dot diff).
 ///
-/// Returns paths relative to the project root.
+/// Returns paths relative to the project root. A non-zero git exit (corrupt
+/// repo, unknown ref, missing object, permissions) is a hard error: silently
+/// returning "no changed files" would look like a clean tree and select zero
+/// tests.
 pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result<Vec<String>> {
     let mut files = Vec::new();
 
     if let Some(base) = diff_base {
         let range = format!("{base}...HEAD");
-        let args = vec!["diff", "--name-only", range.as_str()];
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(project_root)
-            .output()
-            .with_context(|| format!("failed to run git {}", args.join(" ")))?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if !line.is_empty() {
-                    files.push(line.to_string());
-                }
-            }
+        let args = vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--name-only",
+            range.as_str(),
+        ];
+        for line in run_git(project_root, &args)? {
+            files.push(line);
         }
     } else {
         for args in [
-            vec!["diff", "--name-only"],
-            vec!["diff", "--name-only", "--cached"],
+            vec!["diff", "--no-color", "--no-ext-diff", "--name-only"],
+            vec![
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--name-only",
+                "--cached",
+            ],
             vec!["ls-files", "--others", "--exclude-standard"],
         ] {
-            let output = Command::new("git")
-                .args(&args)
-                .current_dir(project_root)
-                .output()
-                .with_context(|| format!("failed to run git {}", args.join(" ")))?;
-
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if !line.is_empty() && !files.contains(&line.to_string()) {
-                        files.push(line.to_string());
-                    }
+            for line in run_git(project_root, &args)? {
+                if !files.contains(&line) {
+                    files.push(line);
                 }
             }
         }
@@ -122,4 +117,101 @@ pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// Run `git <args>` in `project_root` and return non-empty stdout lines.
+/// Errors include the full command, exit code, and stderr — silent skips
+/// here would mask repo corruption, bad refs, or missing objects as a clean
+/// tree.
+fn run_git(project_root: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        bail!(
+            "git {} failed (exit {}): {}",
+            args.join(" "),
+            code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Initialize a fresh git repo in `dir` with a single committed file.
+    /// Sets local user.name/user.email so the commit succeeds even when the
+    /// host has no global git identity configured.
+    fn init_repo(dir: &Path) -> Result<()> {
+        let run = |args: &[&str]| -> Result<()> {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .with_context(|| format!("git {}", args.join(" ")))?;
+            if !out.status.success() {
+                bail!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Ok(())
+        };
+        run(&["init", "-q", "-b", "main"])?;
+        run(&["config", "user.email", "test@example.com"])?;
+        run(&["config", "user.name", "Test"])?;
+        std::fs::write(dir.join("README.md"), b"hello\n")?;
+        run(&["add", "README.md"])?;
+        run(&["commit", "-q", "-m", "init"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn working_tree_happy_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        std::fs::write(dir.path().join("new.txt"), b"x")?;
+
+        let files = git_changed_files(dir.path(), None)?;
+        assert!(
+            files.iter().any(|f| f == "new.txt"),
+            "expected new.txt in {files:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bad_diff_base_errors_loudly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+
+        let err = git_changed_files(dir.path(), Some("nonexistent-ref-xyz"))
+            .expect_err("bad ref must error, not silently return empty");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git diff"),
+            "error should name the failing command: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent-ref-xyz"),
+            "error should propagate git stderr (which mentions the bad ref): {msg}"
+        );
+        Ok(())
+    }
 }
