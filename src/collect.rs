@@ -8,11 +8,12 @@
 //! and write per-(test, file) line ranges to SQLite.
 //!
 //! Approach:
-//! 1. Read crate roots (lib.rs/main.rs/tests/*.rs) from `cargo metadata`,
-//!    grouped by package — a test in package P implicitly depends on P's
-//!    crate roots, but not on any other package's. Stored as sentinel-range
-//!    rows `(line_start=1, line_end=i64::MAX)` so any hunk in one of P's
-//!    crate roots overlaps and selects every test in P.
+//! 1. Read crate roots from `cargo metadata`, scoped per nextest target
+//!    (`binary_id`): each test's sentinel set covers its own crate root,
+//!    its package's lib (for non-lib targets), and lib roots of workspace
+//!    packages this target transitively depends on. Stored as sentinel-range
+//!    rows `(line_start=1, line_end=i64::MAX)` so any hunk in one of those
+//!    files overlaps and re-selects the test.
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
 //!    (id + path) and every testcase. We write a binary_path → binary_id map
 //!    to disk and hand it to the shim via `CARGO_AFFECTED_BINARY_MAP` — the
@@ -77,29 +78,26 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
     }
     std::fs::create_dir_all(&profraw_dir).context("failed to create profraw dir")?;
 
-    // Crate roots (lib.rs/main.rs/tests/*.rs) are added to every test's
-    // coverage set with sentinel range (1, i64::MAX) so any hunk overlaps.
-    // Scoped per-package: a test in package P only gets sentinels for P's
-    // crate roots, so an edit to another package's lib.rs doesn't drag P's
-    // tests in. The package is recovered from `binary_id`'s prefix (see
-    // `package_from_binary_id`).
-    let crate_roots_by_package = project.test_src_paths_by_package()?;
-    if !crate_roots_by_package.is_empty() {
-        for (pkg, paths) in &crate_roots_by_package {
-            eprintln!(
-                "crate roots for {pkg}: {}",
-                paths
-                    .iter()
-                    .map(|p| p.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+    // Per-target sentinel set keyed by nextest's `binary_id`. Each test's
+    // sentinel ranges cover its own crate root, its package's lib (if it's
+    // not the lib itself), and the libs of any workspace packages it
+    // transitively depends on. See `crate_root_sentinels_by_binary_id` for
+    // the reasoning.
+    let crate_root_sentinels = project.crate_root_sentinels_by_binary_id()?;
+    for (binary_id, paths) in &crate_root_sentinels {
+        eprintln!(
+            "crate-root sentinels for {binary_id}: {}",
+            paths
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
-    let crate_root_ranges_by_package: BTreeMap<String, BTreeSet<HitRange>> =
-        crate_roots_by_package
+    let crate_root_ranges_by_binary_id: BTreeMap<String, BTreeSet<HitRange>> =
+        crate_root_sentinels
             .into_iter()
-            .map(|(pkg, paths)| {
+            .map(|(binary_id, paths)| {
                 let ranges = paths
                     .into_iter()
                     .map(|p| HitRange {
@@ -108,7 +106,7 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
                         line_end: u32::MAX,
                     })
                     .collect();
-                (pkg, ranges)
+                (binary_id, ranges)
             })
             .collect();
 
@@ -194,18 +192,18 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
                 let n = *guard;
                 match outcome {
                     Ok(ExtractOutcome::Collected { test_id, mut ranges }) => {
-                        let package = package_from_binary_id(&test_id.binary_id);
-                        let Some(pkg_ranges) = crate_root_ranges_by_package.get(package) else {
+                        let Some(pkg_ranges) =
+                            crate_root_ranges_by_binary_id.get(&test_id.binary_id)
+                        else {
                             eprintln!(
-                                "[{n}/{total}] {}::{}: ERROR (binary_id maps to package \
-                                 {package:?}, which is not a known workspace package)",
+                                "[{n}/{total}] {}::{}: ERROR (binary_id is not a known \
+                                 workspace target)",
                                 test_id.binary_id, test_id.test_name
                             );
                             drop(guard);
                             extract_errors.lock().unwrap().push(format!(
-                                "binary_id {:?} maps to package {:?}, which is not a known \
-                                 workspace package",
-                                test_id.binary_id, package
+                                "binary_id {:?} is not a known workspace target",
+                                test_id.binary_id
                             ));
                             continue;
                         };
@@ -369,18 +367,6 @@ fn extract_one(
             reason: format!("parse error: {e}"),
         }),
     }
-}
-
-/// Recover the package name from nextest's `binary_id`.
-///
-/// Format (per `nextest_metadata::RustBinaryId::from_parts`):
-/// - `<package>` for a package's lib/proc-macro target,
-/// - `<package>::<target>` for an integration test target,
-/// - `<package>::<kind>/<target>` for any other target.
-///
-/// In every case the package name is everything before the first `::`.
-pub(crate) fn package_from_binary_id(binary_id: &str) -> &str {
-    binary_id.split("::").next().unwrap_or(binary_id)
 }
 
 /// Build a nextest `-E` filter expression matching exactly the given tests,

@@ -2,28 +2,34 @@
 //!
 //! cargo-affected uses `cargo metadata` to determine the workspace root and
 //! stores its DB there. This scenario builds a virtual workspace with two
-//! members, each with its own tests, and verifies:
+//! members where `math` has a path dep on `strings`, and verifies the
+//! per-target sentinel scoping:
 //!
-//! 1. `collect` enumerates tests across both members.
-//! 2. **Cross-member narrowing**: editing `math/src/lib.rs` (a crate root in
-//!    `math`) does NOT pull in `strings`'s tests. The crate-root sentinel
-//!    `(1, i64::MAX)` is scoped per-package — `strings`'s tests can't observe
-//!    a change in another crate's compilation unit, so they must not be
-//!    selected.
-//! 3. **Within-package structural guarantee**: editing `math/src/lib.rs`
-//!    *does* pull in every test in `math`, including tests in
-//!    `math/tests/integration.rs` that live in a separate compilation unit —
-//!    a structural edit (`mod foo;`, `use ...;`) in a crate root must
-//!    re-select every test that builds against that crate.
+//! 1. **Discovery**: `collect` enumerates tests across both members and
+//!    across both target kinds in `math` (lib unit test + integration test).
+//! 2. **Cross-member narrowing (no dep)**: editing `strings/src/fmt.rs`
+//!    (which `math` does not transitively depend on for its unit tests'
+//!    coverage outside the dep path) does not over-select unrelated tests.
+//!    Strings's tests run; math's lib unit test does not.
+//! 3. **Per-target narrowing within a package**: editing
+//!    `math/tests/integration.rs` selects the integration test only — it
+//!    must NOT pull in `test_math_add` (a lib unit test in a different
+//!    compilation unit).
+//! 4. **Within-package structural guarantee**: editing `math/src/lib.rs`
+//!    pulls in every test in `math`, including the integration test that
+//!    lives in a separate compilation unit.
+//! 5. **Cross-package transitive dep**: editing `strings/src/lib.rs`
+//!    (`math` depends on it via `path = "../strings"`) pulls in math's
+//!    tests too.
 
 use std::path::Path;
 
 use crate::{cargo_affected, git, init_git_with_initial_commit, replace_in_file};
 
 fn write_workspace(dir: &Path, ws_name: &str) {
-    // Virtual workspace: root has only [workspace], no [package]. Two members,
-    // each a tiny lib. Distinct package names per member, prefixed with the
-    // scenario name to avoid cargo's shared-cache name-collision foot-gun.
+    // Virtual workspace: root has only [workspace], no [package]. Two members.
+    // Distinct package names per member, prefixed with the scenario name to
+    // avoid cargo's shared-cache name-collision foot-gun.
     std::fs::write(
         dir.join("Cargo.toml"),
         r#"[workspace]
@@ -37,10 +43,9 @@ members = ["math", "strings"]
     // rationale; same trade-off applies here.
     std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
 
-    // Member 1: math. The unit test in lib.rs and the integration test in
-    // tests/integration.rs both build against math's crate roots — both must
-    // be re-selected by an edit to math/src/lib.rs (within-package
-    // structural guarantee).
+    // Member 1: math. Path-deps on strings so we can verify cross-package
+    // sentinel propagation. Unit test in lib.rs and integration test in
+    // tests/integration.rs let us exercise per-target narrowing.
     let math = dir.join("math");
     std::fs::create_dir_all(math.join("src")).unwrap();
     std::fs::create_dir_all(math.join("tests")).unwrap();
@@ -51,6 +56,9 @@ members = ["math", "strings"]
 name = "{ws_name}_math"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+{ws_name}_strings = {{ path = "../strings" }}
 "#
         ),
     )
@@ -80,7 +88,8 @@ mod tests {
     )
     .unwrap();
     // Integration test in math: a separate compilation unit from the lib's
-    // unit tests, but still bound to math/src/lib.rs's crate root.
+    // unit tests. Per-target narrowing means an edit here must not pull in
+    // `test_math_add`, even though both belong to package `_math`.
     std::fs::write(
         math.join("tests/integration.rs"),
         format!(
@@ -93,8 +102,7 @@ fn test_math_integration() {{
     )
     .unwrap();
 
-    // Member 2: strings. Same shape — submodule for the function so its tests
-    // can reach it from outside the crate root.
+    // Member 2: strings. No deps; math depends on it.
     let strings = dir.join("strings");
     std::fs::create_dir_all(strings.join("src")).unwrap();
     std::fs::write(
@@ -135,10 +143,10 @@ mod tests {
 }
 
 #[test]
-fn workspace_edit_in_one_member_doesnt_pull_in_other() {
+fn workspace_collect_finds_all_tests_across_targets() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_workspace(dir, "sample_workspace");
+    write_workspace(dir, "sample_ws_collect");
     init_git_with_initial_commit(dir);
 
     let collect = cargo_affected(dir, &["affected", "collect"]);
@@ -149,8 +157,6 @@ fn workspace_edit_in_one_member_doesnt_pull_in_other() {
         String::from_utf8_lossy(&collect.stdout)
     );
 
-    // All three tests should be tracked. The DB lives at the workspace root
-    // regardless of which member is active.
     let db_path = dir.join("target/affected/coverage.db");
     assert!(
         db_path.exists(),
@@ -172,33 +178,26 @@ fn workspace_edit_in_one_member_doesnt_pull_in_other() {
             "expected {expected} in DB, got: {test_names:?}"
         );
     }
+}
 
-    // Direct sqlite check: no test should carry a row for a source file in
-    // another package. This is the per-package sentinel guarantee at the
-    // storage layer — without the fix, math/src/lib.rs sentinels would land
-    // on strings's tests and vice versa.
-    let cross_member_rows: Vec<(String, String)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT binary_id, source_file FROM test_regions \
-                 WHERE (binary_id LIKE '%_math%' AND source_file LIKE 'strings/%') \
-                    OR (binary_id LIKE '%_strings%' AND source_file LIKE 'math/%')",
-            )
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
+#[test]
+fn editing_lib_in_one_member_does_not_pull_in_unrelated_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_workspace(dir, "sample_ws_lib_edit");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
     assert!(
-        cross_member_rows.is_empty(),
-        "no test should carry rows for files in another package, got: {cross_member_rows:?}"
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
     );
 
-    // Edit directly in math/src/lib.rs — a crate root. The edit sits above
-    // any function range, so only the per-package sentinel for math's
-    // lib.rs can match. This is exactly where the old workspace-wide
-    // sentinel would have over-selected and pulled in `strings`'s tests.
+    // Edit at the top of math/src/lib.rs — above any function range, so
+    // selection is driven by the per-target sentinel for math/src/lib.rs.
+    // strings does NOT depend on math, so strings's tests must not be
+    // pulled in.
     replace_in_file(
         &dir.join("math/src/lib.rs"),
         "pub mod algo;",
@@ -213,9 +212,7 @@ fn workspace_edit_in_one_member_doesnt_pull_in_other() {
     );
     let stdout = String::from_utf8_lossy(&status.stdout);
 
-    // Within-package structural guarantee: the edit to math/src/lib.rs (a
-    // crate root) re-selects every test in math, including the integration
-    // test that lives in a separate compilation unit.
+    // Within-package structural guarantee: every test in math runs.
     assert!(
         stdout.contains("test_math_add"),
         "edit in math/src/lib.rs should select test_math_add, got:\n{stdout}"
@@ -225,11 +222,110 @@ fn workspace_edit_in_one_member_doesnt_pull_in_other() {
         "edit in math/src/lib.rs should select test_math_integration \
          (within-package structural guarantee), got:\n{stdout}"
     );
-    // Cross-member narrowing: strings's tests must NOT be pulled in.
+    // strings doesn't depend on math, so its tests stay out.
     assert!(
         !stdout.contains("test_strings_greet"),
-        "edit in math member must NOT pull in strings member's tests, got:\n{stdout}"
+        "edit in math (which strings does not depend on) must NOT pull in \
+         strings's tests, got:\n{stdout}"
     );
 
     git(dir, &["checkout", "--", "math/src/lib.rs"]);
+}
+
+#[test]
+fn editing_integration_test_does_not_pull_in_lib_unit_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_workspace(dir, "sample_ws_int_edit");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Edit the integration test file. Per-target narrowing: the lib's unit
+    // test (`test_math_add`) is in a different compilation unit and does
+    // NOT compile against tests/integration.rs, so it must not be selected.
+    replace_in_file(
+        &dir.join("math/tests/integration.rs"),
+        "add(1, 1), 2",
+        "add(1, 1), 2 /* edited */",
+    );
+
+    let status = cargo_affected(dir, &["affected", "status", "-v"]);
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+
+    assert!(
+        stdout.contains("test_math_integration"),
+        "edit in tests/integration.rs should select test_math_integration, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("test_math_add"),
+        "edit in tests/integration.rs must NOT pull in test_math_add \
+         (per-target narrowing within a package), got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("test_strings_greet"),
+        "edit in math's integration test must NOT pull in strings's tests, got:\n{stdout}"
+    );
+
+    git(dir, &["checkout", "--", "math/tests/integration.rs"]);
+}
+
+#[test]
+fn editing_dep_lib_pulls_in_dependent_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_workspace(dir, "sample_ws_dep_edit");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Edit at the top of strings/src/lib.rs. math depends on strings, so
+    // every math test (lib unit + integration) must be re-selected — the
+    // structural edit could change strings's interface (added/removed
+    // module) and break math's compile. strings's own tests obviously also
+    // run.
+    replace_in_file(
+        &dir.join("strings/src/lib.rs"),
+        "pub mod fmt;",
+        "// edit at the top of strings's crate root\npub mod fmt;",
+    );
+
+    let status = cargo_affected(dir, &["affected", "status", "-v"]);
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+
+    assert!(
+        stdout.contains("test_strings_greet"),
+        "edit in strings/src/lib.rs should select test_strings_greet, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("test_math_add"),
+        "edit in strings/src/lib.rs should pull in test_math_add \
+         (math depends on strings via path dep), got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("test_math_integration"),
+        "edit in strings/src/lib.rs should pull in test_math_integration, got:\n{stdout}"
+    );
+
+    git(dir, &["checkout", "--", "strings/src/lib.rs"]);
 }
