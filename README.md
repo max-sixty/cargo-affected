@@ -59,8 +59,10 @@ the last collect adds to the diff and broadens selection.
 3. If a hunk overlaps no stored range (struct fields, `#[derive]`, `const`,
    `use`, `mod`), a per-file backstop selects every test that touched the
    file. Crate roots (`lib.rs` / `main.rs` / `tests/*.rs`) are stored with a
-   sentinel range covering the whole file, so any edit there reselects every
-   test that covered the crate root.
+   sentinel range covering the whole file, scoped per nextest target. An
+   edit to a crate root reselects every test in that target, every test in
+   the same package that links the lib (bins, integration tests), and every
+   test in workspace packages that transitively depend on it.
 
 ## Accuracy model
 
@@ -76,7 +78,8 @@ CI should still run the full suite.
   fields, derives, consts, `use`, `mod`) reselect every test that touched
   the file.
 - **Crate roots.** Any edit to `lib.rs` / `main.rs` / `tests/*.rs` reruns
-  every test that covered that crate root.
+  every test in that target, every test in the same package that links the
+  lib, and every test in workspace packages that transitively depend on it.
 - **Comment- and whitespace-only edits.** Selection diffs lines, not
   semantics.
 
