@@ -1,2 +1,10 @@
-[post-merge]
+[[post-merge]]
 install = "cargo install --path ."
+
+[[post-merge]]
+collect = "cargo affected collect"
+
+pre-merge = "cargo affected run"
+
+[post-start]
+copy = "wt step copy-ignored"
