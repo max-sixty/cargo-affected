@@ -4,10 +4,10 @@ Like pytest-testmon for Rust. Maps each test to the source-line ranges it
 touches via LLVM coverage, then reruns only the tests whose ranges overlap
 `git diff` hunks.
 
-> **Status: extremely early.** The author is starting to use this in their
-> own repos; others probably shouldn't yet. The schema can change without
-> migration, behavior may break, and there is no support promise. CI should
-> still run the full test suite.
+> **Status: extremely early.** Mac & linux only at this stage. The author is
+> starting to use this in their own repos; others probably shouldn't yet.
+> The schema can change without migration, behavior may break, and there is
+> no support promise. CI should still run the full test suite.
 
 ## Installation
 
