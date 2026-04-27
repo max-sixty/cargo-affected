@@ -18,15 +18,15 @@ Function-level only, not line-level. Function-level captures the bulk of the win
 
 ### Empirical anchor
 
-Sampled `llvm-cov export` for one real test from worktrunk (`cli::hook::tests::test_parse_errors`):
+Sampled `llvm-cov export` for one real test from worktrunk (`commands::alias::tests::test_parse_errors`):
 
-- 13 project functions hit out of 3,892 — typical tests touch a tiny slice
-- Per-test JSON: 56 MB default, 38 MB with `--ignore-filename-regex`, 0.7 MB with `--summary-only` (loses what we need)
-- llvm-cov export: ~1.4 s wall (already the bottleneck; reading more of the same JSON is ~free)
+- 6 project functions hit out of 67,253 total functions in the binary — typical tests touch a tiny slice; each hit function spans ~1–7 source lines
+- Per-test JSON: 44 MB default, 30 MB with `--ignore-filename-regex=/rustc/|/\.cargo/|/target/` (~32% reduction). The filter shrinks `data[0].files[]` (1234 → 113 entries) but does **not** shrink `data[0].functions[]` (55,950 → 55,950). The 30 MB residual is dominated by `functions[]` (32.6 MB on this sample) — most of those have `count=0` and are filtered downstream
+- llvm-cov export: ~1.4 s wall (already the bottleneck; parsing more of the same JSON is ~free)
 
 Reference DB at file-granularity (older fingerprint-free schema): 9.6 MB, 40 K rows, 3,141 tests, avg 12.8 files/test. Function-level extrapolation: ~150–250 K rows, 40–60 MB on disk.
 
-`functions[i].regions[]` (with `count > 0`) is the field we want; `min(line_start)..max(line_end)` per function gives the source extent. No Rust parser (`syn`, `rust-analyzer`) needed.
+`functions[i].regions[]` (with `count > 0`) is the field we want; per `(function, file_id)` we take `min(line_start)..max(line_end)` to get the source extent. No Rust parser (`syn`, `rust-analyzer`) needed.
 
 ### Schema sketch
 
@@ -48,11 +48,10 @@ One row per hit function per test. Dedupe by `(file, line_start, line_end)` at c
 ### Pipeline changes
 
 - `coverage.rs` — return `Vec<(file, line_start, line_end)>` derived from hit functions; replace the filename-set extraction.
-- `db.rs` — schema migration; new range-overlap query (`source_file=? AND line_start<=? AND line_end>=?` per changed hunk).
-- `project.rs` — add `git_changed_line_ranges` parsing `git diff -U0 --no-color --no-ext-diff --`. Hard-error on git failures rather than swallowing exit codes (see `git_changed_files` for the current pattern to *not* repeat).
-- `run.rs` / `status.rs` / `selection.rs` — for each changed file, union stored function ranges overlapping changed hunks → tests to run.
-
-Estimated delta: ~500 LOC across 4–5 files.
+- `db.rs` — schema migration; new range-overlap query (`source_file=? AND line_start<=? AND line_end>=?` per changed hunk) plus a per-file fallback when no range overlaps. Add `collect_sha` column to `fingerprints` (drop+recreate on missing column, same pattern as the existing `migrate_legacy_test_files`).
+- `project.rs` — add `git_changed_line_ranges` parsing `git diff -U0 --no-color --no-ext-diff --` against `<collect_sha>`. Hard-error on git failures (see `git_changed_files` for the existing pattern). Drop the `diff_base` parameter from `git_changed_files`.
+- `run.rs` / `status.rs` / `selection.rs` — for each changed file, union stored function ranges overlapping changed hunks → tests to run. Delete `--diff-base` flag handling.
+- `collect.rs` — capture HEAD sha at collect time and store it on the fingerprint row. Delete `--diff-base` (incremental collect) flag and `select_tests_for_incremental`.
 
 ### Line-drift across commits
 
@@ -74,19 +73,19 @@ Function moves under this scheme:
 
 If `collect_sha` is unreachable (rebased away, shallow clone): refuse function-level selection and tell the user to recollect. No silent fallback — consistent with the project's fail-loud principle.
 
-### Open issues to resolve before implementing
+If a user has committed since `collect`, ranges may have drifted off their stored coordinates and the `git diff <collect_sha>` view becomes increasingly noisy as committed changes accumulate; the cure is to recollect. We don't error in that case — we just do more work than strictly necessary.
 
-1. **`collect --diff-base` (incremental) breaks per-fingerprint `collect_sha`.** Incremental collect updates only selected test rows; remaining rows keep their original snapshot coordinates, so a single per-fingerprint SHA would be wrong for them. Options: (a) disable incremental for v1, (b) force full recollect when SHA would change, (c) store SHA per row.
+### Resolved design decisions
 
-2. **File-level backstop for non-region edits.** Edits to struct fields, `#[derive]`, consts, `use` statements, `mod` declarations, and signatures outside any LLVM region yield no function overlap. Without a backstop those would select zero tests — a regression vs. today. Per-hunk rule: if a hunk overlaps no stored function range for the file, union in all tests that ever covered the file. Costs the win on structural edits; guarantees we never miss. Net effect: function-level wins on body edits, equals file-level on structural-only edits.
+1. **No `--diff-base` flag in v1.** Removed from `collect`, `run`, and `status`. The diff base is implicitly the per-fingerprint `collect_sha`; "compare against branch" is gone until we have proper SHA-translation. Keeps per-fingerprint `collect_sha` coherent without per-row tracking, range translation, or "force full recollect" logic.
 
-3. **Diff coordinate side per mode.** Old-side vs. new-side matters and isn't symmetric across default working-tree `run`, `run --diff-base`, and `collect --diff-base`. Specify each before implementing.
+2. **Per-hunk file-level backstop.** Correctness floor for struct-field, `#[derive]`, const, `use`, and `mod` edits that fall outside any LLVM region. Per hunk: if no stored range overlaps, union in every test with rows for the file under the current fingerprint. Net effect: function-level wins on body edits, equals file-level on structural-only edits. Two queries per file (range-overlap, then fallback) — the second is a strict superset of the first.
 
-4. **`--ignore-filename-regex` is POSIX ERE** — no negative lookahead, so "everything outside the project root" must be enumerated (e.g., `/rustc/|.cargo/|target/`) or replaced with an inclusive include-path filter. Worth verifying that the filter shrinks `functions[]` not just `files[]`. Orthogonal to function-level itself but a ~50× JSON-size win on the sample test (56 MB → ~1 MB).
+3. **One diff command, one rule.** `git diff -U0 --no-color --no-ext-diff <collect_sha> -- <files>` (working tree as new). OLD-side line numbers always (= collect_sha = storage). No mode-dependent sides; no three-dot. Pure insertions (`@@ -A,0 +B,N @@`) are treated as the single-line range `[A, A]`.
 
-5. **Crate roots stay coarse.** `lib.rs` / `main.rs` / `tests/*.rs` are added as implicit deps for every test today (`collect.rs`). They're almost entirely structural; function-level would gain nothing. Keep the implicit-dep behavior unchanged for these files.
+4. **Crate roots ride the same table.** `lib.rs` / `main.rs` / `tests/*.rs` are stored with sentinel range `(line_start=1, line_end=i64::MAX)` in `test_regions`. Any hunk in those files overlaps the sentinel, selecting every test that covered the crate root — same effect as the old per-test implicit dep, no special-case branch.
 
-6. **Index efficiency.** A composite index gives equality prefix + one range bound, not two simultaneously. Benchmark with a synthetic 500K–1M-row table before trusting `status`/`run` latency.
+5. **Index `(source_file, env_fingerprint, line_start, line_end)`.** A composite index can use equality + one range bound but not two simultaneously. Ship as-is; benchmark and revisit if `status`/`run` latency becomes a problem on real workspaces.
 
 ## Known limitations
 

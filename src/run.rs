@@ -1,10 +1,10 @@
 //! Test selection and execution based on git changes.
 //!
-//! Queries git for changed files, looks up which tests cover those files in
-//! the database, and runs the affected tests via `cargo nextest run`. Also
-//! lists tests via nextest to catch tests added since the last `collect` —
-//! those have no coverage data yet, so they're always selected.
-//! nextest is required — no `cargo test` fallback.
+//! Queries git for changed line ranges (vs. `collect_sha`), looks up which
+//! tests have function-range overlap in the database, and runs the affected
+//! tests via `cargo nextest run`. Also lists tests via nextest to catch tests
+//! added since the last `collect` — those have no coverage data, so they're
+//! always selected. nextest is required — no `cargo test` fallback.
 
 use std::path::Path;
 use std::process::Command;
@@ -14,16 +14,11 @@ use anyhow::{Context, Result};
 use crate::collect::{nextest_filter_expr, require_nextest};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_changed_files};
+use crate::project::{find_project_root, git_changed_files, git_changed_line_ranges};
 use crate::selection;
 
 /// Entry point for `cargo affected run`. Returns the exit code to propagate.
-pub fn run(
-    diff_base: Option<&str>,
-    all: bool,
-    verbose: bool,
-    nextest_args: &[String],
-) -> Result<i32> {
+pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
     require_nextest(project_root)?;
@@ -33,7 +28,6 @@ pub fn run(
         return run_tests(project_root, None, nextest_args);
     }
 
-    let changed_files = git_changed_files(project_root, diff_base)?;
     let env_fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
 
@@ -49,8 +43,12 @@ pub fn run(
         return Ok(0);
     }
 
-    warn_untracked_rs_files(&db, &env_fingerprint, &changed_files)?;
+    let collect_sha = db
+        .collect_sha(&env_fingerprint)?
+        .context("coverage data exists but is missing collect_sha — run `cargo affected collect`")?;
 
+    let changed_files = git_changed_files(project_root)?;
+    warn_untracked_rs_files(&db, &env_fingerprint, &changed_files)?;
     if !changed_files.is_empty() {
         eprintln!("{} changed files:", changed_files.len());
         for f in &changed_files {
@@ -58,16 +56,17 @@ pub fn run(
         }
     }
 
-    let sel = selection::compute(project_root, &db, &env_fingerprint, &changed_files)?;
+    let changed_ranges = git_changed_line_ranges(project_root, &collect_sha)?;
+    let sel = selection::compute(project_root, &db, &env_fingerprint, &changed_ranges)?;
     let selected = sel.selected();
     if selected.is_empty() {
-        match (changed_files.is_empty(), diff_base) {
-            (true, None) => eprintln!("no uncommitted changes and no new tests — nothing to run"),
-            (true, Some(base)) => eprintln!("no changes vs {base} and no new tests"),
-            (false, _) => eprintln!(
-                "no tests cover the changed files and no new tests \
+        if changed_files.is_empty() {
+            eprintln!("no uncommitted changes and no new tests — nothing to run");
+        } else {
+            eprintln!(
+                "no tests cover the changed lines and no new tests \
                  (run `cargo affected collect` to update)"
-            ),
+            );
         }
         return Ok(0);
     }

@@ -1,9 +1,17 @@
 //! Shared project utilities: root detection and git queries.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+
+/// Inclusive line range `[start, end]` of a changed hunk in some file.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LineRange {
+    pub start: i64,
+    pub end: i64,
+}
 
 /// Project root information.
 pub struct ProjectRoot {
@@ -64,49 +72,29 @@ pub fn find_project_root() -> Result<ProjectRoot> {
     })
 }
 
-/// Get the list of changed files from git.
-///
-/// When `diff_base` is `None`, returns staged + unstaged + untracked changes
-/// (working tree mode). When `diff_base` is `Some(ref)`, returns files changed
-/// between the merge-base of `ref` and HEAD (three-dot diff).
+/// List files changed in the working tree relative to HEAD: staged + unstaged
+/// + untracked.
 ///
 /// Returns paths relative to the project root. A non-zero git exit (corrupt
-/// repo, unknown ref, missing object, permissions) is a hard error: silently
-/// returning "no changed files" would look like a clean tree and select zero
-/// tests.
-pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result<Vec<String>> {
+/// repo, missing object, permissions) is a hard error: silently returning "no
+/// changed files" would look like a clean tree and select zero tests.
+pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
-
-    if let Some(base) = diff_base {
-        let range = format!("{base}...HEAD");
-        let args = vec![
+    for args in [
+        vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
+        vec![
             "diff",
             "--no-color",
             "--no-ext-diff",
             "--name-only",
+            "--cached",
             "-z",
-            range.as_str(),
-        ];
+        ],
+        vec!["ls-files", "-z", "--others", "--exclude-standard"],
+    ] {
         for path in run_git(project_root, &args)? {
-            files.push(path);
-        }
-    } else {
-        for args in [
-            vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
-            vec![
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--name-only",
-                "--cached",
-                "-z",
-            ],
-            vec!["ls-files", "-z", "--others", "--exclude-standard"],
-        ] {
-            for path in run_git(project_root, &args)? {
-                if !files.contains(&path) {
-                    files.push(path);
-                }
+            if !files.contains(&path) {
+                files.push(path);
             }
         }
     }
@@ -119,6 +107,164 @@ pub fn git_changed_files(project_root: &Path, diff_base: Option<&str>) -> Result
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// Capture the current git HEAD sha. Hard error if HEAD is unreachable —
+/// detached/initial-commit repos can't anchor function-level coverage and
+/// silently using "" would later fail with a confusing diff error.
+pub fn git_head_sha(project_root: &Path) -> Result<String> {
+    let lines = run_git(project_root, &["rev-parse", "HEAD"])?;
+    let sha = lines
+        .into_iter()
+        .next()
+        .context("git rev-parse HEAD returned no output")?
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        bail!("git rev-parse HEAD returned an empty sha");
+    }
+    Ok(sha)
+}
+
+/// Per-file changed line ranges between `collect_sha` and the working tree.
+///
+/// Runs `git diff -U0 --no-color --no-ext-diff <collect_sha>` and parses
+/// `@@ -A,B +C,D @@` headers. Returns OLD-side line ranges (i.e. line
+/// numbers in the `collect_sha` snapshot, which is what `test_regions`
+/// stores). Pure insertions (`@@ -A,0 +C,D @@`) collapse to the single line
+/// `[A, A]` — the line in old before which content was inserted; this
+/// over-selects only at file edges.
+///
+/// Untracked files (no OLD-side at all) don't appear here; callers receive
+/// the file list from `git_changed_files` and warn separately.
+///
+/// Errors are loud — git failure (bad sha, corrupt repo, etc.) is propagated
+/// rather than silently emitting an empty map.
+pub fn git_changed_line_ranges(
+    project_root: &Path,
+    collect_sha: &str,
+) -> Result<BTreeMap<String, Vec<LineRange>>> {
+    // `--src-prefix=a/ --dst-prefix=b/` forces the standard prefixes — without
+    // them, `git diff <commit>` against the working tree uses `c/` and `w/`
+    // and our parser would skip every `--- ` line.
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            collect_sha,
+        ])
+        .current_dir(project_root)
+        .output()
+        .context("failed to run git diff -U0")?;
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        bail!(
+            "git diff -U0 {} failed (exit {}): {}",
+            collect_sha,
+            code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("git diff stdout was not valid UTF-8")?;
+    parse_unified_diff(stdout)
+}
+
+fn parse_unified_diff(diff: &str) -> Result<BTreeMap<String, Vec<LineRange>>> {
+    let mut map: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
+    let mut current_file: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            // `--- a/path/to/file` or `--- /dev/null` for new files. We don't
+            // emit ranges for /dev/null (the new file's lines all live on the
+            // NEW side, with no OLD-side coordinates).
+            current_file = parse_diff_path(rest);
+        } else if line.starts_with("@@ ") {
+            let Some(file) = current_file.clone() else { continue };
+            // /dev/null sentinel — skip.
+            if file == "/dev/null" {
+                continue;
+            }
+            let Some(range) = parse_hunk_header(line) else {
+                continue;
+            };
+            map.entry(file).or_default().push(range);
+        }
+    }
+
+    // Coalesce overlapping/adjacent ranges so downstream queries don't
+    // double-count. Adjacent (end+1 == next.start) hunks are rare from
+    // -U0 but harmless to merge.
+    for ranges in map.values_mut() {
+        ranges.sort_by_key(|r| (r.start, r.end));
+        let mut merged: Vec<LineRange> = Vec::with_capacity(ranges.len());
+        for r in ranges.drain(..) {
+            match merged.last_mut() {
+                Some(prev) if r.start <= prev.end + 1 => {
+                    prev.end = prev.end.max(r.end);
+                }
+                _ => merged.push(r),
+            }
+        }
+        *ranges = merged;
+    }
+
+    Ok(map)
+}
+
+/// Strip the `a/`/`b/` prefix git adds and trim the trailing tab+timestamp.
+fn parse_diff_path(rest: &str) -> Option<String> {
+    // Format: `a/path/to/file` (or `/dev/null`). Sometimes followed by tab+timestamp.
+    let path = rest.split('\t').next().unwrap_or(rest);
+    if path == "/dev/null" {
+        return Some("/dev/null".to_string());
+    }
+    path.strip_prefix("a/").map(String::from)
+}
+
+/// Parse `@@ -OLD_START[,OLD_COUNT] +NEW_START[,NEW_COUNT] @@ ...` and return
+/// the OLD-side inclusive line range. For pure insertions (`OLD_COUNT == 0`),
+/// returns `[OLD_START, OLD_START]` — the line before which content was
+/// inserted, so functions containing that line are still picked up.
+fn parse_hunk_header(line: &str) -> Option<LineRange> {
+    // Stripping leading "@@ " and finding the next " @@" boundary keeps
+    // surrounding context (function name on inline-context lines) out of
+    // the parse.
+    let inner = line.strip_prefix("@@ ")?;
+    let end_idx = inner.find(" @@")?;
+    let body = &inner[..end_idx];
+    // body looks like: "-OLD +NEW" — split on space.
+    let mut parts = body.split_whitespace();
+    let old = parts.next()?;
+    let _new = parts.next()?;
+    let old = old.strip_prefix('-')?;
+    let (start, count) = match old.split_once(',') {
+        Some((s, c)) => (s.parse::<i64>().ok()?, c.parse::<i64>().ok()?),
+        None => (old.parse::<i64>().ok()?, 1),
+    };
+    if count == 0 {
+        // Pure insertion: line `start` is the line before the insert. Use it
+        // as a single-line range so functions containing line `start` are
+        // selected — slight over-select at file edges, acceptable.
+        Some(LineRange {
+            start,
+            end: start,
+        })
+    } else {
+        Some(LineRange {
+            start,
+            end: start + count - 1,
+        })
+    }
 }
 
 /// Run `git <args>` in `project_root` and return NUL-separated stdout entries.
@@ -193,7 +339,7 @@ mod tests {
         init_repo(dir.path())?;
         std::fs::write(dir.path().join("new.txt"), b"x")?;
 
-        let files = git_changed_files(dir.path(), None)?;
+        let files = git_changed_files(dir.path())?;
         assert!(
             files.iter().any(|f| f == "new.txt"),
             "expected new.txt in {files:?}"
@@ -201,9 +347,6 @@ mod tests {
         Ok(())
     }
 
-    /// Paths with spaces or non-ASCII characters would be C-style quoted by
-    /// `git diff --name-only` without `-z` (e.g. `"a b.txt"`); `-z` plus
-    /// NUL-splitting returns them verbatim.
     #[test]
     fn awkward_filename_round_trips() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -211,7 +354,7 @@ mod tests {
         let awkward = "a b — \"weird\".txt";
         std::fs::write(dir.path().join(awkward), b"x")?;
 
-        let files = git_changed_files(dir.path(), None)?;
+        let files = git_changed_files(dir.path())?;
         assert!(
             files.iter().any(|f| f == awkward),
             "expected verbatim {awkward:?} in {files:?}"
@@ -220,20 +363,90 @@ mod tests {
     }
 
     #[test]
-    fn bad_diff_base_errors_loudly() -> Result<()> {
+    fn line_ranges_modify_in_place() -> Result<()> {
         let dir = tempfile::tempdir()?;
         init_repo(dir.path())?;
 
-        let err = git_changed_files(dir.path(), Some("nonexistent-ref-xyz"))
-            .expect_err("bad ref must error, not silently return empty");
+        // Commit a file with 10 lines, then modify line 5 in the working tree.
+        let lines: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), &lines)?;
+        Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(dir.path())
+            .output()?;
+        Command::new("git")
+            .args(["commit", "-q", "-m", "add a"])
+            .current_dir(dir.path())
+            .output()?;
+
+        let modified: String = (1..=10)
+            .map(|i| if i == 5 { "modified\n".into() } else { format!("line {i}\n") })
+            .collect();
+        std::fs::write(dir.path().join("a.txt"), &modified)?;
+
+        let head = git_head_sha(dir.path())?;
+        let map = git_changed_line_ranges(dir.path(), &head)?;
+        let ranges = map.get("a.txt").expect("a.txt should appear");
+        assert_eq!(ranges, &vec![LineRange { start: 5, end: 5 }]);
+        Ok(())
+    }
+
+    #[test]
+    fn line_ranges_pure_insertion_is_single_line() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+
+        let lines: String = (1..=5).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), &lines)?;
+        Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(dir.path())
+            .output()?;
+        Command::new("git")
+            .args(["commit", "-q", "-m", "add a"])
+            .current_dir(dir.path())
+            .output()?;
+
+        // Insert two lines after line 3 (pure insertion: old_count=0).
+        let modified = "line 1\nline 2\nline 3\nINSERTED A\nINSERTED B\nline 4\nline 5\n";
+        std::fs::write(dir.path().join("a.txt"), modified)?;
+
+        let head = git_head_sha(dir.path())?;
+        let map = git_changed_line_ranges(dir.path(), &head)?;
+        let ranges = map.get("a.txt").expect("a.txt should appear");
+        // OLD-side hunk header: `@@ -3,0 +4,2 @@` → collapse to [3, 3].
+        assert_eq!(ranges, &vec![LineRange { start: 3, end: 3 }]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_hunk_header_variants() {
+        assert_eq!(
+            parse_hunk_header("@@ -10,3 +20,1 @@"),
+            Some(LineRange { start: 10, end: 12 })
+        );
+        // No comma → count of 1.
+        assert_eq!(
+            parse_hunk_header("@@ -7 +7 @@ fn foo()"),
+            Some(LineRange { start: 7, end: 7 })
+        );
+        // Pure insertion → single-line.
+        assert_eq!(
+            parse_hunk_header("@@ -5,0 +6,2 @@"),
+            Some(LineRange { start: 5, end: 5 })
+        );
+    }
+
+    #[test]
+    fn bad_sha_errors_loudly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let err = git_changed_line_ranges(dir.path(), "deadbeef0000000000000000000000000000")
+            .expect_err("bad sha must error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("git diff"),
             "error should name the failing command: {msg}"
-        );
-        assert!(
-            msg.contains("nonexistent-ref-xyz"),
-            "error should propagate git stderr (which mentions the bad ref): {msg}"
         );
         Ok(())
     }

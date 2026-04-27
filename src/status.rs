@@ -1,15 +1,15 @@
 //! Status reporting: show stored coverage data and what would run for current changes.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::collect::require_nextest;
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_changed_files};
+use crate::project::{find_project_root, git_changed_files, git_changed_line_ranges};
 use crate::selection;
 
 /// Entry point for `cargo affected status`.
-pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
+pub fn status(verbose: bool) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
@@ -23,8 +23,9 @@ pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
     let db = Db::open(project_root)?;
 
     let known_count = db.test_count(&env_fingerprint)?;
-    let mapping_count = db.mapping_count(&env_fingerprint)?;
+    let region_count = db.region_count(&env_fingerprint)?;
     let last_collected = db.last_collected()?.unwrap_or_else(|| "never".to_string());
+    let collect_sha = db.collect_sha(&env_fingerprint)?;
 
     let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
 
@@ -48,11 +49,18 @@ pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
         "coverage database: {}\n\
          last collected: {last_collected}\n\
          tests tracked: {known_count}\n\
-         test-file mappings: {mapping_count}",
+         regions stored: {region_count}",
         rel_path.display(),
     );
+    if let Some(sha) = collect_sha.as_deref() {
+        println!("collect sha: {sha}");
+    }
 
-    let changed_files = git_changed_files(project_root, diff_base)?;
+    let collect_sha = collect_sha.context(
+        "coverage data exists but is missing collect_sha — run `cargo affected collect`",
+    )?;
+
+    let changed_files = git_changed_files(project_root)?;
     warn_untracked_rs_files(&db, &env_fingerprint, &changed_files)?;
 
     if !changed_files.is_empty() {
@@ -62,14 +70,16 @@ pub fn status(diff_base: Option<&str>, verbose: bool) -> Result<()> {
         }
     }
 
+    let changed_ranges = git_changed_line_ranges(project_root, &collect_sha)?;
+
     require_nextest(project_root)?;
-    let sel = selection::compute(project_root, &db, &env_fingerprint, &changed_files)?;
+    let sel = selection::compute(project_root, &db, &env_fingerprint, &changed_ranges)?;
     let selected = sel.selected();
     if selected.is_empty() {
-        match (changed_files.is_empty(), diff_base) {
-            (true, None) => println!("\nno uncommitted changes and no new tests — nothing would run"),
-            (true, Some(base)) => println!("\nno changes vs {base} and no new tests"),
-            (false, _) => println!("\nno tests cover these files and no new tests"),
+        if changed_files.is_empty() {
+            println!("\nno uncommitted changes and no new tests — nothing would run");
+        } else {
+            println!("\nno tests cover the changed lines and no new tests");
         }
         return Ok(());
     }

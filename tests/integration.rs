@@ -45,7 +45,6 @@ fn llvm_tools_available() -> bool {
     }
     let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Get the host target triple.
     let target_output = Command::new("rustc").arg("-vV").output();
     let Ok(target_output) = target_output else {
         return false;
@@ -65,6 +64,10 @@ fn llvm_tools_available() -> bool {
 }
 
 /// Write a small two-module Rust project with tests into the given directory.
+///
+/// `math.rs` has two independently-tested functions (`add` and `multiply`) so
+/// we can verify function-level narrowing — editing the body of `add` must
+/// NOT select `test_multiply`.
 fn write_sample_project(dir: &Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -92,10 +95,18 @@ pub mod strings;
     )
     .unwrap();
 
+    // math.rs: two independent functions, each tested separately, with a
+    // visible "structural zone" between them where struct/derive/use edits
+    // would land. Line numbers are stable (no comments at the top) so the
+    // assertions can reason about ranges.
     std::fs::write(
         src.join("math.rs"),
         r#"pub fn add(a: i32, b: i32) -> i32 {
     a + b
+}
+
+pub struct Counter {
+    pub n: i32,
 }
 
 pub fn multiply(a: i32, b: i32) -> i32 {
@@ -140,6 +151,19 @@ mod tests {
     .unwrap();
 }
 
+/// Edit a file by replacing exactly `from` with `to`. Panics if `from` is
+/// not present, so a refactor in the sample project can't silently no-op.
+fn replace_in_file(path: &Path, from: &str, to: &str) {
+    let content = std::fs::read_to_string(path).unwrap();
+    assert!(
+        content.contains(from),
+        "expected to find {from:?} in {} so the edit lands on the right line",
+        path.display()
+    );
+    let modified = content.replace(from, to);
+    std::fs::write(path, modified).unwrap();
+}
+
 #[test]
 #[ignore]
 fn test_full_pipeline() {
@@ -151,17 +175,14 @@ fn test_full_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    // Set up the sample project.
     write_sample_project(dir);
 
-    // Initialize git and commit everything.
     git(dir, &["init"]);
     git(dir, &["config", "user.email", "test@test.com"]);
     git(dir, &["config", "user.name", "Test"]);
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "initial"]);
 
-    // Run collect.
     let output = cargo_affected(dir, &["affected", "collect"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -170,30 +191,40 @@ fn test_full_pipeline() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains("test mappings"),
-        "expected 'test mappings' in collect output, got: {stderr}"
+        stderr.contains("storing coverage"),
+        "expected 'storing coverage' in collect output, got: {stderr}"
     );
 
-    // Verify the DB was created.
     let db_path = dir.join("target").join("affected").join("coverage.db");
     assert!(
         db_path.exists(),
         "target/affected/coverage.db should exist after collect"
     );
 
-    // Read the DB and verify mappings.
+    // Verify mappings + collect_sha were stored.
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let test_count: i64 = conn
-        .query_row("SELECT COUNT(DISTINCT test_name) FROM test_files", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(DISTINCT test_name) FROM test_regions",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(test_count, 3, "expected 3 tests in DB");
 
-    // Verify that math tests map to math.rs and strings test maps to strings.rs.
+    let stored_sha: String = conn
+        .query_row("SELECT collect_sha FROM fingerprints LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored_sha.len(), 40, "stored sha should be a full hex sha");
+
+    // Each math test should map to math.rs with at least one row.
     let math_tests: Vec<String> = {
         let mut stmt = conn
-            .prepare("SELECT DISTINCT test_name FROM test_files WHERE source_file LIKE '%math.rs'")
+            .prepare(
+                "SELECT DISTINCT test_name FROM test_regions WHERE source_file LIKE '%math.rs'",
+            )
             .unwrap();
         stmt.query_map([], |r| r.get(0))
             .unwrap()
@@ -209,28 +240,10 @@ fn test_full_pipeline() {
         "expected test_multiply to cover math.rs, got: {math_tests:?}"
     );
 
-    let string_tests: Vec<String> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT test_name FROM test_files WHERE source_file LIKE '%strings.rs'",
-            )
-            .unwrap();
-        stmt.query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
-    assert!(
-        string_tests.iter().any(|t| t.contains("test_greet")),
-        "expected test_greet to cover strings.rs, got: {string_tests:?}"
-    );
-
-    // Now modify math.rs (add a comment to change git status).
+    // Editing only `add`'s body must select test_add but not test_multiply.
     let math_path = dir.join("src/math.rs");
-    let content = std::fs::read_to_string(&math_path).unwrap();
-    std::fs::write(&math_path, format!("{content}\n// changed\n")).unwrap();
+    replace_in_file(&math_path, "a + b", "a + b /* edited */");
 
-    // Run status and verify only math tests are listed.
     let output = cargo_affected(dir, &["affected", "status", "-v"]);
     assert!(
         output.status.success(),
@@ -241,26 +254,52 @@ fn test_full_pipeline() {
 
     assert!(
         stdout.contains("test_add"),
-        "status should list test_add, got:\n{stdout}"
+        "status should list test_add (its function body changed), got:\n{stdout}"
     );
     assert!(
-        stdout.contains("test_multiply"),
-        "status should list test_multiply, got:\n{stdout}"
+        !stdout.contains("test_multiply"),
+        "status should NOT list test_multiply (multiply unchanged) — \
+         function-level narrowing failed:\n{stdout}"
     );
     assert!(
         !stdout.contains("test_greet"),
-        "status should NOT list test_greet (strings.rs unchanged), got:\n{stdout}"
+        "status should NOT list test_greet (strings.rs unchanged):\n{stdout}"
     );
 
-    // Verify the skip count is reported.
+    git(dir, &["checkout", "--", "src/math.rs"]);
+
+    // Adding a derive lands outside any function body; no stored range
+    // overlaps, so the file-level backstop must select every test that
+    // covered math.rs.
+    replace_in_file(
+        &math_path,
+        "pub struct Counter {",
+        "#[derive(Debug, Clone)]\npub struct Counter {",
+    );
+
+    let output = cargo_affected(dir, &["affected", "status", "-v"]);
     assert!(
-        stdout.contains("1 skipped"),
-        "status should report 1 skipped test, got:\n{stdout}"
+        output.status.success(),
+        "status (structural edit) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("test_add"),
+        "backstop: test_add should run after struct-derive edit, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("test_multiply"),
+        "backstop: test_multiply should run after struct-derive edit \
+         (no function range overlaps so file-level fallback fires), got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("test_greet"),
+        "structural edit in math.rs shouldn't pull in strings.rs tests:\n{stdout}"
     );
 
-    // Add a new integration test that didn't exist at collect time. No
-    // existing test covers it, so the only way it should be selected is via
-    // nextest-list-based new-test detection.
+    git(dir, &["checkout", "--", "src/math.rs"]);
     std::fs::create_dir_all(dir.join("tests")).unwrap();
     std::fs::write(
         dir.join("tests/integration_new.rs"),
@@ -287,10 +326,5 @@ fn test_full_pipeline() {
     assert!(
         stdout.contains("1 new"),
         "status should report 1 new test in the summary, got:\n{stdout}"
-    );
-    // The math tests still appear (math.rs is still modified).
-    assert!(
-        stdout.contains("test_add"),
-        "status should still list test_add (math.rs still modified), got:\n{stdout}"
     );
 }

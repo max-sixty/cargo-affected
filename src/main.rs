@@ -37,20 +37,12 @@ enum CargoSubcommand {
 enum Action {
     /// Collect coverage data for all tests and store in the database.
     Collect {
-        /// Only re-collect tests covering files changed since this git ref.
-        /// Discovers new tests too. Much faster than a full collection.
-        #[arg(long)]
-        diff_base: Option<String>,
         /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         nextest_args: Vec<String>,
     },
     /// Run only tests affected by current git changes.
     Run {
-        /// Compare against a git ref (commit, branch, tag) instead of working tree changes.
-        /// Uses three-dot diff (`<ref>...HEAD`) to find changes since diverging from the ref.
-        #[arg(long)]
-        diff_base: Option<String>,
         /// Run all tests, skipping coverage-based selection.
         #[arg(long)]
         all: bool,
@@ -63,10 +55,6 @@ enum Action {
     },
     /// Show stored coverage data and what would run for current changes.
     Status {
-        /// Compare against a git ref (commit, branch, tag) instead of working tree changes.
-        /// Uses three-dot diff (`<ref>...HEAD`) to find changes since diverging from the ref.
-        #[arg(long)]
-        diff_base: Option<String>,
         /// List every selected test name. Default prints only a count.
         #[arg(short, long)]
         verbose: bool,
@@ -114,17 +102,14 @@ fn main() {
 
 fn run_action(action: Action) -> Result<i32> {
     match action {
-        Action::Collect { diff_base, nextest_args } => {
-            collect::collect(diff_base.as_deref(), &nextest_args)
-        }
+        Action::Collect { nextest_args } => collect::collect(&nextest_args),
         Action::Run {
-            diff_base,
             all,
             verbose,
             nextest_args,
-        } => run::run(diff_base.as_deref(), all, verbose, &nextest_args),
-        Action::Status { diff_base, verbose } => {
-            status::status(diff_base.as_deref(), verbose)?;
+        } => run::run(all, verbose, &nextest_args),
+        Action::Status { verbose } => {
+            status::status(verbose)?;
             Ok(0)
         }
         Action::Clean => {

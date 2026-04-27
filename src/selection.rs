@@ -1,12 +1,12 @@
 //! Shared test-selection logic for `run` and `status`.
 //!
 //! Both subcommands do the same computation: list all tests via nextest, look
-//! up which of the known tests cover the changed files, and union that with
-//! tests that are in the listing but not yet in the coverage DB (added since
-//! the last `collect`). This module owns that pipeline and the output format
-//! for the summary line so the two callers don't drift apart.
+//! up which of the known tests cover the changed line ranges, and union that
+//! with tests that are in the listing but not yet in the coverage DB (added
+//! since the last `collect`). This module owns that pipeline and the output
+//! format for the summary line so the two callers don't drift apart.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -14,10 +14,11 @@ use anyhow::Result;
 
 use crate::collect::nextest_list;
 use crate::db::{Db, TestId};
+use crate::project::LineRange;
 
 /// Result of the selection computation.
 pub(crate) struct Selection {
-    /// Known tests that cover one of the changed files.
+    /// Known tests selected by line-range overlap with the changed hunks.
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but missing from the DB —
     /// added since the last `collect`. Always selected because we have no
@@ -41,11 +42,15 @@ impl Selection {
 
 /// Compute the selection. Invokes `cargo nextest list` (which builds), so
 /// callers wanting a fast no-op path should short-circuit on empty DB first.
+///
+/// `changed_ranges` maps each changed file to its list of changed line ranges
+/// (OLD-side, in `collect_sha` coordinates). Files with no entry contribute
+/// nothing — that's how we naturally handle untracked files.
 pub(crate) fn compute(
     project_root: &Path,
     db: &Db,
     env_fingerprint: &str,
-    changed_files: &[String],
+    changed_ranges: &BTreeMap<String, Vec<LineRange>>,
 ) -> Result<Selection> {
     eprintln!("checking for new tests...");
     let listing = nextest_list(project_root, None, None)?;
@@ -58,12 +63,14 @@ pub(crate) fn compute(
         .cloned()
         .collect();
 
-    let affected = if changed_files.is_empty() {
-        BTreeSet::new()
-    } else {
-        let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
-        db.tests_covering(env_fingerprint, &file_refs)?
-    };
+    let mut affected = BTreeSet::new();
+    for (file, hunks) in changed_ranges {
+        if hunks.is_empty() {
+            continue;
+        }
+        let hits = db.tests_covering_ranges(env_fingerprint, file, hunks)?;
+        affected.extend(hits);
+    }
 
     Ok(Selection {
         affected,
