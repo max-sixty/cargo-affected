@@ -33,7 +33,6 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use camino::Utf8PathBuf;
 
 use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
@@ -79,7 +78,7 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
 
     // Crate roots (lib.rs/main.rs/tests/*.rs) are added to every test's
     // coverage set with sentinel range (1, i64::MAX) so any hunk overlaps.
-    let crate_roots = workspace_test_src_paths(project_root)?;
+    let crate_roots = project.test_src_paths()?;
     if !crate_roots.is_empty() {
         eprintln!(
             "crate roots (implicit deps): {}",
@@ -445,67 +444,6 @@ fn write_binary_map(path: &Path, map: &HashMap<String, String>) -> Result<()> {
     std::fs::write(path, json)
         .with_context(|| format!("writing binary map to {}", path.display()))?;
     Ok(())
-}
-
-/// Crate roots of all test-producing workspace targets, relative to the
-/// project root. These are added as implicit deps for every test.
-fn workspace_test_src_paths(project_root: &Path) -> Result<BTreeSet<Utf8PathBuf>> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version=1"])
-        .current_dir(project_root)
-        .output()
-        .context("failed to run cargo metadata")?;
-    if !output.status.success() {
-        bail!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let meta: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("failed to parse cargo metadata")?;
-
-    let root = project_root
-        .canonicalize()
-        .context("failed to canonicalize project root")?;
-
-    let mut src_paths = BTreeSet::new();
-    let Some(packages) = meta.get("packages").and_then(|v| v.as_array()) else {
-        return Ok(src_paths);
-    };
-    for pkg in packages {
-        let Some(targets) = pkg.get("targets").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for target in targets {
-            let is_test_target = target
-                .get("test")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !is_test_target {
-                continue;
-            }
-            let kinds: Vec<&str> = target
-                .get("kind")
-                .and_then(|v| v.as_array())
-                .map(|ks| ks.iter().filter_map(|k| k.as_str()).collect())
-                .unwrap_or_default();
-            // Nextest builds and runs tests for lib/bin/test targets; skip
-            // examples, benches, and custom-build so their src_paths don't
-            // pollute the implicit-dep set.
-            if !kinds.iter().any(|k| matches!(*k, "lib" | "bin" | "test")) {
-                continue;
-            }
-            let Some(abs) = target.get("src_path").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if let Ok(rel) = Path::new(abs).strip_prefix(&root) {
-                if let Ok(u) = Utf8PathBuf::try_from(rel.to_path_buf()) {
-                    src_paths.insert(u);
-                }
-            }
-        }
-    }
-    Ok(src_paths)
 }
 
 /// List subdirectories of `profraw_dir` that look like per-test output

@@ -116,6 +116,7 @@ mod tests {
         ProjectRoot {
             workspace_root,
             manifest_paths: manifests,
+            metadata: serde_json::Value::Null,
         }
     }
 

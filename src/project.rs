@@ -1,10 +1,11 @@
 //! Shared project utilities: root detection and git queries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use camino::Utf8PathBuf;
 
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,6 +23,9 @@ pub struct ProjectRoot {
     /// plus every member's manifest. Sorted, deduplicated. Used for
     /// environment fingerprinting.
     pub manifest_paths: Vec<PathBuf>,
+    /// Raw `cargo metadata --no-deps` JSON. Parsed once at root detection so
+    /// less-common lookups (test src paths) don't have to re-spawn cargo.
+    pub metadata: serde_json::Value,
 }
 
 /// Find the project root via `cargo metadata`.
@@ -69,7 +73,60 @@ pub fn find_project_root() -> Result<ProjectRoot> {
     Ok(ProjectRoot {
         workspace_root,
         manifest_paths,
+        metadata: meta,
     })
+}
+
+impl ProjectRoot {
+    /// Crate roots of all test-producing workspace targets, relative to the
+    /// project root. These are added as implicit deps for every test.
+    ///
+    /// Reads from the cached `metadata` JSON — no cargo spawn.
+    pub fn test_src_paths(&self) -> Result<BTreeSet<Utf8PathBuf>> {
+        let root = self
+            .workspace_root
+            .canonicalize()
+            .context("failed to canonicalize project root")?;
+
+        let mut src_paths = BTreeSet::new();
+        let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
+            return Ok(src_paths);
+        };
+        for pkg in packages {
+            let Some(targets) = pkg.get("targets").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for target in targets {
+                let is_test_target = target
+                    .get("test")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !is_test_target {
+                    continue;
+                }
+                let kinds: Vec<&str> = target
+                    .get("kind")
+                    .and_then(|v| v.as_array())
+                    .map(|ks| ks.iter().filter_map(|k| k.as_str()).collect())
+                    .unwrap_or_default();
+                // Nextest builds and runs tests for lib/bin/test targets; skip
+                // examples, benches, and custom-build so their src_paths don't
+                // pollute the implicit-dep set.
+                if !kinds.iter().any(|k| matches!(*k, "lib" | "bin" | "test")) {
+                    continue;
+                }
+                let Some(abs) = target.get("src_path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if let Ok(rel) = Path::new(abs).strip_prefix(&root) {
+                    if let Ok(u) = Utf8PathBuf::try_from(rel.to_path_buf()) {
+                        src_paths.insert(u);
+                    }
+                }
+            }
+        }
+        Ok(src_paths)
+    }
 }
 
 /// List files changed in the working tree relative to HEAD: staged + unstaged
