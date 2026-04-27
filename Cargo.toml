@@ -2,6 +2,13 @@
 name = "cargo-affected"
 version = "0.1.0"
 edition = "2021"
+description = "Run only the tests affected by git changes, using LLVM coverage."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/max-sixty/cargo-affected"
+readme = "README.md"
+keywords = ["test", "coverage", "cargo-subcommand", "incremental", "nextest"]
+categories = ["development-tools::testing", "development-tools::cargo-plugins"]
+authors = ["Maximilian Roos <m@maxroos.com>"]
 
 [[bin]]
 name = "cargo-affected"
