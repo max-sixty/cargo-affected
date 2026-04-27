@@ -71,9 +71,9 @@ Function moves under this scheme:
 | helper extracted from `foo` | edit lands inside `foo` → T selected; next collect adds helper row |
 | extra generic monomorphization | dedupes to same source range → no DB change |
 
-If `collect_sha` is unreachable (rebased away, shallow clone): refuse function-level selection and tell the user to recollect. No silent fallback — consistent with the project's fail-loud principle.
+If `collect_sha` is unreachable (rebased away, shallow clone): `run`/`status` hard-error with a recollect hint. No silent fallback — consistent with the project's fail-loud principle.
 
-If a user has committed since `collect`, ranges may have drifted off their stored coordinates and the `git diff <collect_sha>` view becomes increasingly noisy as committed changes accumulate; the cure is to recollect. We don't error in that case — we just do more work than strictly necessary.
+If a user has committed since `collect`, ranges may have drifted off their stored coordinates and the `git diff <collect_sha>` view becomes increasingly noisy as committed changes accumulate; `run`/`status` print a one-line note with the commit count pointing at recollect. We don't error in that case — we just do more work than strictly necessary.
 
 ### Resolved design decisions
 

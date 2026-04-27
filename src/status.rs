@@ -1,11 +1,13 @@
 //! Status reporting: show stored coverage data and what would run for current changes.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::collect::require_nextest;
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_changed_files, git_changed_line_ranges};
+use crate::project::{
+    find_project_root, git_changed_files, git_changed_line_ranges, relation_to_head, ShaRelation,
+};
 use crate::selection;
 
 /// Entry point for `cargo affected status`.
@@ -59,6 +61,24 @@ pub fn status(verbose: bool) -> Result<()> {
     let collect_sha = collect_sha.context(
         "coverage data exists but is missing collect_sha — run `cargo affected collect`",
     )?;
+
+    match relation_to_head(project_root, &collect_sha)? {
+        ShaRelation::Equal => {}
+        ShaRelation::Ancestor { commits_ahead } => {
+            println!(
+                "\nnote: {commits_ahead} commit(s) since collect — \
+                 diff vs collect_sha is noisier than necessary; \
+                 run `cargo affected collect` to refresh"
+            );
+        }
+        ShaRelation::Diverged => {
+            bail!(
+                "collect_sha {collect_sha} is not reachable from HEAD \
+                 (rebased or branch switched) — \
+                 run `cargo affected collect` to re-anchor"
+            );
+        }
+    }
 
     let changed_files = git_changed_files(project_root)?;
     warn_untracked_rs_files(&db, &env_fingerprint, &changed_files)?;

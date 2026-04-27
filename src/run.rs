@@ -9,12 +9,14 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::collect::{nextest_filter_expr, require_nextest};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_changed_files, git_changed_line_ranges};
+use crate::project::{
+    find_project_root, git_changed_files, git_changed_line_ranges, relation_to_head, ShaRelation,
+};
 use crate::selection;
 
 /// Entry point for `cargo affected run`. Returns the exit code to propagate.
@@ -46,6 +48,24 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
     let collect_sha = db
         .collect_sha(&env_fingerprint)?
         .context("coverage data exists but is missing collect_sha — run `cargo affected collect`")?;
+
+    match relation_to_head(project_root, &collect_sha)? {
+        ShaRelation::Equal => {}
+        ShaRelation::Ancestor { commits_ahead } => {
+            eprintln!(
+                "note: {commits_ahead} commit(s) since collect — \
+                 diff vs collect_sha is noisier than necessary; \
+                 run `cargo affected collect` to refresh"
+            );
+        }
+        ShaRelation::Diverged => {
+            bail!(
+                "collect_sha {collect_sha} is not reachable from HEAD \
+                 (rebased or branch switched) — \
+                 run `cargo affected collect` to re-anchor"
+            );
+        }
+    }
 
     let changed_files = git_changed_files(project_root)?;
     warn_untracked_rs_files(&db, &env_fingerprint, &changed_files)?;

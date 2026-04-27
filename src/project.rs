@@ -14,6 +14,24 @@ pub struct LineRange {
     pub end: i64,
 }
 
+/// How a stored sha relates to the current `HEAD`.
+///
+/// `Equal` — same commit, no drift.
+/// `Ancestor` — committed `commits_ahead` commits since collect; stored line
+/// numbers still align (collect_sha is in current history) but the diff
+/// against working tree includes those committed changes, so selection is
+/// noisier than necessary.
+/// `Diverged` — collect_sha is not reachable from HEAD (rebased, branch
+/// switched, garbage-collected, beyond shallow boundary). Stored line numbers
+/// no longer share a coordinate system with the working tree; the cache is
+/// unsafe to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShaRelation {
+    Equal,
+    Ancestor { commits_ahead: u32 },
+    Diverged,
+}
+
 /// Project root information.
 pub struct ProjectRoot {
     /// Workspace root directory. Git operations and the DB live here.
@@ -181,6 +199,39 @@ pub fn git_head_sha(project_root: &Path) -> Result<String> {
         bail!("git rev-parse HEAD returned an empty sha");
     }
     Ok(sha)
+}
+
+/// Compare `sha` against current `HEAD` for drift reporting.
+///
+/// Uses `git merge-base --is-ancestor` (exit 0 = ancestor, 1 = not ancestor;
+/// any non-zero exit folds into `Diverged` because the user-visible cure is
+/// the same: recollect — whether the sha was rebased away, garbage-collected,
+/// or simply beyond a shallow clone boundary).
+pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
+    let head = git_head_sha(project_root)?;
+    if head == sha {
+        return Ok(ShaRelation::Equal);
+    }
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .with_context(|| format!("failed to run git merge-base --is-ancestor {sha} HEAD"))?;
+    if !status.status.success() {
+        return Ok(ShaRelation::Diverged);
+    }
+    let lines = run_git(
+        project_root,
+        &["rev-list", "--count", &format!("{sha}..HEAD")],
+    )?;
+    let count = lines
+        .into_iter()
+        .next()
+        .context("git rev-list --count returned no output")?
+        .trim()
+        .parse::<u32>()
+        .context("git rev-list --count returned non-numeric output")?;
+    Ok(ShaRelation::Ancestor { commits_ahead: count })
 }
 
 /// Per-file changed line ranges between `collect_sha` and the working tree.
@@ -492,6 +543,85 @@ mod tests {
             parse_hunk_header("@@ -5,0 +6,2 @@"),
             Some(LineRange { start: 5, end: 5 })
         );
+    }
+
+    /// Run `git <args>` in `dir`, asserting success. Used by tests that
+    /// need to drive a repo through several states.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} failed to spawn: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn relation_to_head_equal_when_unchanged() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let head = git_head_sha(dir.path())?;
+        assert_eq!(relation_to_head(dir.path(), &head)?, ShaRelation::Equal);
+        Ok(())
+    }
+
+    #[test]
+    fn relation_to_head_ancestor_counts_commits_ahead() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let collect_sha = git_head_sha(dir.path())?;
+
+        for i in 1..=3 {
+            let name = format!("f{i}.txt");
+            std::fs::write(dir.path().join(&name), b"x")?;
+            git(dir.path(), &["add", &name]);
+            git(dir.path(), &["commit", "-q", "-m", &format!("c{i}")]);
+        }
+
+        assert_eq!(
+            relation_to_head(dir.path(), &collect_sha)?,
+            ShaRelation::Ancestor { commits_ahead: 3 }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relation_to_head_diverged_after_reset() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let init_sha = git_head_sha(dir.path())?;
+
+        // Create a commit, capture its sha, then reset HEAD back. The captured
+        // sha is now a sibling of HEAD's history — present in the repo but
+        // not an ancestor.
+        std::fs::write(dir.path().join("a.txt"), b"x")?;
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "B"]);
+        let b_sha = git_head_sha(dir.path())?;
+        git(dir.path(), &["reset", "--hard", "-q", &init_sha]);
+
+        assert_eq!(
+            relation_to_head(dir.path(), &b_sha)?,
+            ShaRelation::Diverged
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relation_to_head_diverged_when_sha_missing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        // Sha that doesn't exist in the repo at all — folds into Diverged.
+        assert_eq!(
+            relation_to_head(dir.path(), "deadbeef00000000000000000000000000000000")?,
+            ShaRelation::Diverged
+        );
+        Ok(())
     }
 
     #[test]
