@@ -40,10 +40,10 @@ cd /tmp && mkdir affected-sample && cd affected-sample
 cargo init --lib
 # add some modules with tests
 git init && git add . && git commit -m init
-cargo-affected affected collect
+cargo affected collect
 # modify a file
-cargo-affected affected status
-cargo-affected affected run
+cargo affected status
+cargo affected run
 ```
 
 ## Workspace support
