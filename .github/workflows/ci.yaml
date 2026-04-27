@@ -1,0 +1,69 @@
+name: ci
+
+# Runner versions are pinned to avoid surprise breaking changes from -latest
+# migrations. cargo-affected's runner shim uses execvp and is Unix-only, so
+# Windows is intentionally absent from the matrix.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI does clean builds, so incremental compilation tracking adds I/O overhead
+  # with no benefit.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: 📂 Checkout code
+      uses: actions/checkout@v6
+
+    - name: 💰 Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: 🔍 Clippy
+      run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux
+          - os: macos-15
+            name: macos
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: 📂 Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install llvm-tools
+      run: rustup component add llvm-tools
+
+    - name: Install cargo-nextest
+      uses: baptiste0928/cargo-install@v3
+      with:
+        crate: cargo-nextest
+        version: "=0.9.132"
+
+    - name: 💰 Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: 🧪 Unit tests
+      run: cargo test
+
+    - name: 🧪 Integration tests
+      run: cargo test -- --ignored
