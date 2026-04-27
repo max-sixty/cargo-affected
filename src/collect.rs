@@ -8,10 +8,11 @@
 //! and write per-(test, file) line ranges to SQLite.
 //!
 //! Approach:
-//! 1. Read crate roots (lib.rs/main.rs/tests/*.rs) from `cargo metadata` —
-//!    every test implicitly depends on these so edits re-select them.
-//!    Stored as sentinel-range rows `(line_start=1, line_end=i64::MAX)` so
-//!    any hunk in a crate root overlaps and selects the test.
+//! 1. Read crate roots (lib.rs/main.rs/tests/*.rs) from `cargo metadata`,
+//!    grouped by package — a test in package P implicitly depends on P's
+//!    crate roots, but not on any other package's. Stored as sentinel-range
+//!    rows `(line_start=1, line_end=i64::MAX)` so any hunk in one of P's
+//!    crate roots overlaps and selects every test in P.
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
 //!    (id + path) and every testcase. We write a binary_path → binary_id map
 //!    to disk and hand it to the shim via `CARGO_AFFECTED_BINARY_MAP` — the
@@ -26,7 +27,7 @@
 //!    Parallelized across workers.
 //! 6. Store mappings + collect_sha in the DB keyed by (binary_id, test_name).
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -78,25 +79,38 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
 
     // Crate roots (lib.rs/main.rs/tests/*.rs) are added to every test's
     // coverage set with sentinel range (1, i64::MAX) so any hunk overlaps.
-    let crate_roots = project.test_src_paths()?;
-    if !crate_roots.is_empty() {
-        eprintln!(
-            "crate roots (implicit deps): {}",
-            crate_roots
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    // Scoped per-package: a test in package P only gets sentinels for P's
+    // crate roots, so an edit to another package's lib.rs doesn't drag P's
+    // tests in. The package is recovered from `binary_id`'s prefix (see
+    // `package_from_binary_id`).
+    let crate_roots_by_package = project.test_src_paths_by_package()?;
+    if !crate_roots_by_package.is_empty() {
+        for (pkg, paths) in &crate_roots_by_package {
+            eprintln!(
+                "crate roots for {pkg}: {}",
+                paths
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
-    let crate_root_ranges: BTreeSet<HitRange> = crate_roots
-        .iter()
-        .map(|p| HitRange {
-            file: p.clone(),
-            line_start: 1,
-            line_end: u32::MAX,
-        })
-        .collect();
+    let crate_root_ranges_by_package: BTreeMap<String, BTreeSet<HitRange>> =
+        crate_roots_by_package
+            .into_iter()
+            .map(|(pkg, paths)| {
+                let ranges = paths
+                    .into_iter()
+                    .map(|p| HitRange {
+                        file: p,
+                        line_start: 1,
+                        line_end: u32::MAX,
+                    })
+                    .collect();
+                (pkg, ranges)
+            })
+            .collect();
 
     let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     if !rustflags.is_empty() {
@@ -164,6 +178,7 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
     let work: Mutex<VecDeque<(usize, PathBuf)>> =
         Mutex::new(test_dirs.into_iter().enumerate().collect());
     let mappings: Mutex<Vec<(TestId, BTreeSet<HitRange>)>> = Mutex::new(Vec::new());
+    let extract_errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     std::thread::scope(|s| {
         for _ in 0..num_workers {
@@ -179,7 +194,22 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
                 let n = *guard;
                 match outcome {
                     Ok(ExtractOutcome::Collected { test_id, mut ranges }) => {
-                        ranges.extend(crate_root_ranges.iter().cloned());
+                        let package = package_from_binary_id(&test_id.binary_id);
+                        let Some(pkg_ranges) = crate_root_ranges_by_package.get(package) else {
+                            eprintln!(
+                                "[{n}/{total}] {}::{}: ERROR (binary_id maps to package \
+                                 {package:?}, which is not a known workspace package)",
+                                test_id.binary_id, test_id.test_name
+                            );
+                            drop(guard);
+                            extract_errors.lock().unwrap().push(format!(
+                                "binary_id {:?} maps to package {:?}, which is not a known \
+                                 workspace package",
+                                test_id.binary_id, package
+                            ));
+                            continue;
+                        };
+                        ranges.extend(pkg_ranges.iter().cloned());
                         eprintln!(
                             "[{n}/{total}] {}::{}: {} ranges ({elapsed:.1}s)",
                             test_id.binary_id,
@@ -205,6 +235,11 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
             });
         }
     });
+
+    let extract_errors = extract_errors.into_inner().unwrap();
+    if !extract_errors.is_empty() {
+        bail!("coverage extraction failed:\n  {}", extract_errors.join("\n  "));
+    }
 
     let mappings = mappings.into_inner().unwrap();
 
@@ -334,6 +369,18 @@ fn extract_one(
             reason: format!("parse error: {e}"),
         }),
     }
+}
+
+/// Recover the package name from nextest's `binary_id`.
+///
+/// Format (per `nextest_metadata::RustBinaryId::from_parts`):
+/// - `<package>` for a package's lib/proc-macro target,
+/// - `<package>::<target>` for an integration test target,
+/// - `<package>::<kind>/<target>` for any other target.
+///
+/// In every case the package name is everything before the first `::`.
+pub(crate) fn package_from_binary_id(binary_id: &str) -> &str {
+    binary_id.split("::").next().unwrap_or(binary_id)
 }
 
 /// Build a nextest `-E` filter expression matching exactly the given tests,

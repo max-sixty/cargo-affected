@@ -96,21 +96,32 @@ pub fn find_project_root() -> Result<ProjectRoot> {
 }
 
 impl ProjectRoot {
-    /// Crate roots of all test-producing workspace targets, relative to the
-    /// project root. These are added as implicit deps for every test.
+    /// Crate roots of all test-producing workspace targets, grouped by package
+    /// name. Paths are relative to the workspace root. Used by `collect` to
+    /// attach a sentinel `(1, i64::MAX)` range to every test for *its own
+    /// package*'s crate roots — a structural edit (`mod foo;`, `use ...;`) in
+    /// any of those files must pull in every test in that package, but must
+    /// not leak to other packages whose tests can't observe the change.
+    ///
+    /// The map key is the package name from `metadata.packages[].name`, which
+    /// matches the prefix of nextest's `binary_id` (everything before the
+    /// first `::`). See `nextest_metadata::RustBinaryId::from_parts`.
     ///
     /// Reads from the cached `metadata` JSON — no cargo spawn.
-    pub fn test_src_paths(&self) -> Result<BTreeSet<Utf8PathBuf>> {
+    pub fn test_src_paths_by_package(&self) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
         let root = self
             .workspace_root
             .canonicalize()
             .context("failed to canonicalize project root")?;
 
-        let mut src_paths = BTreeSet::new();
+        let mut by_package: BTreeMap<String, BTreeSet<Utf8PathBuf>> = BTreeMap::new();
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
-            return Ok(src_paths);
+            return Ok(by_package);
         };
         for pkg in packages {
+            let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let Some(targets) = pkg.get("targets").and_then(|v| v.as_array()) else {
                 continue;
             };
@@ -138,12 +149,12 @@ impl ProjectRoot {
                 };
                 if let Ok(rel) = Path::new(abs).strip_prefix(&root) {
                     if let Ok(u) = Utf8PathBuf::try_from(rel.to_path_buf()) {
-                        src_paths.insert(u);
+                        by_package.entry(name.to_string()).or_default().insert(u);
                     }
                 }
             }
         }
-        Ok(src_paths)
+        Ok(by_package)
     }
 }
 
