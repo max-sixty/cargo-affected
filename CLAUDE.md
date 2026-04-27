@@ -6,11 +6,11 @@ Like pytest-testmon for Rust. Uses LLVM coverage to map each test to the source-
 
 ```sh
 cargo clippy --all-targets   # lint
-cargo test                   # unit tests only
-cargo test -- --ignored      # integration test (slow — runs coverage builds)
+cargo test                   # unit + functional integration tests
 ```
 
-Requires `rustup component add llvm-tools` for coverage collection.
+Requires `rustup component add llvm-tools` and `cargo-nextest` — both used by
+the functional test suite.
 
 ## Architecture
 
