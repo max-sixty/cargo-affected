@@ -5,11 +5,17 @@
 //! tests via `cargo nextest run`. Also lists tests via nextest to catch tests
 //! added since the last `collect` — those have no coverage data, so they're
 //! always selected. nextest is required — no `cargo test` fallback.
+//!
+//! When selection can't be computed precisely (no coverage yet, fingerprint
+//! changed, missing `collect_sha`, or `collect_sha` not reachable from HEAD),
+//! `run` falls back to running every test with an explanatory stderr notice.
+//! That makes `cargo affected run` a strict superset of `cargo nextest run` —
+//! always at least as safe.
 
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::collect::{nextest_filter_expr, require_nextest};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
@@ -20,6 +26,11 @@ use crate::project::{
 use crate::selection;
 
 /// Entry point for `cargo affected run`. Returns the exit code to propagate.
+///
+/// Falls back to running all tests (with an explanatory stderr notice) in
+/// every case where a precise affected-test selection can't be computed —
+/// no coverage data, fingerprint mismatch, missing `collect_sha`, or
+/// `collect_sha` not reachable from HEAD.
 pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
@@ -36,18 +47,26 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
     if db.test_count(&env_fingerprint)? == 0 {
         if db.has_any_coverage()? {
             eprintln!(
-                "coverage database has no data for the current environment \
-                 (Cargo.lock, Cargo.toml, rustc version, or build flags changed) — running all tests"
+                "note: no coverage data for the current environment \
+                 (Cargo.lock, Cargo.toml, rustc version, or build flags changed) — \
+                 running all tests; run `cargo affected collect` to refresh"
             );
-            return run_tests(project_root, None, nextest_args);
+        } else {
+            eprintln!(
+                "note: no coverage data yet — running all tests; \
+                 run `cargo affected collect` to enable selection"
+            );
         }
-        eprintln!("no coverage data yet — run `cargo affected collect` first");
-        return Ok(0);
+        return run_tests(project_root, None, nextest_args);
     }
 
-    let collect_sha = db
-        .collect_sha(&env_fingerprint)?
-        .context("coverage data exists but is missing collect_sha — run `cargo affected collect`")?;
+    let Some(collect_sha) = db.collect_sha(&env_fingerprint)? else {
+        eprintln!(
+            "note: coverage data exists but is missing collect_sha — running all tests; \
+             run `cargo affected collect` to re-anchor"
+        );
+        return run_tests(project_root, None, nextest_args);
+    };
 
     match relation_to_head(project_root, &collect_sha)? {
         ShaRelation::Equal => {}
@@ -59,11 +78,12 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
             );
         }
         ShaRelation::Diverged => {
-            bail!(
-                "collect_sha {collect_sha} is not reachable from HEAD \
-                 (rebased or branch switched) — \
+            eprintln!(
+                "note: collect_sha {collect_sha} not reachable from HEAD \
+                 (rebased or branch switched) — running all tests; \
                  run `cargo affected collect` to re-anchor"
             );
+            return run_tests(project_root, None, nextest_args);
         }
     }
 

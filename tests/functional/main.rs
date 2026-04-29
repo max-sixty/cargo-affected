@@ -23,6 +23,7 @@
 
 mod clean;
 mod drift;
+mod fallback;
 mod fingerprint;
 mod narrowing;
 mod new_test;
