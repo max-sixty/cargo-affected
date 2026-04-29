@@ -6,11 +6,11 @@
 //! added since the last `collect` — those have no coverage data, so they're
 //! always selected. nextest is required — no `cargo test` fallback.
 //!
-//! When selection can't be computed precisely (no coverage yet, fingerprint
-//! changed, missing `collect_sha`, or `collect_sha` not reachable from HEAD),
-//! `run` falls back to running every test with an explanatory stderr notice.
-//! That makes `cargo affected run` a strict superset of `cargo nextest run` —
-//! always at least as safe.
+//! When the coverage cache can't anchor a precise selection (no coverage
+//! yet, fingerprint changed, missing `collect_sha`, or `collect_sha` not
+//! reachable from HEAD), `run` emits a stderr notice and runs every test.
+//! That makes `cargo affected run` a strict superset of `cargo nextest
+//! run` — always at least as safe.
 
 use std::path::Path;
 use std::process::Command;
@@ -27,8 +27,8 @@ use crate::selection;
 
 /// Entry point for `cargo affected run`. Returns the exit code to propagate.
 ///
-/// Falls back to running all tests (with an explanatory stderr notice) in
-/// every case where a precise affected-test selection can't be computed —
+/// Runs every test (with an explanatory stderr notice) in every case where
+/// the coverage cache can't anchor a precise affected-test selection —
 /// no coverage data, fingerprint mismatch, missing `collect_sha`, or
 /// `collect_sha` not reachable from HEAD.
 pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {

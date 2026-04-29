@@ -36,10 +36,10 @@ cargo affected clean      # wipe the coverage cache
 `collect` last ran. Recollect periodically — every committed change since
 the last collect adds to the diff and broadens selection.
 
-When `run` can't compute a precise selection — no coverage yet, environment
-fingerprint changed, missing or unreachable `collect_sha` — it falls back to
-running every test with a stderr notice. `cargo affected run` is therefore a
-strict superset of `cargo nextest run`: always at least as safe.
+When the coverage cache can't anchor a precise selection — no coverage yet,
+environment fingerprint changed, missing or unreachable `collect_sha` — `run`
+emits a stderr notice and runs every test. `cargo affected run` is therefore
+a strict superset of `cargo nextest run`: always at least as safe.
 
 ## How it works
 

@@ -223,7 +223,7 @@ impl Db {
 
     /// Find tests under `fingerprint` that overlap any of the given line
     /// ranges in `file`. Per hunk: range-overlap; if a hunk overlaps no
-    /// stored range, fall back to "any test with rows for this file" (the
+    /// stored range, broaden to "any test with rows for this file" (the
     /// structural-edit backstop for struct-field, derive, const, use, mod
     /// edits).
     ///
@@ -593,7 +593,7 @@ mod tests {
         Ok(())
     }
 
-    /// Backstop: a hunk that overlaps no stored range falls back to all tests
+    /// Backstop: a hunk that overlaps no stored range broadens to all tests
     /// with rows for the file. Models a struct-field edit between two
     /// functions — neither function's range overlaps line 25, but both tests
     /// touched lib.rs and so both must be selected to be safe.

@@ -1,24 +1,26 @@
-//! Fallback-to-all-tests behavior for `cargo affected run`.
+//! Coverage-cache-miss behavior for `cargo affected run`.
 //!
 //! `run` aims to be a strict superset of `cargo nextest run`: when the
-//! framework can't compute a precise affected-test selection, it falls back
-//! to running every test with a stderr notice rather than bailing or
-//! no-opping. This file pins the behavioral promise for the two cases that
-//! are easy to set up integration-style — no coverage data at all, and a
-//! `collect_sha` that's no longer reachable from HEAD (drift).
+//! coverage cache can't anchor a precise affected-test selection (no data
+//! at all, fingerprint mismatch, missing or unreachable `collect_sha`), it
+//! emits a stderr notice and runs every test rather than bailing or
+//! no-opping. This file pins that contract for the two cases that are easy
+//! to set up integration-style — empty coverage cache, and a `collect_sha`
+//! no longer reachable from HEAD.
 //!
-//! `status` keeps the bail behavior for drift (see `drift.rs`); only `run`
-//! falls back, because `run`'s job is to actually produce CI signal.
+//! `status` keeps the bail behavior on drift (see `drift.rs`); only `run`
+//! widens to the full suite, because `run`'s job is to actually produce
+//! CI signal.
 
 use crate::{
     cargo_affected, git, git_head, init_git_with_initial_commit, write_two_module_project,
 };
 
 #[test]
-fn run_falls_back_to_all_when_no_coverage_data() {
+fn run_executes_full_suite_when_no_coverage_data() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_two_module_project(dir, "sample_fallback_no_coverage");
+    write_two_module_project(dir, "sample_cache_miss_no_coverage");
     init_git_with_initial_commit(dir);
 
     // No `cargo affected collect` — DB is empty (or absent). `run` must
@@ -38,11 +40,12 @@ fn run_falls_back_to_all_when_no_coverage_data() {
         String::from_utf8_lossy(&run.stdout)
     );
 
-    // The fallback notice — phrased as "note: ..." per the existing notice
-    // style in run.rs. Match on the "no coverage data yet" key phrase.
+    // The "running all tests" notice — phrased as "note: ..." per the
+    // existing notice style in run.rs. Match on the "no coverage data yet"
+    // key phrase.
     assert!(
         combined.contains("no coverage data yet") && combined.contains("running all tests"),
-        "expected fallback notice, got:\n{combined}"
+        "expected cache-miss notice, got:\n{combined}"
     );
     // nextest actually ran every test in the sample project (PASS lines for
     // each of test_add / test_multiply / test_greet). One PASS would be
@@ -57,10 +60,10 @@ fn run_falls_back_to_all_when_no_coverage_data() {
 }
 
 #[test]
-fn run_falls_back_to_all_when_collect_sha_diverged() {
+fn run_executes_full_suite_when_collect_sha_diverged() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_two_module_project(dir, "sample_fallback_diverged");
+    write_two_module_project(dir, "sample_cache_miss_diverged");
     init_git_with_initial_commit(dir);
     let init_sha = git_head(dir);
 
@@ -104,7 +107,7 @@ fn run_falls_back_to_all_when_collect_sha_diverged() {
 
     assert!(
         combined.contains("not reachable from HEAD") && combined.contains("running all tests"),
-        "expected diverged-fallback notice, got:\n{combined}"
+        "expected diverged-cache notice, got:\n{combined}"
     );
     // The whole suite ran — same three-test check as the no-coverage case.
     for t in ["test_add", "test_multiply", "test_greet"] {

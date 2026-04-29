@@ -22,7 +22,7 @@ fn added_derive_pulls_in_all_file_tests() {
     );
 
     // Adding a derive lands between functions — no stored range overlaps,
-    // so the per-hunk fallback must kick in and select every test that ever
+    // so the per-hunk backstop must kick in and select every test that ever
     // touched math.rs (test_add and test_multiply). test_greet lives in
     // strings.rs and must NOT be pulled in.
     replace_in_file(
@@ -46,7 +46,7 @@ fn added_derive_pulls_in_all_file_tests() {
     assert!(
         stdout.contains("test_multiply"),
         "backstop: test_multiply should run after struct-derive edit \
-         (no function range overlaps so file-level fallback fires), got:\n{stdout}"
+         (no function range overlaps so file-level backstop fires), got:\n{stdout}"
     );
     assert!(
         !stdout.contains("test_greet"),

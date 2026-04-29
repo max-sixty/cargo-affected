@@ -21,9 +21,9 @@
 //! we're not yet sharing a `target/` across scenarios, keeping names unique
 //! avoids the foot-gun preemptively.
 
+mod cache_miss;
 mod clean;
 mod drift;
-mod fallback;
 mod fingerprint;
 mod narrowing;
 mod new_test;
