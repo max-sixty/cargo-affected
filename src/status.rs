@@ -1,6 +1,11 @@
 //! Status reporting: show stored coverage data and what would run for current changes.
+//!
+//! Mirrors `run`'s contract: when the coverage cache can't anchor a precise
+//! selection (no data, fingerprint mismatch, missing or unreachable
+//! `collect_sha`), `status` reports "would run all tests" with an explanation
+//! rather than bailing — same widening `run` performs.
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 
 use crate::collect::require_nextest;
 use crate::db::{db_path, warn_untracked_rs_files, Db};
@@ -11,13 +16,22 @@ use crate::project::{
 use crate::selection;
 
 /// Entry point for `cargo affected status`.
+///
+/// Reports "would run all tests" (with an explanation) in every case where
+/// the coverage cache can't anchor a precise affected-test selection — no
+/// coverage data, fingerprint mismatch, missing `collect_sha`, or
+/// `collect_sha` not reachable from HEAD. Mirrors `run`'s widening so the
+/// dry-run accurately predicts what `run` would do.
 pub fn status(verbose: bool) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
     let path = db_path(project_root);
     if !path.exists() {
-        println!("no coverage data found — run `cargo affected collect` first");
+        println!(
+            "no coverage data found — would run all tests; \
+             run `cargo affected collect` to enable selection"
+        );
         return Ok(());
     }
 
@@ -41,7 +55,7 @@ pub fn status(verbose: bool) -> Result<()> {
         println!(
             "coverage database: {}\n\
              last collected: {last_collected}\n\
-             {reason} — run `cargo affected collect`",
+             {reason} — would run all tests; run `cargo affected collect` to enable selection",
             rel_path.display(),
         );
         return Ok(());
@@ -58,9 +72,13 @@ pub fn status(verbose: bool) -> Result<()> {
         println!("collect sha: {sha}");
     }
 
-    let collect_sha = collect_sha.context(
-        "coverage data exists but is missing collect_sha — run `cargo affected collect`",
-    )?;
+    let Some(collect_sha) = collect_sha else {
+        println!(
+            "\nnote: coverage data exists but is missing collect_sha — \
+             would run all tests; run `cargo affected collect` to re-anchor"
+        );
+        return Ok(());
+    };
 
     match relation_to_head(project_root, &collect_sha)? {
         ShaRelation::Equal => {}
@@ -72,11 +90,12 @@ pub fn status(verbose: bool) -> Result<()> {
             );
         }
         ShaRelation::Diverged => {
-            bail!(
-                "collect_sha {collect_sha} is not reachable from HEAD \
-                 (rebased or branch switched) — \
+            println!(
+                "\nnote: collect_sha {collect_sha} not reachable from HEAD \
+                 (rebased or branch switched) — would run all tests; \
                  run `cargo affected collect` to re-anchor"
             );
+            return Ok(());
         }
     }
 

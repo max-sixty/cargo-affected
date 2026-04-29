@@ -1,15 +1,15 @@
 //! collect_sha drift: when the recorded `collect_sha` is no longer reachable
 //! from HEAD (rebased away, branch switched, history rewritten), stored line
-//! numbers no longer share a coordinate system with the working tree. Status
-//! should bail loudly — silently using mis-aligned ranges would select wrong
-//! tests.
+//! numbers no longer share a coordinate system with the working tree.
+//! `status` mirrors `run`'s widening — it reports "would run all tests" with
+//! a re-anchor hint, so the dry-run accurately predicts what `run` would do.
 
 use crate::{
     cargo_affected, git, git_head, init_git_with_initial_commit, write_two_module_project,
 };
 
 #[test]
-fn unreachable_collect_sha_errors_with_reanchor_hint() {
+fn unreachable_collect_sha_status_reports_full_suite() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_two_module_project(dir, "sample_drift");
@@ -47,19 +47,23 @@ fn unreachable_collect_sha_errors_with_reanchor_hint() {
 
     let status = cargo_affected(dir, &["affected", "status"]);
     assert!(
-        !status.status.success(),
-        "status should fail when collect_sha is unreachable, got success with:\nstdout=\n{}\nstderr=\n{}",
+        status.status.success(),
+        "status should succeed and report full-suite widening, got failure:\nstdout=\n{}\nstderr=\n{}",
         String::from_utf8_lossy(&status.stdout),
         String::from_utf8_lossy(&status.stderr)
     );
 
-    let stderr = String::from_utf8_lossy(&status.stderr);
+    let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
-        stderr.contains("not reachable from HEAD"),
-        "expected 'not reachable from HEAD' in error, got:\n{stderr}"
+        stdout.contains("not reachable from HEAD"),
+        "expected 'not reachable from HEAD' in notice, got:\n{stdout}"
     );
     assert!(
-        stderr.contains("re-anchor") || stderr.contains("collect"),
-        "expected re-anchor / collect hint in error, got:\n{stderr}"
+        stdout.contains("would run all tests"),
+        "expected 'would run all tests' in notice, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("re-anchor") || stdout.contains("collect"),
+        "expected re-anchor / collect hint in notice, got:\n{stdout}"
     );
 }
