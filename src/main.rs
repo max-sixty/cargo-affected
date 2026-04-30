@@ -38,6 +38,9 @@ enum CargoSubcommand {
 enum Action {
     /// Collect coverage data for all tests and store in the database.
     Collect {
+        /// Print pipeline internals (tool paths, per-binary sentinels, etc.).
+        #[arg(short, long)]
+        verbose: bool,
         /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         nextest_args: Vec<String>,
@@ -116,7 +119,10 @@ fn run_action(action: Action) -> Result<i32> {
     }
 
     match action {
-        Action::Collect { nextest_args } => collect::collect(&nextest_args),
+        Action::Collect {
+            verbose,
+            nextest_args,
+        } => collect::collect(verbose, &nextest_args),
         Action::Run {
             all,
             verbose,

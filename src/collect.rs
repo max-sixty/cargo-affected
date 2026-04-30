@@ -48,11 +48,13 @@ use crate::fingerprint;
 use crate::project::{find_project_root, git_head_sha};
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
-pub fn collect(nextest_args: &[String]) -> Result<i32> {
+pub fn collect(verbose: bool, nextest_args: &[String]) -> Result<i32> {
     let total_start = Instant::now();
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
-    eprintln!("project root: {}", project_root.display());
+    if verbose {
+        eprintln!("project root: {}", project_root.display());
+    }
     let canonical_root = project_root
         .canonicalize()
         .context("failed to canonicalize project root")?;
@@ -68,8 +70,10 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
 
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
-    eprintln!("llvm-profdata: {}", llvm_profdata.display());
-    eprintln!("llvm-cov: {}", llvm_cov.display());
+    if verbose {
+        eprintln!("llvm-profdata: {}", llvm_profdata.display());
+        eprintln!("llvm-cov: {}", llvm_cov.display());
+    }
 
     // Anchor for future `run`/`status` diffs. Captured up front so a missing
     // HEAD (e.g., empty repo) errors before we spend time on builds.
@@ -90,15 +94,17 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
     // transitively depends on. See `crate_root_sentinels_by_binary_id` for
     // the reasoning.
     let crate_root_sentinels = project.crate_root_sentinels_by_binary_id()?;
-    for (binary_id, paths) in &crate_root_sentinels {
-        eprintln!(
-            "crate-root sentinels for {binary_id}: {}",
-            paths
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    if verbose {
+        for (binary_id, paths) in &crate_root_sentinels {
+            eprintln!(
+                "crate-root sentinels for {binary_id}: {}",
+                paths
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     let crate_root_ranges_by_binary_id: BTreeMap<String, BTreeSet<HitRange>> =
         crate_root_sentinels
@@ -152,7 +158,9 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
     // reflects whatever the run step is about to invoke. Cheap (cache hit
     // when nothing changed) and structurally robust against rebuilds that
     // would otherwise reshuffle hashes between list and run.
-    eprintln!("refreshing binary paths before nextest run...");
+    if verbose {
+        eprintln!("refreshing binary paths before nextest run...");
+    }
     let pre_run = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
     let runtime_map = build_runtime_binary_map(&pre_run.binaries, &stable_by_target)?;
     write_binary_map(&binary_map_path, &runtime_map)?;
