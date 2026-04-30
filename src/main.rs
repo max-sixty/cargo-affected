@@ -41,6 +41,12 @@ enum Action {
         /// Print pipeline internals (tool paths, per-binary sentinels, etc.).
         #[arg(short, long)]
         verbose: bool,
+        /// Collect against a dirty working tree. Stored line numbers reflect
+        /// the working-tree files cargo compiled, but they're filed under
+        /// `HEAD`'s sha — later diffs against `HEAD` will be out of phase
+        /// and selection will silently mis-target. Use only for throwaway runs.
+        #[arg(long)]
+        allow_dirty: bool,
         /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         nextest_args: Vec<String>,
@@ -121,8 +127,9 @@ fn run_action(action: Action) -> Result<i32> {
     match action {
         Action::Collect {
             verbose,
+            allow_dirty,
             nextest_args,
-        } => collect::collect(verbose, &nextest_args),
+        } => collect::collect(verbose, allow_dirty, &nextest_args),
         Action::Run {
             all,
             verbose,

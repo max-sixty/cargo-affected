@@ -45,10 +45,10 @@ use anyhow::{bail, Context, Result};
 use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_head_sha};
+use crate::project::{find_project_root, git_head_sha, git_working_tree_dirty};
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
-pub fn collect(verbose: bool, nextest_args: &[String]) -> Result<i32> {
+pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Result<i32> {
     let total_start = Instant::now();
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
@@ -58,6 +58,24 @@ pub fn collect(verbose: bool, nextest_args: &[String]) -> Result<i32> {
     let canonical_root = project_root
         .canonicalize()
         .context("failed to canonicalize project root")?;
+
+    // Refuse to collect on a dirty tree by default: ranges would be filed
+    // under HEAD but reflect working-tree line numbers, knocking the DB out
+    // of phase with every later `git diff <collect_sha>` query.
+    if git_working_tree_dirty(project_root)? {
+        if allow_dirty {
+            eprintln!(
+                "warning: collecting on a dirty working tree (--allow-dirty); \
+                 stored ranges may not align with future `affected run` queries"
+            );
+        } else {
+            bail!(
+                "working tree has uncommitted changes; commit or stash them \
+                 before `cargo affected collect`, or pass --allow-dirty for a \
+                 throwaway run (selection will be unreliable)"
+            );
+        }
+    }
 
     require_nextest(project_root)?;
     let self_path = std::env::current_exe().context("failed to resolve current executable")?;

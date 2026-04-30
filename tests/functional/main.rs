@@ -23,6 +23,7 @@
 
 mod cache_miss;
 mod clean;
+mod dirty;
 mod drift;
 mod duplicate_target_names;
 mod fingerprint;

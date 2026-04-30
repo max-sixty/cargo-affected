@@ -355,6 +355,28 @@ pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Whether the working tree has uncommitted changes — staged, unstaged, or
+/// untracked — relative to `HEAD`. Ignored files don't count.
+///
+/// `collect` refuses to run on a dirty tree by default: stored line numbers
+/// reflect the working-tree files cargo actually compiled, but the captured
+/// `collect_sha` points at `HEAD`. Later, `run`/`status` ask git for hunks via
+/// `git diff -U0 <collect_sha>`, whose OLD-side line numbers are in HEAD's
+/// coordinate system — out of phase with what's in the DB. The
+/// structural-edit backstop hides some of the damage but only when a hunk
+/// overlaps no stored range; point edits within a function silently
+/// mis-select.
+pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
+    // `--porcelain=v1 -z` emits one NUL-terminated entry per changed path
+    // (renames split into two entries; we only care about emptiness).
+    // Untracked files are reported by default; ignored files are not. That's
+    // the right calibration: an untracked .rs in the workspace can be
+    // compiled into tests, so its line numbers end up in the DB just like a
+    // modified file's.
+    let lines = run_git(project_root, &["status", "--porcelain=v1", "-z"])?;
+    Ok(!lines.is_empty())
+}
+
 /// Capture the current git HEAD sha. Hard error if HEAD is unreachable —
 /// detached/initial-commit repos can't anchor function-level coverage and
 /// silently using "" would later fail with a confusing diff error.
@@ -638,6 +660,27 @@ mod tests {
             files.iter().any(|f| f == awkward),
             "expected verbatim {awkward:?} in {files:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn working_tree_dirty_distinguishes_states() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+
+        // Fresh repo with one committed file: clean.
+        assert!(!git_working_tree_dirty(dir.path())?);
+
+        // Untracked file → dirty.
+        std::fs::write(dir.path().join("new.txt"), b"x")?;
+        assert!(git_working_tree_dirty(dir.path())?);
+        std::fs::remove_file(dir.path().join("new.txt"))?;
+        assert!(!git_working_tree_dirty(dir.path())?);
+
+        // Modified tracked file → dirty.
+        std::fs::write(dir.path().join("README.md"), b"changed\n")?;
+        assert!(git_working_tree_dirty(dir.path())?);
+
         Ok(())
     }
 

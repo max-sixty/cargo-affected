@@ -146,8 +146,13 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         "wt-perf builds test must not be selected (its package didn't change), got:\n{combined}"
     );
 
-    // A second collect under the edited tree exercises the full pipeline
-    // again — pre-run listing must still produce a working binary_map.
+    // A second collect after the edit exercises the full pipeline again —
+    // pre-run listing must still produce a working binary_map. Commit the
+    // edit first so collect's clean-tree gate is satisfied; the gate exists
+    // because stored ranges would otherwise be filed under HEAD but reflect
+    // the dirty working tree.
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "edit mock-stub touch"]);
     let recollect = cargo_affected_stripped(dir, &["affected", "collect"]);
     let recollect_stderr = String::from_utf8_lossy(&recollect.stderr);
     assert!(
