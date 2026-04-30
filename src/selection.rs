@@ -139,10 +139,29 @@ pub(crate) fn changed_ranges_per_sha(
     Ok(out)
 }
 
+/// Compute selection given a pre-built listing and a `Reachability`.
+///
+/// Bundles the two steps that always happen together — per-sha diff query
+/// and the selection compute — so the three callers (`run`, `status`,
+/// `collect --diff`) don't each open-code the pair. Caller stays
+/// responsible for handling `reach.reachable.is_empty()` upstream:
+/// `run`/`status` widen to all tests there, `collect --diff` bails. Those
+/// policies and their notices differ, so they don't belong in here.
+pub(crate) fn select_with_reach(
+    project_root: &Path,
+    db: &Db,
+    fingerprint: &str,
+    listing: &Listing,
+    reach: &Reachability,
+) -> Result<Selection> {
+    let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
+    compute(db, fingerprint, &reach.reachable, &changed_ranges_by_sha, listing)
+}
+
 /// Compute the selection from a pre-built nextest listing and per-sha changed
-/// ranges. Callers do their own `nextest list` so they can pass the listing
-/// they already need for the binary-map dance (collect) or to control the
-/// build flags (run/status invoke a non-instrumented list).
+/// ranges. Most callers should use [`select_with_reach`] instead; this is the
+/// lower-level entry point for tests and any caller that already has the
+/// per-sha changed-range map.
 ///
 /// `reachable_shas` are the stored `collect_sha`s still reachable from HEAD;
 /// only tests anchored at one of those shas count as "known" to the cache.

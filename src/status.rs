@@ -105,17 +105,15 @@ pub fn status(verbose: bool) -> Result<()> {
         }
     }
 
-    let changed_ranges_by_sha = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
-
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");
     let listing = nextest_list(project_root, None, None)?;
-    let sel = selection::compute(
+    let sel = selection::select_with_reach(
+        project_root,
         &db,
         &env_fingerprint,
-        &reach.reachable,
-        &changed_ranges_by_sha,
         &listing,
+        &reach,
     )?;
     let selected = sel.selected();
     if selected.is_empty() {

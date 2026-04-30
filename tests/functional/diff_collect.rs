@@ -527,6 +527,92 @@ fn diff_collect_prunes_deleted_tests() {
     );
 }
 
+/// All-phantom selection: every selected test exists in the DB but has been
+/// removed from the nextest listing. The structural-edit backstop pulls
+/// both math.rs tests into `affected`; both are now absent from the
+/// listing, so the nextest filter matches nothing and the runner shim
+/// never fires. `handle_no_profraw_dirs` should recognize this as the
+/// expected "filter matched nothing real" case (rather than a runner
+/// shim failure) and prune the stale rows.
+#[test]
+fn diff_collect_all_phantom_selection_prunes_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_all_phantoms");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Strip BOTH `#[test]` attributes in math.rs. Both functions still
+    // compile (the dead_code lint is just a warning) but neither is a test
+    // anymore — listing drops to just test_greet. The diff hunks land on
+    // attribute lines that don't overlap any stored body range, so the
+    // backstop fires and selects test_add + test_multiply. Both are
+    // phantoms now.
+    replace_in_file(
+        &dir.join("src/math.rs"),
+        "    #[test]\n    fn test_add()",
+        "    fn test_add()",
+    );
+    replace_in_file(
+        &dir.join("src/math.rs"),
+        "    #[test]\n    fn test_multiply()",
+        "    fn test_multiply()",
+    );
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "demote both math tests"]);
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert!(
+        diff.status.success(),
+        "collect --diff with all-phantom selection should exit 0; \
+         stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+    // The recovery message names the cause specifically — it must NOT
+    // surface as a "runner shim may have failed" diagnostic.
+    assert!(
+        combined.contains("every selected test is absent"),
+        "expected all-phantom recovery message, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("runner shim may have failed"),
+        "all-phantom selection should not surface as a shim failure:\n{combined}"
+    );
+    assert!(
+        combined.contains("pruned 2 tests"),
+        "expected 'pruned 2 tests' in --diff output, got:\n{combined}"
+    );
+
+    // DB invariant: both math tests pruned, only test_greet remains.
+    let db_path = dir.join("target/affected/coverage.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let surviving: Vec<String> = conn
+        .prepare("SELECT DISTINCT test_name FROM test_regions")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        surviving,
+        vec!["strings::tests::test_greet".to_string()],
+        "only test_greet should remain, got: {surviving:?}",
+    );
+}
+
 /// `--diff` on a clean working tree (HEAD == prior collect_sha, no
 /// uncommitted edits) should short-circuit with exit 0 and announce that
 /// nothing needs to be recollected — no nextest invocation, no DB writes.

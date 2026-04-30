@@ -240,6 +240,13 @@ pub fn collect(
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
         .arg("run")
+        // `--no-tests=warn` so a filter that matches nothing real (every
+        // selected test absent from the listing — common in `--diff` after
+        // renames/deletions) doesn't make nextest exit non-zero. We
+        // discriminate the legitimate "all phantoms" case from a build
+        // failure in `handle_no_profraw_dirs` using the diff plan's
+        // live-vs-phantom split, not nextest's exit code.
+        .arg("--no-tests=warn")
         .env("RUSTFLAGS", &rustflags)
         .env(&runner_env_name, &runner_env_value)
         .env("CARGO_AFFECTED_PROFRAW_BASE", &profraw_dir)
@@ -248,7 +255,7 @@ pub fn collect(
         .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
     if let Some(plan) = &diff_plan {
-        cmd.arg("-E").arg(&plan.filter_expr);
+        cmd.arg("-E").arg(plan.filter_expr());
     }
     for a in nextest_args {
         cmd.arg(a);
@@ -264,25 +271,13 @@ pub fn collect(
     let test_dirs = list_test_dirs(&profraw_dir)?;
     let total = test_dirs.len();
     if total == 0 {
-        eprintln!(
-            "no per-test profraw directories found under {}\n\
-             (nextest exit code: {nextest_exit})",
-            profraw_dir.display(),
+        return handle_no_profraw_dirs(
+            &mut db,
+            &env_fingerprint,
+            diff_plan.as_ref(),
+            nextest_exit,
+            &profraw_dir,
         );
-        // Prune still has to run in diff mode: the listing's set of tests
-        // (renamed/deleted between collects) is independent of whether
-        // nextest produced any per-test profraw dirs. Without this, a
-        // diff-mode collect that selects only phantom tests (every
-        // selected test absent from the current listing) silently leaves
-        // their stale rows in the DB.
-        if let Some(plan) = &diff_plan {
-            let pruned = db.prune_missing_tests(&env_fingerprint, &plan.listed)?;
-            if pruned > 0 {
-                let s = if pruned == 1 { "" } else { "s" };
-                eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-            }
-        }
-        return Ok(nextest_exit);
     }
 
     let num_workers = std::thread::available_parallelism()
@@ -401,11 +396,32 @@ pub fn collect(
 /// nextest with, and the full listing so a post-run prune can drop tests
 /// that disappeared since the last collect.
 struct DiffPlan {
-    /// Nextest `-E` filter expression matching the affected + new tests.
-    filter_expr: String,
-    /// Every test currently in `nextest list` — used to prune rows for
-    /// tests that were renamed/deleted between collects.
+    /// Tests selected for rerun — affected + new. Includes "phantoms":
+    /// tests in the DB whose stored ranges overlap diff hunks but that no
+    /// longer appear in the current nextest listing (renamed/deleted
+    /// between collects). nextest filters those out at runtime; the
+    /// `total == 0` recovery path uses the live/phantom split to tell
+    /// "filter matched nothing real" apart from "runner shim failed".
+    selected: BTreeSet<TestId>,
+    /// Every test currently in `nextest list`. Drives prune (rows for
+    /// renamed/deleted tests) and the live-vs-phantom check above.
     listed: BTreeSet<TestId>,
+}
+
+impl DiffPlan {
+    /// Nextest `-E` filter expression matching every selected test, including
+    /// phantoms — nextest will silently match nothing for those.
+    fn filter_expr(&self) -> String {
+        let v: Vec<TestId> = self.selected.iter().cloned().collect();
+        nextest_filter_expr(&v)
+    }
+
+    /// Selected tests that nextest can actually run (those present in the
+    /// current listing). Used to distinguish the all-phantoms case from a
+    /// runner-shim failure when extraction yields no profraw dirs.
+    fn live_selected_count(&self) -> usize {
+        self.selected.iter().filter(|t| self.listed.contains(t)).count()
+    }
 }
 
 /// Result of the `collect --diff` preflight. The variant tells `collect`
@@ -465,25 +481,86 @@ fn plan_diff_collect(
         );
     }
 
-    let changed_ranges_by_sha = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
-    let sel = selection::compute(
-        db,
-        env_fingerprint,
-        &reach.reachable,
-        &changed_ranges_by_sha,
-        listing,
-    )?;
+    let sel = selection::select_with_reach(project_root, db, env_fingerprint, listing, &reach)?;
     let selected = sel.selected();
     if selected.is_empty() {
         return Ok(DiffOutcome::NothingToRecollect { listed: sel.listed });
     }
 
     eprintln!("\n{}\n", selection::format_summary(&sel, "to recollect", false));
-    let selected_vec: Vec<TestId> = selected.into_iter().collect();
     Ok(DiffOutcome::Plan(DiffPlan {
-        filter_expr: nextest_filter_expr(&selected_vec),
+        selected,
         listed: sel.listed,
     }))
+}
+
+/// Recovery for the case where nextest run produced no per-test profraw
+/// directories. Discriminates three buckets so the user gets an actionable
+/// message instead of a generic "no profraws" line:
+///
+/// - **Build or test failure** (nextest exited non-zero) — bail and let
+///   nextest's own output explain. We pass `--no-tests=warn` to nextest so
+///   "filter matched nothing" doesn't fall in here.
+/// - **All-phantom selection** (`--diff` mode, every selected test absent
+///   from the current listing) — expected when tests were renamed/deleted
+///   between collects. Prune the stale rows and exit 0.
+/// - **Runner shim didn't fire** (live tests should have run but no
+///   per-test dirs appeared) — bail with a diagnostic pointing at the
+///   shim. This is the case where nextest claims success but our
+///   instrumentation never engaged.
+fn handle_no_profraw_dirs(
+    db: &mut Db,
+    env_fingerprint: &str,
+    diff_plan: Option<&DiffPlan>,
+    nextest_exit: i32,
+    profraw_dir: &Path,
+) -> Result<i32> {
+    if nextest_exit != 0 {
+        bail!(
+            "nextest exited with code {nextest_exit} and produced no per-test \
+             profraw directories under {} — build or test failure (see nextest \
+             output above)",
+            profraw_dir.display(),
+        );
+    }
+
+    if let Some(plan) = diff_plan {
+        let live = plan.live_selected_count();
+        if live > 0 {
+            // nextest exited 0 with live tests in the filter, but no
+            // per-test dirs appeared — those should each have one. The
+            // runner shim must have failed to fire.
+            bail!(
+                "nextest exited 0 but {live} of {} selected tests should have \
+                 been instrumented — no per-test profraw directories appeared \
+                 under {}; the runner shim may have failed to fire",
+                plan.selected.len(),
+                profraw_dir.display(),
+            );
+        }
+        eprintln!(
+            "no tests rerun: every selected test is absent from the current \
+             nextest listing (renamed or deleted between collects)"
+        );
+        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
+        if pruned > 0 {
+            let s = if pruned == 1 { "" } else { "s" };
+            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+        }
+        return Ok(0);
+    }
+
+    // Full collect with no profraws and no diff plan: either the project
+    // has no tests at all (nextest's `--no-tests=warn` lets us distinguish
+    // this from a hard failure) or the shim never fired. We can't tell
+    // apart from here without re-listing, so default to the more likely
+    // explanation in this codepath — empty suite — and surface a hint.
+    eprintln!(
+        "no per-test profraw directories under {} — \
+         project may have no tests, or the runner shim may have failed to fire",
+        profraw_dir.display(),
+    );
+    Ok(0)
 }
 
 /// Outcome of coverage extraction for a single per-test directory.
