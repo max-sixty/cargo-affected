@@ -105,6 +105,79 @@ CI should still run the full suite.
 When in doubt, `cargo affected collect` to refresh coverage, or skip
 cargo-affected and run the full suite.
 
+## Comparison with similar tools
+
+The biggest design choice is *how* a tool decides what changed. The headline
+difference vs. [pytest-testmon] (the closest analogue) is that
+cargo-affected anchors selection on a git SHA: `collect` records the HEAD
+sha alongside the coverage data, and `run` asks git for the diff against
+it. testmon is VCS-agnostic — it stores a per-block checksum and compares
+the current source's checksums against the stored ones on every test run.
+
+|                         | cargo-affected                                                              | [pytest-testmon]                                                  | [`jest --changedSince`]                              | [Bazel] / [Buck]                       |
+| ----------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------- |
+| Test-to-code mapping    | LLVM source-based coverage                                                  | `coverage.py`                                                     | Static module-import graph                           | Declared `BUILD` deps                  |
+| Granularity             | Function-level source line ranges                                           | AST blocks (function / method / class)                            | File                                                 | Target                                 |
+| Change detection        | `git diff -U0 <collect_sha>` (text)                                         | AST-block checksum mismatch                                       | `git`/`hg` diff of changed files                     | Build-graph reachability               |
+| Uses VCS commit data    | Yes — records HEAD sha at `collect`, diffs against it on every `run`        | No — works independently of VCS                                   | Yes — at runtime only, no stored sha                 | No                                     |
+| Persistent state        | SQLite at `target/affected/coverage.db` (per-test line ranges + env fingerprint + collect_sha) | SQLite at `.testmondata` (per-test block checksums)               | None                                                 | Build graph + remote cache             |
+| When state updates      | Explicit `cargo affected collect`                                           | Silently after every test run                                     | n/a                                                  | On every build                         |
+| Whitespace/comment edits | Count as changes (text diff)                                                | Ignored (checksums stable across formatting)                      | Count (file mtime / diff)                            | Ignored (no source diff)               |
+| Env invalidation        | Fingerprint: `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_BUILD_TARGET` | Python version, env vars, installed package versions             | n/a                                                  | Toolchain + declared inputs            |
+| Falls back to full run when | Fingerprint mismatch, missing/unreachable `collect_sha`, no coverage yet | DB schema mismatch                                                | No git repo / no merge base                          | n/a                                    |
+
+The trade-off:
+
+- **Anchoring on a SHA** (cargo-affected) means `collect` is a separate,
+  explicit step and `run` does cheap text diffs — but it depends on the
+  recorded `collect_sha` still being reachable, and any commit since
+  `collect` widens the diff. Whitespace and comment edits look like real
+  changes because we diff text, not AST.
+- **Recomputing checksums every run** (testmon) is VCS-agnostic and
+  ignores cosmetic edits, at the cost of reparsing all source on every
+  invocation and silently mutating the DB on every run.
+- **Static-graph approaches** ([jest], [Bazel], [Buck]) skip dynamic
+  coverage entirely — fast and deterministic, but conservative on
+  reflection, plugin loading, and runtime dispatch, where coverage-based
+  tools see the actual edges.
+
+### Why git instead of content hashes
+
+The obvious alternative — testmon's design — is to hash each item and
+rerun any test whose dependencies' hashes changed. We track line ranges
+instead because of coordinates: stored data is keyed to OLD-side line
+numbers, and after any edit those don't point at the same code in the
+working tree.
+
+Bridging the two coordinate systems takes either:
+
+- A diff in OLD-side coordinates (`git diff -U0 <collect_sha>`,
+  language-agnostic), or
+- An AST parse to re-find each item in current source by stable
+  identity and rehash (`syn` for Rust).
+
+Tests themselves don't need stable identity — nextest gives canonical
+names, and "rerun any test in a file that changed" is a fine
+concession. The coordinate problem is on the *source* side, where
+dropping git means choosing between a parser and a precision drop:
+
+|                                    | Precision | Needs parser | Needs git |
+| ---------------------------------- | --------- | ------------ | --------- |
+| Line ranges + `git diff` (today)   | Function  | No           | Yes       |
+| Per-file content hash              | File      | No           | No        |
+| Per-item content hash via `syn`    | Function  | Yes          | No        |
+
+Git is the cheapest bridge that keeps function-level precision without
+a parser. If the git dependency becomes a real constraint, per-item
+hashes via `syn` are the natural next step — strictly more work, but
+VCS-agnostic and robust to whitespace and comment edits.
+
+[pytest-testmon]: https://testmon.org/
+[`jest --changedSince`]: https://jestjs.io/docs/cli#--changedsince
+[Bazel]: https://bazel.build/
+[Buck]: https://buck2.build/
+[jest]: https://jestjs.io/
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0 at your option.
