@@ -19,19 +19,20 @@ use clap::{Parser, Subcommand};
 
 /// Run only the tests affected by your changes.
 #[derive(Parser)]
-#[command(name = "cargo-affected", bin_name = "cargo-affected")]
+#[command(
+    name = "cargo-affected",
+    bin_name = "cargo affected",
+    version,
+    disable_help_subcommand = true,
+    arg_required_else_help = true,
+)]
 struct Cli {
+    /// Print extra output: pipeline internals during `collect`, every
+    /// selected test name during `run`/`status`. Accepted at any position.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
-    command: CargoSubcommand,
-}
-
-#[derive(Subcommand)]
-enum CargoSubcommand {
-    /// The actual affected subcommand (invoked as `cargo affected <action>`).
-    Affected {
-        #[command(subcommand)]
-        action: Action,
-    },
+    action: Action,
 }
 
 #[derive(Subcommand)]
@@ -44,9 +45,6 @@ enum Action {
         /// if any stored collect_sha is no longer reachable from HEAD.
         #[arg(long)]
         diff: bool,
-        /// Print pipeline internals (tool paths, per-binary sentinels, etc.).
-        #[arg(short, long)]
-        verbose: bool,
         /// Collect against a dirty working tree. Stored line numbers reflect
         /// the working-tree files cargo compiled, but they're filed under
         /// `HEAD`'s sha — later diffs against `HEAD` will be out of phase
@@ -62,19 +60,12 @@ enum Action {
         /// Run all tests, skipping coverage-based selection.
         #[arg(long)]
         all: bool,
-        /// List every selected test name before running. Default prints only a count.
-        #[arg(short, long)]
-        verbose: bool,
         /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
         #[arg(last = true)]
         nextest_args: Vec<String>,
     },
     /// Show stored coverage data and what would run for current changes.
-    Status {
-        /// List every selected test name. Default prints only a count.
-        #[arg(short, long)]
-        verbose: bool,
-    },
+    Status,
     /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
 }
@@ -95,23 +86,27 @@ fn clean() -> Result<()> {
 }
 
 fn main() {
+    let mut argv: Vec<String> = std::env::args().collect();
+
     // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
     // via CARGO_TARGET_<TRIPLE>_RUNNER. Dispatch before clap — its trailing args
     // include `--exact`/`--list`/etc. which clap would interpret if we let it.
     // Unix-only — non-Unix targets fall through to clap and hit the platform
     // check in `run_action`.
     #[cfg(unix)]
-    {
-        let argv: Vec<String> = std::env::args().collect();
-        if argv.get(1).map(String::as_str) == Some("runner-shim") {
-            shim::run(&argv[2..]);
-        }
+    if argv.get(1).map(String::as_str) == Some("runner-shim") {
+        shim::run(&argv[2..]);
     }
 
-    let cli = Cli::parse();
-    let CargoSubcommand::Affected { action } = cli.command;
+    // Cargo invokes us as `cargo-affected affected <args>`; strip the redundant
+    // slot so clap sees a flat command rather than needing a wrapper subcommand.
+    if argv.get(1).map(String::as_str) == Some("affected") {
+        argv.remove(1);
+    }
 
-    let exit_code = match run_action(action) {
+    let cli = Cli::parse_from(argv);
+
+    let exit_code = match run_action(cli.action, cli.verbose) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
@@ -121,7 +116,7 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-fn run_action(action: Action) -> Result<i32> {
+fn run_action(action: Action, verbose: bool) -> Result<i32> {
     // The coverage pipeline relies on the unix-only runner shim (see `shim.rs`).
     // `status` and `clean` don't spawn it, so leave them working everywhere.
     #[cfg(not(unix))]
@@ -133,16 +128,11 @@ fn run_action(action: Action) -> Result<i32> {
     match action {
         Action::Collect {
             diff,
-            verbose,
             allow_dirty,
             nextest_args,
         } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
-        Action::Run {
-            all,
-            verbose,
-            nextest_args,
-        } => run::run(all, verbose, &nextest_args),
-        Action::Status { verbose } => {
+        Action::Run { all, nextest_args } => run::run(all, verbose, &nextest_args),
+        Action::Status => {
             status::status(verbose)?;
             Ok(0)
         }
