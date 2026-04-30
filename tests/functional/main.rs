@@ -75,6 +75,18 @@ pub fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// Concatenate a process output's stderr and stdout (in that order) into a
+/// single `String` for substring assertions. Stderr first matches every
+/// existing call site — selection summaries and notices land on stderr while
+/// nextest's PASS/FAIL lines land on stdout, and tests grep both.
+pub fn combined_output(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    )
+}
+
 /// Capture `git rev-parse HEAD` in `dir` as a 40-char sha.
 pub fn git_head(dir: &Path) -> String {
     let output = Command::new("git")

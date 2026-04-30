@@ -13,7 +13,8 @@
 //! CI signal.
 
 use crate::{
-    cargo_affected, git, git_head, init_git_with_initial_commit, write_two_module_project,
+    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit,
+    write_two_module_project,
 };
 
 #[test]
@@ -34,11 +35,7 @@ fn run_executes_full_suite_when_no_coverage_data() {
         String::from_utf8_lossy(&run.stdout),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&run.stderr),
-        String::from_utf8_lossy(&run.stdout)
-    );
+    let combined = combined_output(&run);
 
     // The "running all tests" notice — phrased as "note: ..." per the
     // existing notice style in run.rs. Match on the "no coverage data yet"
@@ -99,11 +96,7 @@ fn run_executes_full_suite_when_collect_sha_diverged() {
         String::from_utf8_lossy(&run.stdout),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&run.stderr),
-        String::from_utf8_lossy(&run.stdout)
-    );
+    let combined = combined_output(&run);
 
     assert!(
         combined.contains("not reachable from HEAD") && combined.contains("running all tests"),

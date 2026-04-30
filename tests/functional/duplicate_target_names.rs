@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use crate::{git, init_git_with_initial_commit, replace_in_file};
+use crate::{combined_output, git, init_git_with_initial_commit, replace_in_file};
 
 /// Two-member virtual workspace, both with `tests/builds.rs` containing a
 /// single `#[test] fn builds() {}`. Identical bodies on purpose — there's
@@ -133,7 +133,7 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         "run failed: stderr=\n{run_stderr}\nstdout=\n{}",
         String::from_utf8_lossy(&run.stdout)
     );
-    let combined = format!("{run_stderr}{}", String::from_utf8_lossy(&run.stdout));
+    let combined = combined_output(&run);
     // The mock-stub `builds` test must run because its package's lib changed
     // (per-target sentinels include the package's own lib root). The
     // wt-perf `builds` test must NOT — its package is independent.

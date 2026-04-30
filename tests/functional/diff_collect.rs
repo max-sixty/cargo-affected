@@ -9,7 +9,7 @@
 //! collect, and a stored sha no longer reachable from HEAD.
 
 use crate::{
-    cargo_affected, git, git_head, init_git_with_initial_commit, replace_in_file,
+    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit, replace_in_file,
     write_two_module_project,
 };
 
@@ -61,11 +61,7 @@ fn diff_collect_re_anchors_only_affected_tests() {
     );
 
     // The re-collect summary should pick exactly one test (test_add).
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&diff.stderr),
-        String::from_utf8_lossy(&diff.stdout),
-    );
+    let combined = combined_output(&diff);
     assert!(
         combined.contains("1 tests to recollect"),
         "expected '1 tests to recollect' in diff output, got:\n{combined}"
@@ -187,11 +183,7 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
         String::from_utf8_lossy(&diff2.stderr),
         String::from_utf8_lossy(&diff2.stdout),
     );
-    let combined2 = format!(
-        "{}{}",
-        String::from_utf8_lossy(&diff2.stderr),
-        String::from_utf8_lossy(&diff2.stdout),
-    );
+    let combined2 = combined_output(&diff2);
     assert!(
         combined2.contains("1 tests to recollect"),
         "round2 should rerun exactly test_fb, got:\n{combined2}"
@@ -301,11 +293,7 @@ fn run_uses_reachable_shas_when_one_sha_diverges() {
         String::from_utf8_lossy(&run.stderr),
         String::from_utf8_lossy(&run.stdout),
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&run.stderr),
-        String::from_utf8_lossy(&run.stdout),
-    );
+    let combined = combined_output(&run);
 
     // Notice fired about the diverged sha.
     assert!(
@@ -390,11 +378,7 @@ fn run_unions_affected_and_stranded_when_partially_diverged() {
         String::from_utf8_lossy(&run.stderr),
         String::from_utf8_lossy(&run.stdout),
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&run.stderr),
-        String::from_utf8_lossy(&run.stdout),
-    );
+    let combined = combined_output(&run);
 
     assert!(
         combined.contains("2 tests to run"),
@@ -493,11 +477,7 @@ fn diff_collect_prunes_deleted_tests() {
         String::from_utf8_lossy(&diff.stdout),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&diff.stderr),
-        String::from_utf8_lossy(&diff.stdout),
-    );
+    let combined = combined_output(&diff);
     assert!(
         combined.contains("pruned 1 test"),
         "expected 'pruned 1 test' in --diff output, got:\n{combined}"
@@ -576,11 +556,7 @@ fn diff_collect_all_phantom_selection_prunes_cleanly() {
         String::from_utf8_lossy(&diff.stdout),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&diff.stderr),
-        String::from_utf8_lossy(&diff.stdout),
-    );
+    let combined = combined_output(&diff);
     // The recovery message names the cause specifically — it must NOT
     // surface as a "runner shim may have failed" diagnostic.
     assert!(
@@ -648,11 +624,7 @@ fn diff_collect_clean_tree_exits_zero() {
         String::from_utf8_lossy(&diff.stdout),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&diff.stderr),
-        String::from_utf8_lossy(&diff.stdout),
-    );
+    let combined = combined_output(&diff);
     assert!(
         combined.contains("nothing to recollect"),
         "expected 'nothing to recollect' in --diff output, got:\n{combined}"

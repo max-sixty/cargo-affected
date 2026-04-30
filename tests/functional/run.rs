@@ -6,7 +6,8 @@
 //! chosen AND that they actually ran successfully.
 
 use crate::{
-    cargo_affected, init_git_with_initial_commit, replace_in_file, write_two_module_project,
+    cargo_affected, combined_output, init_git_with_initial_commit, replace_in_file,
+    write_two_module_project,
 };
 
 #[test]
@@ -38,11 +39,7 @@ fn run_executes_only_affected_tests() {
     // run.rs's `eprintln!`); nextest's own progress output also goes to
     // stderr. Concatenate both streams so assertions don't get tripped up by
     // wherever a particular line landed.
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&run.stderr),
-        String::from_utf8_lossy(&run.stdout)
-    );
+    let combined = combined_output(&run);
 
     // Selection summary line — verifies the run command picked exactly one
     // test (test_add) before handing off to nextest.
