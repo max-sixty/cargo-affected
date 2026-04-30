@@ -602,6 +602,11 @@ pub(crate) struct Listing {
 /// invariant across rebuilds, unlike `binary_path` (whose hash suffix can
 /// change) and unlike the basename (which collides across workspace members
 /// that happen to use the same target name).
+///
+/// `marker` is the project-root-relative source path the binary will embed
+/// in panic strings/symbol names. The shim uses it to disambiguate binaries
+/// whose basenames collide (e.g. two `tests/builds.rs` across workspace
+/// members) when cargo's hash drifts the path lookup miss.
 #[derive(Debug, Clone)]
 pub(crate) struct BinaryEntry {
     pub(crate) binary_id: String,
@@ -609,6 +614,7 @@ pub(crate) struct BinaryEntry {
     pub(crate) package: String,
     pub(crate) target: String,
     pub(crate) kind: String,
+    pub(crate) marker: Option<String>,
 }
 
 impl BinaryEntry {
@@ -616,6 +622,42 @@ impl BinaryEntry {
     pub(crate) fn key(&self) -> (String, String, String) {
         (self.package.clone(), self.target.clone(), self.kind.clone())
     }
+}
+
+/// On-disk entry the shim consumes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BinaryMapEntry {
+    pub binary_id: String,
+    /// Project-root-relative source path that the binary embeds (panic
+    /// messages, symbol names) — survives `-C debuginfo=0`. None for lib/bin
+    /// where the basename match is enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+}
+
+/// Compute a marker the binary embeds: the project-root-relative path of its
+/// source file. Used by the shim to disambiguate same-basename binaries when
+/// cargo's hash-suffix drifts the path lookup miss.
+///
+/// Only emitted for test/bench/example targets where the convention is
+/// stable. Lib/bin targets get None — they typically have unique basenames.
+fn marker_for(suite: &serde_json::Value, project_root: &Path) -> Option<String> {
+    let kind = suite.get("kind").and_then(|v| v.as_str())?;
+    let cwd = suite.get("cwd").and_then(|v| v.as_str())?;
+    let binary_name = suite.get("binary-name").and_then(|v| v.as_str())?;
+    let dir = match kind {
+        "test" => "tests",
+        "bench" => "benches",
+        "example" => "examples",
+        _ => return None,
+    };
+    let rel = Path::new(cwd).strip_prefix(project_root).ok()?;
+    let rel_str = rel.to_str()?;
+    Some(if rel_str.is_empty() {
+        format!("{dir}/{binary_name}.rs")
+    } else {
+        format!("{rel_str}/{dir}/{binary_name}.rs")
+    })
 }
 
 /// Enumerate all tests via `cargo nextest list --message-format json`.
@@ -689,12 +731,14 @@ pub(crate) fn nextest_list(
                 .and_then(|v| v.as_str())
                 .context("nextest list entry missing kind")?
                 .to_string();
+            let marker = marker_for(suite, project_root);
             binaries.push(BinaryEntry {
                 binary_id: binary_id.clone(),
                 binary_path,
                 package,
                 target,
                 kind,
+                marker,
             });
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
@@ -722,7 +766,7 @@ pub(crate) fn nextest_list(
 pub(crate) fn build_runtime_binary_map(
     fresh: &[BinaryEntry],
     stable_by_target: &HashMap<(String, String, String), String>,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, BinaryMapEntry>> {
     let mut out = HashMap::with_capacity(fresh.len());
     for entry in fresh {
         let key = entry.key();
@@ -744,13 +788,19 @@ pub(crate) fn build_runtime_binary_map(
                 entry.binary_id,
             );
         }
-        out.insert(entry.binary_path.clone(), entry.binary_id.clone());
+        out.insert(
+            entry.binary_path.clone(),
+            BinaryMapEntry {
+                binary_id: entry.binary_id.clone(),
+                marker: entry.marker.clone(),
+            },
+        );
     }
     Ok(out)
 }
 
-/// Write the `binary_path → binary_id` map as JSON for the runner shim.
-fn write_binary_map(path: &Path, map: &HashMap<String, String>) -> Result<()> {
+/// Write the `binary_path → BinaryMapEntry` map as JSON for the runner shim.
+fn write_binary_map(path: &Path, map: &HashMap<String, BinaryMapEntry>) -> Result<()> {
     let json = serde_json::to_string(map).context("serializing binary map")?;
     std::fs::write(path, json)
         .with_context(|| format!("writing binary map to {}", path.display()))?;
@@ -914,6 +964,7 @@ mod tests {
             package: package.into(),
             target: target.into(),
             kind: kind.into(),
+            marker: None,
         }
     }
 
@@ -955,11 +1006,11 @@ mod tests {
 
         let map = build_runtime_binary_map(&fresh, &stable)?;
         assert_eq!(
-            map.get("/t/target/debug/deps/builds-NEW1").map(String::as_str),
+            map.get("/t/target/debug/deps/builds-NEW1").map(|e| e.binary_id.as_str()),
             Some("mock-stub::builds")
         );
         assert_eq!(
-            map.get("/t/target/debug/deps/builds-NEW2").map(String::as_str),
+            map.get("/t/target/debug/deps/builds-NEW2").map(|e| e.binary_id.as_str()),
             Some("wt-perf::builds")
         );
         Ok(())
