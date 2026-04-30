@@ -118,9 +118,19 @@ pub fn sanitize(name: &str) -> String {
 }
 
 /// Look up the binary's nextest `binary_id` in the map written by
-/// `collect`. Tries the path as-is and canonicalized, since cargo may pass a
-/// relative or symlinked path but the map was built from nextest's
-/// (canonicalized, absolute) listing.
+/// `collect`.
+///
+/// Tries in order:
+/// 1. Path as-is.
+/// 2. Canonicalized path (cargo may pass a relative or symlinked path but
+///    the map was built from nextest's canonicalized, absolute listing).
+/// 3. Target-name fallback. If `cargo nextest run` rebuilds the test
+///    binaries between the `list` and `run` steps (e.g. a `build.rs`
+///    that's sensitive to env vars `list` doesn't set but `run` does),
+///    the new binaries have different `-<hash>` suffixes than the ones
+///    in the map. We strip the hash suffix from both sides and look up
+///    by target name. If exactly one map entry matches, use it; if
+///    multiple match, fail with a clear error rather than guessing.
 fn resolve_binary_id(map_path: &Path, binary_path: &Path) -> anyhow::Result<String> {
     let json = std::fs::read_to_string(map_path).map_err(|e| {
         anyhow::anyhow!("reading binary map at {}: {e}", map_path.display())
@@ -137,10 +147,62 @@ fn resolve_binary_id(map_path: &Path, binary_path: &Path) -> anyhow::Result<Stri
             return Ok(id.clone());
         }
     }
+
+    // Target-name fallback: match by basename modulo the cargo hash suffix.
+    let needle = binary_path.file_name().and_then(|s| s.to_str()).map(target_name);
+    if let Some(needle) = needle {
+        let candidates: Vec<&String> = map
+            .iter()
+            .filter(|(p, _)| {
+                Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(target_name)
+                    == Some(needle)
+            })
+            .map(|(_, id)| id)
+            .collect();
+        match candidates.len() {
+            1 => {
+                eprintln!(
+                    "cargo-affected runner-shim: warning — exact path missed, \
+                     resolved {} via target-name fallback (binaries appear to \
+                     have rebuilt since collect's `nextest list` step)",
+                    binary_path.display(),
+                );
+                return Ok(candidates[0].clone());
+            }
+            n if n > 1 => {
+                return Err(anyhow::anyhow!(
+                    "binary not found in map (path: {}); target-name fallback \
+                     ambiguous — {n} entries share basename {:?}",
+                    binary_path.display(),
+                    needle
+                ));
+            }
+            _ => {}
+        }
+    }
+
     Err(anyhow::anyhow!(
         "binary not found in map (path: {})",
         binary_path.display()
     ))
+}
+
+/// Strip cargo's `-<16 hex chars>` hash suffix from a binary basename, leaving
+/// the stable target name. Returns the input unchanged if the suffix isn't
+/// present (e.g., a binary from outside cargo, or a future cargo with a
+/// different hash format).
+fn target_name(basename: &str) -> &str {
+    let bytes = basename.as_bytes();
+    if bytes.len() >= 17 && bytes[bytes.len() - 17] == b'-' {
+        let hash = &basename[basename.len() - 16..];
+        if hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return &basename[..basename.len() - 17];
+        }
+    }
+    basename
 }
 
 #[cfg(test)]
@@ -212,6 +274,75 @@ mod tests {
 
         let err = resolve_binary_id(&map_path, Path::new("/nowhere/foo")).unwrap_err();
         assert!(err.to_string().contains("not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn target_name_strips_hash() {
+        assert_eq!(target_name("worktrunk-e19bc0c52c763540"), "worktrunk");
+        assert_eq!(target_name("mock-stub-abcdef0123456789"), "mock-stub");
+        assert_eq!(target_name("foo-0123456789abcdef"), "foo");
+    }
+
+    #[test]
+    fn target_name_passthrough_when_no_hash() {
+        assert_eq!(target_name("worktrunk"), "worktrunk");
+        assert_eq!(target_name("plain"), "plain");
+        // Hash too short.
+        assert_eq!(target_name("foo-abc"), "foo-abc");
+        // Suffix present but not 16 hex chars (uppercase isn't hex-lowercase).
+        assert_eq!(target_name("foo-ABCDEF0123456789"), "foo-ABCDEF0123456789");
+        // Suffix present but contains non-hex.
+        assert_eq!(target_name("foo-zzzzzzzzzzzzzzzz"), "foo-zzzzzzzzzzzzzzzz");
+    }
+
+    #[test]
+    fn resolve_binary_id_target_name_fallback() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let map_path = dir.path().join("map.json");
+        let mut map = HashMap::new();
+        // Map was built when binary had hash `aaaa...`.
+        map.insert(
+            "/tmp/target/debug/deps/worktrunk-aaaaaaaaaaaaaaaa".to_string(),
+            "worktrunk".to_string(),
+        );
+        std::fs::write(&map_path, serde_json::to_string(&map)?)?;
+
+        // Run-step rebuild gave the same target a different hash.
+        let id = resolve_binary_id(
+            &map_path,
+            Path::new("/tmp/target/debug/deps/worktrunk-bbbbbbbbbbbbbbbb"),
+        )?;
+        assert_eq!(id, "worktrunk");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_binary_id_target_name_fallback_ambiguous() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let map_path = dir.path().join("map.json");
+        let mut map = HashMap::new();
+        // Two crates each have a `tests/integration.rs` → both produce
+        // a `integration-<hash>` binary with the same basename.
+        map.insert(
+            "/tmp/target/debug/deps/integration-aaaaaaaaaaaaaaaa".to_string(),
+            "crate_a::integration".to_string(),
+        );
+        map.insert(
+            "/tmp/target/debug/deps/integration-bbbbbbbbbbbbbbbb".to_string(),
+            "crate_b::integration".to_string(),
+        );
+        std::fs::write(&map_path, serde_json::to_string(&map)?)?;
+
+        let err = resolve_binary_id(
+            &map_path,
+            Path::new("/tmp/target/debug/deps/integration-cccccccccccccccc"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "expected ambiguous error, got: {err}"
+        );
         Ok(())
     }
 }
