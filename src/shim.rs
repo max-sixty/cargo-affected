@@ -128,9 +128,14 @@ pub fn sanitize(name: &str) -> String {
 ///    binaries between the `list` and `run` steps (e.g. a `build.rs`
 ///    that's sensitive to env vars `list` doesn't set but `run` does),
 ///    the new binaries have different `-<hash>` suffixes than the ones
-///    in the map. We strip the hash suffix from both sides and look up
-///    by target name. If exactly one map entry matches, use it; if
-///    multiple match, fail with a clear error rather than guessing.
+///    in the map. Strip the hash suffix and match by target name. If
+///    multiple map entries share a basename (e.g. several
+///    `tests/integration.rs` across workspace crates), narrow further
+///    by filesystem state — after a partial rebuild, the un-rebuilt
+///    candidates still have their original on-disk paths, while the
+///    rebuilt binary's old path was replaced. The unique
+///    no-longer-on-disk candidate is the right match. Fail with a
+///    clear error only when even that doesn't disambiguate.
 fn resolve_binary_id(map_path: &Path, binary_path: &Path) -> anyhow::Result<String> {
     let json = std::fs::read_to_string(map_path).map_err(|e| {
         anyhow::anyhow!("reading binary map at {}: {e}", map_path.display())
@@ -151,7 +156,7 @@ fn resolve_binary_id(map_path: &Path, binary_path: &Path) -> anyhow::Result<Stri
     // Target-name fallback: match by basename modulo the cargo hash suffix.
     let needle = binary_path.file_name().and_then(|s| s.to_str()).map(target_name);
     if let Some(needle) = needle {
-        let candidates: Vec<&String> = map
+        let candidates: Vec<(&str, &String)> = map
             .iter()
             .filter(|(p, _)| {
                 Path::new(p)
@@ -160,27 +165,48 @@ fn resolve_binary_id(map_path: &Path, binary_path: &Path) -> anyhow::Result<Stri
                     .map(target_name)
                     == Some(needle)
             })
-            .map(|(_, id)| id)
+            .map(|(p, id)| (p.as_str(), id))
             .collect();
-        match candidates.len() {
-            1 => {
-                eprintln!(
-                    "cargo-affected runner-shim: warning — exact path missed, \
-                     resolved {} via target-name fallback (binaries appear to \
-                     have rebuilt since collect's `nextest list` step)",
-                    binary_path.display(),
-                );
-                return Ok(candidates[0].clone());
+
+        let resolved: Option<&String> = match candidates.len() {
+            0 => None,
+            1 => Some(candidates[0].1),
+            _ => {
+                // Disambiguate via filesystem state: the rebuilt binary's old
+                // map path no longer exists. If exactly one candidate's old
+                // path is gone, that's the match.
+                let rebuilt: Vec<&String> = candidates
+                    .iter()
+                    .filter(|(p, _)| !Path::new(p).exists())
+                    .map(|(_, id)| *id)
+                    .collect();
+                if rebuilt.len() == 1 {
+                    Some(rebuilt[0])
+                } else {
+                    None
+                }
             }
-            n if n > 1 => {
-                return Err(anyhow::anyhow!(
-                    "binary not found in map (path: {}); target-name fallback \
-                     ambiguous — {n} entries share basename {:?}",
-                    binary_path.display(),
-                    needle
-                ));
-            }
-            _ => {}
+        };
+
+        if let Some(id) = resolved {
+            eprintln!(
+                "cargo-affected runner-shim: warning — exact path missed, \
+                 resolved {} via target-name fallback (binaries appear to \
+                 have rebuilt since collect's `nextest list` step)",
+                binary_path.display(),
+            );
+            return Ok(id.clone());
+        }
+
+        if !candidates.is_empty() {
+            return Err(anyhow::anyhow!(
+                "binary not found in map (path: {}); target-name fallback \
+                 ambiguous — {} entries share basename {:?} and filesystem \
+                 state can't disambiguate",
+                binary_path.display(),
+                candidates.len(),
+                needle
+            ));
         }
     }
 
@@ -318,25 +344,70 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_id_target_name_fallback_ambiguous() -> anyhow::Result<()> {
+    fn resolve_binary_id_disambiguates_partial_rebuild() -> anyhow::Result<()> {
+        // Two crates each have a `tests/builds.rs` → both produce a
+        // `builds-<hash>` binary with the same basename. After a partial
+        // rebuild only one of them gets a new hash; the un-rebuilt one's
+        // original path is still on disk. Filesystem state should
+        // disambiguate.
+        let dir = tempfile::tempdir()?;
+        let unrebuilt = dir.path().join("builds-aaaaaaaaaaaaaaaa");
+        let map_path = dir.path().join("map.json");
+
+        std::fs::write(&unrebuilt, b"")?;
+        // No file at builds-bbbb…: that binary was rebuilt and its old hash
+        // path is gone.
+        let mut map = HashMap::new();
+        map.insert(
+            unrebuilt.to_str().unwrap().to_string(),
+            "crate_a::builds".to_string(),
+        );
+        map.insert(
+            dir.path()
+                .join("builds-bbbbbbbbbbbbbbbb")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            "crate_b::builds".to_string(),
+        );
+        std::fs::write(&map_path, serde_json::to_string(&map)?)?;
+
+        let id = resolve_binary_id(
+            &map_path,
+            // The new (rebuilt) hash for crate_b's binary.
+            &dir.path().join("builds-cccccccccccccccc"),
+        )?;
+        assert_eq!(id, "crate_b::builds");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_binary_id_target_name_fallback_truly_ambiguous() -> anyhow::Result<()> {
+        // Both candidates rebuilt — filesystem state can't disambiguate.
         let dir = tempfile::tempdir()?;
         let map_path = dir.path().join("map.json");
         let mut map = HashMap::new();
-        // Two crates each have a `tests/integration.rs` → both produce
-        // a `integration-<hash>` binary with the same basename.
         map.insert(
-            "/tmp/target/debug/deps/integration-aaaaaaaaaaaaaaaa".to_string(),
-            "crate_a::integration".to_string(),
+            dir.path()
+                .join("builds-aaaaaaaaaaaaaaaa")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            "crate_a::builds".to_string(),
         );
         map.insert(
-            "/tmp/target/debug/deps/integration-bbbbbbbbbbbbbbbb".to_string(),
-            "crate_b::integration".to_string(),
+            dir.path()
+                .join("builds-bbbbbbbbbbbbbbbb")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            "crate_b::builds".to_string(),
         );
         std::fs::write(&map_path, serde_json::to_string(&map)?)?;
 
         let err = resolve_binary_id(
             &map_path,
-            Path::new("/tmp/target/debug/deps/integration-cccccccccccccccc"),
+            &dir.path().join("builds-cccccccccccccccc"),
         )
         .unwrap_err();
         assert!(
