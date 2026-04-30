@@ -89,8 +89,11 @@ pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Res
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
     if verbose {
-        eprintln!("llvm-profdata: {}", llvm_profdata.display());
-        eprintln!("llvm-cov: {}", llvm_cov.display());
+        eprintln!(
+            "llvm-profdata: {}\nllvm-cov: {}",
+            llvm_profdata.display(),
+            llvm_cov.display()
+        );
     }
 
     // Anchor for future `run`/`status` diffs. Captured up front so a missing
@@ -211,8 +214,11 @@ pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Res
     let test_dirs = list_test_dirs(&profraw_dir)?;
     let total = test_dirs.len();
     if total == 0 {
-        eprintln!("no per-test profraw directories found under {}", profraw_dir.display());
-        eprintln!("(nextest exit code: {nextest_exit})");
+        eprintln!(
+            "no per-test profraw directories found under {}\n\
+             (nextest exit code: {nextest_exit})",
+            profraw_dir.display(),
+        );
         return Ok(nextest_exit);
     }
 
