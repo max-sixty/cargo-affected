@@ -15,18 +15,24 @@
 //!    rows `(line_start=1, line_end=i64::MAX)` so any hunk in one of those
 //!    files overlaps and re-selects the test.
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
-//!    (id + path) and every testcase. We write a binary_path → binary_id map
-//!    to disk and hand it to the shim via `CARGO_AFFECTED_BINARY_MAP` — the
-//!    shim needs binary_id to disambiguate same-named tests across binaries.
-//! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
+//!    (id + path) and every testcase. We capture the stable
+//!    `(package, target, kind) → binary_id` map alongside the raw
+//!    `binary_path → binary_id` map; the stable triple is invariant across
+//!    rebuilds and is what disambiguates same-basename binaries (e.g. two
+//!    `tests/builds.rs` across workspace members).
+//! 3. Immediately before `cargo nextest run`, re-list to capture cargo's
+//!    current artifact paths, join against the stable map, and write a fresh
+//!    `binary_path → binary_id` JSON for the shim. This minimizes the window
+//!    where cargo's hash output could drift out from under the shim.
+//! 4. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
 //!    runner env set. The preceding `list` step built the binaries, so `run`
 //!    is a cache hit. nextest handles parallelism and progress.
-//! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
+//! 5. Capture HEAD sha (anchor for future diffs) before extraction so any
 //!    git error surfaces before we spend time on coverage parsing.
-//! 5. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
+//! 6. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
 //!    merge with `llvm-profdata`, export with `llvm-cov`, parse hit ranges.
 //!    Parallelized across workers.
-//! 6. Store mappings + collect_sha in the DB keyed by (binary_id, test_name).
+//! 7. Store mappings + collect_sha in the DB keyed by (binary_id, test_name).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -116,23 +122,40 @@ pub fn collect(nextest_args: &[String]) -> Result<i32> {
     }
     rustflags.push_str("-C instrument-coverage");
 
-    // List first. Gives us the binary_path → binary_id map for the shim.
-    // The list step builds with the same RUSTFLAGS; the subsequent run is a
-    // cache hit. Fingerprint is taken now so Cargo.lock is in its final
-    // state — status/run will compare against that same state.
+    // List first. Gives us the stable (package, target, kind) → binary_id map
+    // we'll use to disambiguate same-basename binaries (e.g. two crates with
+    // their own `tests/builds.rs`). The list step builds with the same
+    // RUSTFLAGS; the subsequent run is a cache hit. Fingerprint is taken now
+    // so Cargo.lock is in its final state — status/run will compare against
+    // that same state.
     eprintln!("listing tests with cargo nextest list...");
     let listing = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
     eprintln!(
         "found {} tests across {} binaries",
         listing.tests.len(),
-        listing.binary_map.len()
+        listing.binaries.len()
     );
     let env_fingerprint = fingerprint::compute(&project)?;
 
+    let stable_by_target: HashMap<(String, String, String), String> = listing
+        .binaries
+        .iter()
+        .map(|b| (b.key(), b.binary_id.clone()))
+        .collect();
     let binary_map_path = profraw_dir.join("binary_map.json");
-    write_binary_map(&binary_map_path, &listing.binary_map)?;
 
     // Stray profraw files left in project root by the list-step build.
+    clean_profraw_files(project_root)?;
+
+    // Right before nextest run: re-list to capture cargo's current artifact
+    // paths and join against the stable map, so the shim's path lookup
+    // reflects whatever the run step is about to invoke. Cheap (cache hit
+    // when nothing changed) and structurally robust against rebuilds that
+    // would otherwise reshuffle hashes between list and run.
+    eprintln!("refreshing binary paths before nextest run...");
+    let pre_run = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
+    let runtime_map = build_runtime_binary_map(&pre_run.binaries, &stable_by_target)?;
+    write_binary_map(&binary_map_path, &runtime_map)?;
     clean_profraw_files(project_root)?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
@@ -400,28 +423,33 @@ pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
 }
 
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
-/// pair, plus a binary_path → entry map for the runner shim.
+/// pair, plus per-binary metadata.
 pub(crate) struct Listing {
     pub(crate) tests: Vec<TestId>,
-    pub(crate) binary_map: HashMap<String, BinaryMapEntry>,
+    pub(crate) binaries: Vec<BinaryEntry>,
 }
 
-/// Per-binary metadata the runner shim needs at test time.
+/// One binary in nextest's listing.
 ///
-/// `binary_id` is what we ultimately want to look up. `marker` is a
-/// best-effort source-path string that's uniquely embedded in this
-/// particular binary's debug info (e.g. `mock-stub/tests/builds.rs`
-/// for an integration test). The shim uses it to disambiguate when
-/// two binaries share a basename and a partial rebuild made the
-/// path-based map miss — e.g., a workspace with several `tests/<name>.rs`
-/// files of the same name across packages.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub(crate) struct BinaryMapEntry {
+/// `(package, target, kind)` is the cargo-stable identifier — the same triple
+/// produced by `cargo metadata` and emitted in `nextest list`'s JSON. It's
+/// invariant across rebuilds, unlike `binary_path` (whose hash suffix can
+/// change) and unlike the basename (which collides across workspace members
+/// that happen to use the same target name).
+#[derive(Debug, Clone)]
+pub(crate) struct BinaryEntry {
     pub(crate) binary_id: String,
-    /// Optional. Empty for kinds we can't construct a unique source marker
-    /// for (lib, bin) — those embed paths shared with their dependents.
-    #[serde(default)]
-    pub(crate) marker: Option<String>,
+    pub(crate) binary_path: String,
+    pub(crate) package: String,
+    pub(crate) target: String,
+    pub(crate) kind: String,
+}
+
+impl BinaryEntry {
+    /// The stable join key — invariant across rebuilds.
+    pub(crate) fn key(&self) -> (String, String, String) {
+        (self.package.clone(), self.target.clone(), self.kind.clone())
+    }
 }
 
 /// Enumerate all tests via `cargo nextest list --message-format json`.
@@ -464,7 +492,7 @@ pub(crate) fn nextest_list(
         serde_json::from_str(stdout).context("failed to parse nextest list JSON")?;
 
     let mut tests = BTreeSet::new();
-    let mut binary_map = HashMap::new();
+    let mut binaries = Vec::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
             let binary_id = suite
@@ -472,16 +500,36 @@ pub(crate) fn nextest_list(
                 .and_then(|v| v.as_str())
                 .context("nextest list entry missing binary-id")?
                 .to_string();
-            if let Some(binary_path) = suite.get("binary-path").and_then(|v| v.as_str()) {
-                let marker = source_marker(suite);
-                binary_map.insert(
-                    binary_path.to_string(),
-                    BinaryMapEntry {
-                        binary_id: binary_id.clone(),
-                        marker,
-                    },
-                );
-            }
+            let binary_path = suite
+                .get("binary-path")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing binary-path")?
+                .to_string();
+            let package = suite
+                .get("package-name")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing package-name")?
+                .to_string();
+            // nextest emits the cargo target name as `binary-name` (lib/bin/test
+            // target name, not the file basename — the basename includes cargo's
+            // hash suffix).
+            let target = suite
+                .get("binary-name")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing binary-name")?
+                .to_string();
+            let kind = suite
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing kind")?
+                .to_string();
+            binaries.push(BinaryEntry {
+                binary_id: binary_id.clone(),
+                binary_path,
+                package,
+                target,
+                kind,
+            });
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
             };
@@ -492,35 +540,51 @@ pub(crate) fn nextest_list(
     }
     Ok(Listing {
         tests: tests.into_iter().collect(),
-        binary_map,
+        binaries,
     })
 }
 
-/// Build a uniquely-identifying source-path string for a binary, suitable for
-/// substring matching against the binary's embedded debug info.
+/// Build the `binary_path → binary_id` map the runner shim consumes.
 ///
-/// Returns `Some` for `kind` values whose source layout is unambiguous
-/// (`test`/`bench`/`example` — single source file under `<package>/<dir>/`),
-/// and `None` for kinds where a per-binary marker isn't structurally unique
-/// (`lib` and `bin` source paths are also referenced by dependents' debug
-/// info, so they can't disambiguate). When `None`, the shim's binary-content
-/// fallback won't help; users hitting that path with two same-basename
-/// libs/bins should rename one.
-fn source_marker(suite: &serde_json::Value) -> Option<String> {
-    let kind = suite.get("kind").and_then(|v| v.as_str())?;
-    let package = suite.get("package-name").and_then(|v| v.as_str())?;
-    let target = suite.get("target-name").and_then(|v| v.as_str())?;
-    let dir = match kind {
-        "test" => "tests",
-        "bench" => "benches",
-        "example" => "examples",
-        _ => return None,
-    };
-    Some(format!("{package}/{dir}/{target}.rs"))
+/// Joins the freshly-listed binaries (which carry cargo's CURRENT artifact
+/// paths) against the stable `(package, target, kind) → binary_id` map
+/// captured earlier. The triple is cargo-stable across rebuilds, so any
+/// hash-suffix drift in cargo's output flows through transparently — fresh
+/// path on the left, stable id on the right. A drifted binary_id would mean
+/// nextest itself disagrees about the binary's identity between two list
+/// invocations, which we treat as a hard error.
+pub(crate) fn build_runtime_binary_map(
+    fresh: &[BinaryEntry],
+    stable_by_target: &HashMap<(String, String, String), String>,
+) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::with_capacity(fresh.len());
+    for entry in fresh {
+        let key = entry.key();
+        let stable_id = stable_by_target.get(&key).with_context(|| {
+            format!(
+                "binary {:?} (package={}, target={}, kind={}) appeared in pre-run \
+                 listing but not in the initial listing",
+                entry.binary_path, entry.package, entry.target, entry.kind,
+            )
+        })?;
+        if stable_id != &entry.binary_id {
+            bail!(
+                "nextest reported inconsistent binary_ids for (package={}, \
+                 target={}, kind={}): {:?} vs {:?}",
+                entry.package,
+                entry.target,
+                entry.kind,
+                stable_id,
+                entry.binary_id,
+            );
+        }
+        out.insert(entry.binary_path.clone(), entry.binary_id.clone());
+    }
+    Ok(out)
 }
 
-/// Write the binary_path → entry map as JSON for the runner shim.
-fn write_binary_map(path: &Path, map: &HashMap<String, BinaryMapEntry>) -> Result<()> {
+/// Write the `binary_path → binary_id` map as JSON for the runner shim.
+fn write_binary_map(path: &Path, map: &HashMap<String, String>) -> Result<()> {
     let json = serde_json::to_string(map).context("serializing binary map")?;
     std::fs::write(path, json)
         .with_context(|| format!("writing binary map to {}", path.display()))?;
@@ -668,6 +732,113 @@ mod tests {
             "(binary_id(=mock-stub::builds) & (test(=builds))) | \
              (binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y))) | \
              (binary_id(=wt-perf::builds) & (test(=builds)))"
+        );
+    }
+
+    fn entry(
+        binary_id: &str,
+        binary_path: &str,
+        package: &str,
+        target: &str,
+        kind: &str,
+    ) -> BinaryEntry {
+        BinaryEntry {
+            binary_id: binary_id.into(),
+            binary_path: binary_path.into(),
+            package: package.into(),
+            target: target.into(),
+            kind: kind.into(),
+        }
+    }
+
+    #[test]
+    fn build_runtime_binary_map_joins_by_stable_triple() -> Result<()> {
+        // Two crates ship `tests/builds.rs`. The basename collides; the
+        // (package, target, kind) triple does not. After a rebuild, paths
+        // shift but the triples stay put — the join must still resolve to
+        // the original binary_ids.
+        let stable: HashMap<(String, String, String), String> = [
+            (
+                ("mock-stub".into(), "builds".into(), "test".into()),
+                "mock-stub::builds".into(),
+            ),
+            (
+                ("wt-perf".into(), "builds".into(), "test".into()),
+                "wt-perf::builds".into(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let fresh = vec![
+            entry(
+                "mock-stub::builds",
+                "/t/target/debug/deps/builds-NEW1",
+                "mock-stub",
+                "builds",
+                "test",
+            ),
+            entry(
+                "wt-perf::builds",
+                "/t/target/debug/deps/builds-NEW2",
+                "wt-perf",
+                "builds",
+                "test",
+            ),
+        ];
+
+        let map = build_runtime_binary_map(&fresh, &stable)?;
+        assert_eq!(
+            map.get("/t/target/debug/deps/builds-NEW1").map(String::as_str),
+            Some("mock-stub::builds")
+        );
+        assert_eq!(
+            map.get("/t/target/debug/deps/builds-NEW2").map(String::as_str),
+            Some("wt-perf::builds")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_runtime_binary_map_errors_on_inconsistent_id() {
+        // A new binary appears in the pre-run listing whose triple is known
+        // but whose binary_id disagrees with the initial listing — that's a
+        // nextest-side inconsistency we'd rather surface than paper over.
+        let stable: HashMap<(String, String, String), String> =
+            [(("foo".into(), "builds".into(), "test".into()), "foo::builds".into())]
+                .into_iter()
+                .collect();
+        let fresh = vec![entry(
+            "foo::different",
+            "/t/target/debug/deps/builds-X",
+            "foo",
+            "builds",
+            "test",
+        )];
+        let err = build_runtime_binary_map(&fresh, &stable).unwrap_err();
+        assert!(
+            err.to_string().contains("inconsistent binary_ids"),
+            "expected mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_runtime_binary_map_errors_on_unknown_triple() {
+        // A binary in the pre-run listing whose triple wasn't in the initial
+        // listing — likely a workspace-membership change between calls. Hard
+        // error rather than silently dropping it from the shim's map.
+        let stable: HashMap<(String, String, String), String> = HashMap::new();
+        let fresh = vec![entry(
+            "foo::builds",
+            "/t/target/debug/deps/builds-X",
+            "foo",
+            "builds",
+            "test",
+        )];
+        let err = build_runtime_binary_map(&fresh, &stable).unwrap_err();
+        assert!(
+            err.to_string().contains("not in the initial listing"),
+            "expected missing-triple error, got: {err}"
         );
     }
 }
