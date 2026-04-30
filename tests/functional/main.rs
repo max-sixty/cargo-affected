@@ -24,6 +24,7 @@
 mod cache_miss;
 mod clean;
 mod drift;
+mod duplicate_target_names;
 mod fingerprint;
 mod narrowing;
 mod new_test;
