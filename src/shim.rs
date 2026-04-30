@@ -28,6 +28,17 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Per-binary metadata serialized by `collect`.
+///
+/// Mirrors `collect::BinaryMapEntry`. Defined here as a private copy so the
+/// shim doesn't pull collect's deps; serde handles the schema match.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MapEntry {
+    binary_id: String,
+    #[serde(default)]
+    marker: Option<String>,
+}
+
 /// Entry point. `args` is everything after `runner-shim` on argv:
 /// `[<test-binary>, <test-args…>]`.
 ///
@@ -117,103 +128,148 @@ pub fn sanitize(name: &str) -> String {
     out
 }
 
-/// Look up the binary's nextest `binary_id` in the map written by
-/// `collect`.
+/// Look up the binary's nextest `binary_id` in the map written by `collect`.
 ///
 /// Tries in order:
 /// 1. Path as-is.
 /// 2. Canonicalized path (cargo may pass a relative or symlinked path but
 ///    the map was built from nextest's canonicalized, absolute listing).
-/// 3. Target-name fallback. If `cargo nextest run` rebuilds the test
-///    binaries between the `list` and `run` steps (e.g. a `build.rs`
-///    that's sensitive to env vars `list` doesn't set but `run` does),
-///    the new binaries have different `-<hash>` suffixes than the ones
-///    in the map. Strip the hash suffix and match by target name. If
-///    multiple map entries share a basename (e.g. several
-///    `tests/integration.rs` across workspace crates), narrow further
-///    by filesystem state — after a partial rebuild, the un-rebuilt
-///    candidates still have their original on-disk paths, while the
-///    rebuilt binary's old path was replaced. The unique
-///    no-longer-on-disk candidate is the right match. Fail with a
-///    clear error only when even that doesn't disambiguate.
+/// 3. Target-name fallback when binaries rebuilt between `list` and `run`
+///    (different `-<hash>` suffixes). Strip the hash and match basenames.
+///    Within those candidates:
+///    a. If exactly one, use it.
+///    b. Otherwise narrow by filesystem state: the rebuilt binary's old
+///    on-disk path is gone; un-rebuilt siblings' paths still exist. If
+///    exactly one candidate is "gone," use it.
+///    c. Otherwise scan the new binary's bytes for each candidate's
+///    `marker` (the source path uniquely embedded in that binary's
+///    debug info, e.g. `mock-stub/tests/builds.rs`). If exactly one
+///    marker is present, use that candidate.
+///    d. Fail with a clear error.
 fn resolve_binary_id(map_path: &Path, binary_path: &Path) -> anyhow::Result<String> {
     let json = std::fs::read_to_string(map_path).map_err(|e| {
         anyhow::anyhow!("reading binary map at {}: {e}", map_path.display())
     })?;
-    let map: HashMap<String, String> = serde_json::from_str(&json)
+    let map: HashMap<String, MapEntry> = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("parsing binary map {}: {e}", map_path.display()))?;
 
     let as_str = binary_path.to_str().unwrap_or("");
-    if let Some(id) = map.get(as_str) {
-        return Ok(id.clone());
+    if let Some(entry) = map.get(as_str) {
+        return Ok(entry.binary_id.clone());
     }
     if let Ok(canon) = std::fs::canonicalize(binary_path) {
-        if let Some(id) = canon.to_str().and_then(|s| map.get(s)) {
-            return Ok(id.clone());
+        if let Some(entry) = canon.to_str().and_then(|s| map.get(s)) {
+            return Ok(entry.binary_id.clone());
         }
     }
 
     // Target-name fallback: match by basename modulo the cargo hash suffix.
-    let needle = binary_path.file_name().and_then(|s| s.to_str()).map(target_name);
-    if let Some(needle) = needle {
-        let candidates: Vec<(&str, &String)> = map
-            .iter()
-            .filter(|(p, _)| {
-                Path::new(p)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(target_name)
-                    == Some(needle)
-            })
-            .map(|(p, id)| (p.as_str(), id))
-            .collect();
+    let Some(needle) = binary_path.file_name().and_then(|s| s.to_str()).map(target_name)
+    else {
+        return Err(anyhow::anyhow!(
+            "binary not found in map (path: {})",
+            binary_path.display()
+        ));
+    };
 
-        let resolved: Option<&String> = match candidates.len() {
-            0 => None,
-            1 => Some(candidates[0].1),
-            _ => {
-                // Disambiguate via filesystem state: the rebuilt binary's old
-                // map path no longer exists. If exactly one candidate's old
-                // path is gone, that's the match.
-                let rebuilt: Vec<&String> = candidates
-                    .iter()
-                    .filter(|(p, _)| !Path::new(p).exists())
-                    .map(|(_, id)| *id)
-                    .collect();
-                if rebuilt.len() == 1 {
-                    Some(rebuilt[0])
-                } else {
-                    None
-                }
-            }
-        };
+    let candidates: Vec<(&str, &MapEntry)> = map
+        .iter()
+        .filter(|(p, _)| {
+            Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(target_name)
+                == Some(needle)
+        })
+        .map(|(p, e)| (p.as_str(), e))
+        .collect();
 
-        if let Some(id) = resolved {
-            eprintln!(
-                "cargo-affected runner-shim: warning — exact path missed, \
-                 resolved {} via target-name fallback (binaries appear to \
-                 have rebuilt since collect's `nextest list` step)",
-                binary_path.display(),
-            );
-            return Ok(id.clone());
-        }
-
-        if !candidates.is_empty() {
-            return Err(anyhow::anyhow!(
-                "binary not found in map (path: {}); target-name fallback \
-                 ambiguous — {} entries share basename {:?} and filesystem \
-                 state can't disambiguate",
-                binary_path.display(),
-                candidates.len(),
-                needle
-            ));
-        }
+    if candidates.is_empty() {
+        return Err(anyhow::anyhow!(
+            "binary not found in map (path: {})",
+            binary_path.display()
+        ));
     }
 
+    let resolved: Option<&MapEntry> = match candidates.len() {
+        1 => Some(candidates[0].1),
+        _ => {
+            // Disambiguate via filesystem state first — cheap.
+            let missing: Vec<&MapEntry> = candidates
+                .iter()
+                .filter(|(p, _)| !Path::new(p).exists())
+                .map(|(_, e)| *e)
+                .collect();
+            if missing.len() == 1 {
+                Some(missing[0])
+            } else {
+                // Last-resort: read the new binary and look for each
+                // candidate's source-path marker in its bytes. Test/bench/
+                // example binaries embed `<package>/{tests,benches,examples}/<target>.rs`
+                // in debug info; that string is unique to this binary's
+                // package because no dependent references the test source.
+                disambiguate_by_marker(binary_path, &candidates)
+            }
+        }
+    };
+
+    if let Some(entry) = resolved {
+        eprintln!(
+            "cargo-affected runner-shim: warning — exact path missed, \
+             resolved {} via target-name fallback (binaries appear to \
+             have rebuilt since collect's `nextest list` step)",
+            binary_path.display(),
+        );
+        return Ok(entry.binary_id.clone());
+    }
+
+    let ids: Vec<&str> = candidates.iter().map(|(_, e)| e.binary_id.as_str()).collect();
     Err(anyhow::anyhow!(
-        "binary not found in map (path: {})",
-        binary_path.display()
+        "binary not found in map (path: {}); target-name fallback ambiguous \
+         — {} entries share basename {:?} ({:?}) and neither filesystem state \
+         nor binary-content marker disambiguates",
+        binary_path.display(),
+        candidates.len(),
+        needle,
+        ids,
     ))
+}
+
+/// Last-resort disambiguator: read the new binary file and search for each
+/// candidate's `marker` substring. Returns `Some` only when exactly one
+/// candidate's marker is present.
+///
+/// Markers are constructed at list time as `<package>/<dir>/<target>.rs`
+/// (only for kinds where this is structurally unique, see
+/// `collect::source_marker`). The new binary's debug info embeds the absolute
+/// path of every source file compiled into it, including the test entry
+/// point. That entry-point path is in the test binary's *own* package and
+/// nowhere else, so a substring match is exclusive.
+fn disambiguate_by_marker<'a>(
+    binary_path: &Path,
+    candidates: &[(&str, &'a MapEntry)],
+) -> Option<&'a MapEntry> {
+    let bytes = std::fs::read(binary_path).ok()?;
+    let hits: Vec<&MapEntry> = candidates
+        .iter()
+        .filter_map(|(_, e)| {
+            let marker = e.marker.as_deref()?;
+            byte_contains(&bytes, marker.as_bytes()).then_some(*e)
+        })
+        .collect();
+    if hits.len() == 1 {
+        Some(hits[0])
+    } else {
+        None
+    }
+}
+
+/// Naive subsequence search over bytes. The needle is small (a path
+/// fragment, ~30-80 bytes), the haystack is a binary (~50MB), so a
+/// linear scan with `windows().any()` is fine for the rare ambiguous-
+/// fallback case.
+fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Strip cargo's `-<16 hex chars>` hash suffix from a binary basename, leaving
@@ -276,6 +332,20 @@ mod tests {
         assert_eq!(sanitize("a b"), "a_b");
     }
 
+    fn entry(binary_id: &str) -> MapEntry {
+        MapEntry {
+            binary_id: binary_id.to_string(),
+            marker: None,
+        }
+    }
+
+    fn entry_with_marker(binary_id: &str, marker: &str) -> MapEntry {
+        MapEntry {
+            binary_id: binary_id.to_string(),
+            marker: Some(marker.to_string()),
+        }
+    }
+
     #[test]
     fn resolve_binary_id_exact_match() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -283,7 +353,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "/tmp/target/debug/deps/foo-abc123".to_string(),
-            "mycrate::foo".to_string(),
+            entry("mycrate::foo"),
         );
         std::fs::write(&map_path, serde_json::to_string(&map)?)?;
 
@@ -330,7 +400,7 @@ mod tests {
         // Map was built when binary had hash `aaaa...`.
         map.insert(
             "/tmp/target/debug/deps/worktrunk-aaaaaaaaaaaaaaaa".to_string(),
-            "worktrunk".to_string(),
+            entry("worktrunk"),
         );
         std::fs::write(&map_path, serde_json::to_string(&map)?)?;
 
@@ -355,20 +425,20 @@ mod tests {
         let map_path = dir.path().join("map.json");
 
         std::fs::write(&unrebuilt, b"")?;
-        // No file at builds-bbbb…: that binary was rebuilt and its old hash
-        // path is gone.
         let mut map = HashMap::new();
         map.insert(
             unrebuilt.to_str().unwrap().to_string(),
-            "crate_a::builds".to_string(),
+            entry("crate_a::builds"),
         );
+        // No file at builds-bbbb…: that binary was rebuilt and its old hash
+        // path is gone.
         map.insert(
             dir.path()
                 .join("builds-bbbbbbbbbbbbbbbb")
                 .to_str()
                 .unwrap()
                 .to_string(),
-            "crate_b::builds".to_string(),
+            entry("crate_b::builds"),
         );
         std::fs::write(&map_path, serde_json::to_string(&map)?)?;
 
@@ -382,9 +452,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_id_target_name_fallback_truly_ambiguous() -> anyhow::Result<()> {
-        // Both candidates rebuilt — filesystem state can't disambiguate.
+    fn resolve_binary_id_disambiguates_via_marker_when_both_rebuilt() -> anyhow::Result<()> {
+        // Both binaries rebuilt → both old map paths are gone. Use the
+        // source-path marker embedded in the new binary to pick.
         let dir = tempfile::tempdir()?;
+        let new_binary = dir.path().join("builds-cccccccccccccccc");
+        // Simulate a binary whose debug info contains crate_b's test path
+        // but not crate_a's.
+        std::fs::write(
+            &new_binary,
+            b"random elf header... and somewhere inside: crate_b/tests/builds.rs ... more bytes",
+        )?;
+
         let map_path = dir.path().join("map.json");
         let mut map = HashMap::new();
         map.insert(
@@ -393,7 +472,7 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string(),
-            "crate_a::builds".to_string(),
+            entry_with_marker("crate_a::builds", "crate_a/tests/builds.rs"),
         );
         map.insert(
             dir.path()
@@ -401,19 +480,56 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string(),
-            "crate_b::builds".to_string(),
+            entry_with_marker("crate_b::builds", "crate_b/tests/builds.rs"),
         );
         std::fs::write(&map_path, serde_json::to_string(&map)?)?;
 
-        let err = resolve_binary_id(
-            &map_path,
-            &dir.path().join("builds-cccccccccccccccc"),
-        )
-        .unwrap_err();
+        let id = resolve_binary_id(&map_path, &new_binary)?;
+        assert_eq!(id, "crate_b::builds");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_binary_id_target_name_fallback_truly_ambiguous() -> anyhow::Result<()> {
+        // Both candidates rebuilt and neither marker is found in the new
+        // binary — exhaustively ambiguous, error out.
+        let dir = tempfile::tempdir()?;
+        let new_binary = dir.path().join("builds-cccccccccccccccc");
+        std::fs::write(&new_binary, b"random bytes with no useful path strings")?;
+
+        let map_path = dir.path().join("map.json");
+        let mut map = HashMap::new();
+        map.insert(
+            dir.path()
+                .join("builds-aaaaaaaaaaaaaaaa")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            entry_with_marker("crate_a::builds", "crate_a/tests/builds.rs"),
+        );
+        map.insert(
+            dir.path()
+                .join("builds-bbbbbbbbbbbbbbbb")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            entry_with_marker("crate_b::builds", "crate_b/tests/builds.rs"),
+        );
+        std::fs::write(&map_path, serde_json::to_string(&map)?)?;
+
+        let err = resolve_binary_id(&map_path, &new_binary).unwrap_err();
         assert!(
             err.to_string().contains("ambiguous"),
             "expected ambiguous error, got: {err}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn byte_contains_finds_substring() {
+        assert!(byte_contains(b"abc/foo/tests/x.rs/def", b"foo/tests/x.rs"));
+        assert!(!byte_contains(b"abcdef", b"xyz"));
+        // Needle longer than haystack.
+        assert!(!byte_contains(b"a", b"ab"));
     }
 }

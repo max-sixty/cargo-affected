@@ -400,10 +400,28 @@ pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
 }
 
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
-/// pair, plus a binary_path → binary_id map for the runner shim.
+/// pair, plus a binary_path → entry map for the runner shim.
 pub(crate) struct Listing {
     pub(crate) tests: Vec<TestId>,
-    pub(crate) binary_map: HashMap<String, String>,
+    pub(crate) binary_map: HashMap<String, BinaryMapEntry>,
+}
+
+/// Per-binary metadata the runner shim needs at test time.
+///
+/// `binary_id` is what we ultimately want to look up. `marker` is a
+/// best-effort source-path string that's uniquely embedded in this
+/// particular binary's debug info (e.g. `mock-stub/tests/builds.rs`
+/// for an integration test). The shim uses it to disambiguate when
+/// two binaries share a basename and a partial rebuild made the
+/// path-based map miss — e.g., a workspace with several `tests/<name>.rs`
+/// files of the same name across packages.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub(crate) struct BinaryMapEntry {
+    pub(crate) binary_id: String,
+    /// Optional. Empty for kinds we can't construct a unique source marker
+    /// for (lib, bin) — those embed paths shared with their dependents.
+    #[serde(default)]
+    pub(crate) marker: Option<String>,
 }
 
 /// Enumerate all tests via `cargo nextest list --message-format json`.
@@ -455,7 +473,14 @@ pub(crate) fn nextest_list(
                 .context("nextest list entry missing binary-id")?
                 .to_string();
             if let Some(binary_path) = suite.get("binary-path").and_then(|v| v.as_str()) {
-                binary_map.insert(binary_path.to_string(), binary_id.clone());
+                let marker = source_marker(suite);
+                binary_map.insert(
+                    binary_path.to_string(),
+                    BinaryMapEntry {
+                        binary_id: binary_id.clone(),
+                        marker,
+                    },
+                );
             }
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
@@ -471,8 +496,31 @@ pub(crate) fn nextest_list(
     })
 }
 
-/// Write the binary_path → binary_id map as JSON for the runner shim.
-fn write_binary_map(path: &Path, map: &HashMap<String, String>) -> Result<()> {
+/// Build a uniquely-identifying source-path string for a binary, suitable for
+/// substring matching against the binary's embedded debug info.
+///
+/// Returns `Some` for `kind` values whose source layout is unambiguous
+/// (`test`/`bench`/`example` — single source file under `<package>/<dir>/`),
+/// and `None` for kinds where a per-binary marker isn't structurally unique
+/// (`lib` and `bin` source paths are also referenced by dependents' debug
+/// info, so they can't disambiguate). When `None`, the shim's binary-content
+/// fallback won't help; users hitting that path with two same-basename
+/// libs/bins should rename one.
+fn source_marker(suite: &serde_json::Value) -> Option<String> {
+    let kind = suite.get("kind").and_then(|v| v.as_str())?;
+    let package = suite.get("package-name").and_then(|v| v.as_str())?;
+    let target = suite.get("target-name").and_then(|v| v.as_str())?;
+    let dir = match kind {
+        "test" => "tests",
+        "bench" => "benches",
+        "example" => "examples",
+        _ => return None,
+    };
+    Some(format!("{package}/{dir}/{target}.rs"))
+}
+
+/// Write the binary_path → entry map as JSON for the runner shim.
+fn write_binary_map(path: &Path, map: &HashMap<String, BinaryMapEntry>) -> Result<()> {
     let json = serde_json::to_string(map).context("serializing binary map")?;
     std::fs::write(path, json)
         .with_context(|| format!("writing binary map to {}", path.display()))?;
