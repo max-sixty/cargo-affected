@@ -38,6 +38,12 @@ enum CargoSubcommand {
 enum Action {
     /// Collect coverage data for all tests and store in the database.
     Collect {
+        /// Re-collect coverage only for tests affected by changes since the
+        /// last collect, leaving rows for unaffected tests in place. Errors
+        /// out if there's no prior collect for the current environment, or
+        /// if any stored collect_sha is no longer reachable from HEAD.
+        #[arg(long)]
+        diff: bool,
         /// Print pipeline internals (tool paths, per-binary sentinels, etc.).
         #[arg(short, long)]
         verbose: bool,
@@ -126,10 +132,11 @@ fn run_action(action: Action) -> Result<i32> {
 
     match action {
         Action::Collect {
+            diff,
             verbose,
             allow_dirty,
             nextest_args,
-        } => collect::collect(verbose, allow_dirty, &nextest_args),
+        } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
         Action::Run {
             all,
             verbose,

@@ -1,18 +1,23 @@
-//! Shared test-selection logic for `run` and `status`.
+//! Shared test-selection logic for `run`, `status`, and `collect --diff`.
 //!
-//! Both subcommands do the same computation: list all tests via nextest, look
+//! All three callers do the same computation: list all tests via nextest, look
 //! up which of the known tests cover the changed line ranges, and union that
 //! with tests that are in the listing but not yet in the coverage DB (added
 //! since the last `collect`). This module owns that pipeline and the output
-//! format for the summary line so the two callers don't drift apart.
+//! format for the summary line so the callers don't drift apart.
+//!
+//! `collect --diff` produces rows anchored at the new HEAD while leaving
+//! unaffected tests' rows at their original sha, so the DB can hold rows
+//! from several distinct collect points at once for a single fingerprint.
+//! Callers iterate over those shas and pass per-sha changed-line ranges in;
+//! selection looks up overlaps in each sha's row set and unions the results.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::nextest_list;
+use crate::collect::Listing;
 use crate::db::{Db, TestId};
 use crate::project::LineRange;
 
@@ -26,6 +31,10 @@ pub(crate) struct Selection {
     pub(crate) new_tests: BTreeSet<TestId>,
     /// Distinct tests tracked in the DB under the current fingerprint.
     pub(crate) known_count: usize,
+    /// Every test currently present in the project's nextest listing —
+    /// used by `collect --diff` to prune rows for tests that were renamed
+    /// or removed.
+    pub(crate) listed: BTreeSet<TestId>,
 }
 
 impl Selection {
@@ -40,42 +49,54 @@ impl Selection {
     }
 }
 
-/// Compute the selection. Invokes `cargo nextest list` (which builds), so
-/// callers wanting a fast no-op path should short-circuit on empty DB first.
+/// Per-sha changed-line ranges: outer key is the `collect_sha` the rows are
+/// anchored at, inner map mirrors the existing per-file shape produced by
+/// `git_changed_line_ranges`.
+pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineRange>>>;
+
+/// Compute the selection from a pre-built nextest listing and per-sha changed
+/// ranges. Callers do their own `nextest list` so they can pass the listing
+/// they already need for the binary-map dance (collect) or to control the
+/// build flags (run/status invoke a non-instrumented list).
 ///
-/// `changed_ranges` maps each changed file to its list of changed line ranges
-/// (OLD-side, in `collect_sha` coordinates). Files with no entry contribute
-/// nothing — that's how we naturally handle untracked files.
+/// `reachable_shas` are the stored `collect_sha`s still reachable from HEAD;
+/// only tests anchored at one of those shas count as "known" to the cache.
+/// Tests anchored exclusively at diverged shas surface as `new_tests` so
+/// they're rerun (and, in `collect --diff`, re-anchored at the new HEAD)
+/// rather than silently skipped.
 pub(crate) fn compute(
-    project_root: &Path,
     db: &Db,
     env_fingerprint: &str,
-    changed_ranges: &BTreeMap<String, Vec<LineRange>>,
+    reachable_shas: &BTreeSet<String>,
+    changed_ranges_by_sha: &ChangedRangesBySha,
+    listing: &Listing,
 ) -> Result<Selection> {
-    eprintln!("checking for new tests...");
-    let listing = nextest_list(project_root, None, None)?;
-    let known_tests = db.all_tests(env_fingerprint)?;
+    let listed: BTreeSet<TestId> = listing.tests.iter().cloned().collect();
+    let known_tests = db.all_tests_at_shas(env_fingerprint, reachable_shas)?;
     let known_count = known_tests.len();
-    let new_tests: BTreeSet<TestId> = listing
-        .tests
+    let new_tests: BTreeSet<TestId> = listed
         .iter()
         .filter(|t| !known_tests.contains(*t))
         .cloned()
         .collect();
 
     let mut affected = BTreeSet::new();
-    for (file, hunks) in changed_ranges {
-        if hunks.is_empty() {
-            continue;
+    for (collect_sha, ranges_by_file) in changed_ranges_by_sha {
+        for (file, hunks) in ranges_by_file {
+            if hunks.is_empty() {
+                continue;
+            }
+            let hits =
+                db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
+            affected.extend(hits);
         }
-        let hits = db.tests_covering_ranges(env_fingerprint, file, hunks)?;
-        affected.extend(hits);
     }
 
     Ok(Selection {
         affected,
         new_tests,
         known_count,
+        listed,
     })
 }
 
@@ -114,10 +135,16 @@ mod tests {
     }
 
     fn selection_with(affected: &[TestId], new_tests: &[TestId], known_count: usize) -> Selection {
+        let listed: BTreeSet<TestId> = affected
+            .iter()
+            .cloned()
+            .chain(new_tests.iter().cloned())
+            .collect();
         Selection {
             affected: affected.iter().cloned().collect(),
             new_tests: new_tests.iter().cloned().collect(),
             known_count,
+            listed,
         }
     }
 

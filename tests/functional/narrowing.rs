@@ -23,10 +23,10 @@ fn function_body_edit_selects_only_that_test() {
         String::from_utf8_lossy(&collect.stdout)
     );
 
-    // Sanity-check that the DB picked up all three tests and stored a real
-    // collect_sha. The DB is a black box for the rest of the suite — this
-    // scenario doubles as smoke for `collect` so other scenarios can rely on
-    // it without each re-checking the schema.
+    // Sanity-check that the DB picked up all three tests and anchored their
+    // rows to a real collect_sha. The DB is a black box for the rest of the
+    // suite — this scenario doubles as smoke for `collect` so other scenarios
+    // can rely on it without each re-checking the schema.
     let db_path = dir.join("target/affected/coverage.db");
     assert!(
         db_path.exists(),
@@ -41,12 +41,23 @@ fn function_body_edit_selects_only_that_test() {
         )
         .unwrap();
     assert_eq!(test_count, 3, "expected 3 tests in DB");
-    let stored_sha: String = conn
-        .query_row("SELECT collect_sha FROM fingerprints LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(stored_sha.len(), 40, "stored sha should be a full hex sha");
+    let stored_shas: Vec<String> = conn
+        .prepare("SELECT DISTINCT collect_sha FROM test_regions")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        stored_shas.len(),
+        1,
+        "fresh full collect should anchor every row at a single sha, got {stored_shas:?}",
+    );
+    assert_eq!(
+        stored_shas[0].len(),
+        40,
+        "stored sha should be a full hex sha",
+    );
 
     // Edit only inside `add`'s body. `test_multiply`'s stored range doesn't
     // overlap, so it must not be selected. `test_greet` lives in strings.rs

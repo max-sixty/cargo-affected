@@ -1,27 +1,26 @@
 //! Status reporting: show stored coverage data and what would run for current changes.
 //!
-//! Mirrors `run`'s contract: when the coverage cache can't anchor a precise
-//! selection (no data, fingerprint mismatch, missing or unreachable
-//! `collect_sha`), `status` reports "would run all tests" with an explanation
-//! rather than bailing — same widening `run` performs.
+//! Mirrors `run`'s contract: reports "would run all tests" with an
+//! explanation when the cache offers nothing usable (no data, fingerprint
+//! mismatch, or every stored `collect_sha` unreachable). Partial divergence
+//! proceeds with the reachable subset, same as `run`.
 
 use anyhow::Result;
 
-use crate::collect::require_nextest;
+use crate::collect::{nextest_list, require_nextest};
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
-use crate::project::{
-    find_project_root, git_changed_files, git_changed_line_ranges, relation_to_head, ShaRelation,
-};
+use crate::project::{find_project_root, git_changed_files};
+use crate::run::{changed_ranges_per_sha, check_shas_reachable, diverged_shas_notice};
 use crate::selection;
 
 /// Entry point for `cargo affected status`.
 ///
-/// Reports "would run all tests" (with an explanation) in every case where
-/// the coverage cache can't anchor a precise affected-test selection — no
-/// coverage data, fingerprint mismatch, missing `collect_sha`, or
-/// `collect_sha` not reachable from HEAD. Mirrors `run`'s widening so the
-/// dry-run accurately predicts what `run` would do.
+/// Reports "would run all tests" (with an explanation) when the cache
+/// offers nothing usable — no coverage, fingerprint mismatch, or every
+/// stored `collect_sha` unreachable. Partial divergence proceeds with the
+/// reachable subset and surfaces stranded tests as "new", mirroring `run`
+/// so the dry-run accurately predicts what `run` would do.
 pub fn status(verbose: bool) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
@@ -41,7 +40,7 @@ pub fn status(verbose: bool) -> Result<()> {
     let known_count = db.test_count(&env_fingerprint)?;
     let region_count = db.region_count(&env_fingerprint)?;
     let last_collected = db.last_collected()?.unwrap_or_else(|| "never".to_string());
-    let collect_sha = db.collect_sha(&env_fingerprint)?;
+    let collect_shas = db.collect_shas(&env_fingerprint)?;
 
     let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
 
@@ -68,35 +67,33 @@ pub fn status(verbose: bool) -> Result<()> {
          regions stored: {region_count}",
         rel_path.display(),
     );
-    if let Some(sha) = collect_sha.as_deref() {
-        println!("collect sha: {sha}");
-    }
+    let mut sha_list: Vec<&str> = collect_shas.iter().map(String::as_str).collect();
+    sha_list.sort();
+    println!("collect shas: {}", sha_list.join(", "));
 
-    let Some(collect_sha) = collect_sha else {
+    let reach = check_shas_reachable(project_root, &collect_shas)?;
+    if !reach.diverged.is_empty() {
+        let stale_rows = db.region_count_at_shas(&env_fingerprint, &reach.diverged)?;
         println!(
-            "\nnote: coverage data exists but is missing collect_sha — \
+            "\n{}\nstale rows: {stale_rows} (anchored at diverged sha{})",
+            diverged_shas_notice(&reach.diverged, "would rerun as 'new'"),
+            if reach.diverged.len() == 1 { "" } else { "s" },
+        );
+    }
+    if reach.reachable.is_empty() {
+        println!(
+            "\nnote: no reachable collect_sha for the current environment — \
              would run all tests; run `cargo affected collect` to re-anchor"
         );
         return Ok(());
-    };
-
-    match relation_to_head(project_root, &collect_sha)? {
-        ShaRelation::Equal => {}
-        ShaRelation::Ancestor { commits_ahead } => {
-            println!(
-                "\nnote: {commits_ahead} commit(s) since collect — \
-                 diff vs collect_sha is noisier than necessary; \
-                 run `cargo affected collect` to refresh"
-            );
-        }
-        ShaRelation::Diverged => {
-            println!(
-                "\nnote: collect_sha {collect_sha} not reachable from HEAD \
-                 (rebased or branch switched) — would run all tests; \
-                 run `cargo affected collect` to re-anchor"
-            );
-            return Ok(());
-        }
+    }
+    if reach.max_commits_ahead > 0 {
+        println!(
+            "\nnote: {} commit(s) since collect — \
+             diff vs collect_sha is noisier than necessary; \
+             run `cargo affected collect` to refresh",
+            reach.max_commits_ahead,
+        );
     }
 
     let changed_files = git_changed_files(project_root)?;
@@ -109,10 +106,18 @@ pub fn status(verbose: bool) -> Result<()> {
         }
     }
 
-    let changed_ranges = git_changed_line_ranges(project_root, &collect_sha)?;
+    let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
 
     require_nextest(project_root)?;
-    let sel = selection::compute(project_root, &db, &env_fingerprint, &changed_ranges)?;
+    eprintln!("checking for new tests...");
+    let listing = nextest_list(project_root, None, None)?;
+    let sel = selection::compute(
+        &db,
+        &env_fingerprint,
+        &reach.reachable,
+        &changed_ranges_by_sha,
+        &listing,
+    )?;
     let selected = sel.selected();
     if selected.is_empty() {
         if changed_files.is_empty() {

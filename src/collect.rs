@@ -46,9 +46,23 @@ use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_head_sha, git_working_tree_dirty};
+use crate::run::{changed_ranges_per_sha, check_shas_reachable, diverged_shas_notice};
+use crate::selection;
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
-pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Result<i32> {
+///
+/// `diff = true` runs an incremental collect: only tests affected by changes
+/// since one of the stored `collect_sha`s (or new tests added to the project)
+/// are rerun under instrumentation, and their rows are re-anchored at the
+/// new HEAD. Other tests' rows stay put. Errors out if there's no prior
+/// collect for the current environment, or if any stored sha is no longer
+/// reachable from HEAD.
+pub fn collect(
+    diff: bool,
+    verbose: bool,
+    allow_dirty: bool,
+    nextest_args: &[String],
+) -> Result<i32> {
     let total_start = Instant::now();
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
@@ -174,6 +188,29 @@ pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Res
     // Stray profraw files left in project root by the list-step build.
     clean_profraw_files(project_root)?;
 
+    // Diff mode: validate prior collect, run selection, build the
+    // nextest filter expression for the rerun set. Done after the listing
+    // step so we use the same fingerprint for read and write — the list
+    // step can update Cargo.lock, which would otherwise leave us reading
+    // under one fingerprint and writing under another.
+    let diff_plan = if diff {
+        match plan_diff_collect(project_root, &env_fingerprint, &listing)? {
+            Some(plan) => Some(plan),
+            None => {
+                // Nothing to rerun — selection's prune already ran. Avoid the
+                // pre-run listing dance and the nextest invocation entirely.
+                eprintln!(
+                    "done. nothing to recollect — no affected tests and no new tests \
+                     ({:.1}s total)",
+                    total_start.elapsed().as_secs_f64(),
+                );
+                return Ok(0);
+            }
+        }
+    } else {
+        None
+    };
+
     // Right before nextest run: re-list to capture cargo's current artifact
     // paths and join against the stable map, so the shim's path lookup
     // reflects whatever the run step is about to invoke. Cheap (cache hit
@@ -200,6 +237,9 @@ pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Res
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
+    if let Some(plan) = &diff_plan {
+        cmd.arg("-E").arg(&plan.filter_expr);
+    }
     for a in nextest_args {
         cmd.arg(a);
     }
@@ -300,11 +340,24 @@ pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Res
     let region_count: usize = mappings.iter().map(|(_, r)| r.len()).sum();
 
     let mut db = Db::open(project_root)?;
-    eprintln!(
-        "storing coverage for {} tests ({region_count} ranges)...",
-        mappings.len()
-    );
-    db.store_coverage(&env_fingerprint, &collect_sha, &mappings)?;
+    if let Some(plan) = diff_plan {
+        eprintln!(
+            "updating coverage for {} tests ({region_count} ranges)...",
+            mappings.len()
+        );
+        db.update_coverage_for_tests(&env_fingerprint, &collect_sha, &mappings)?;
+        let pruned = db.prune_missing_tests(&env_fingerprint, &plan.listed)?;
+        if pruned > 0 {
+            let s = if pruned == 1 { "" } else { "s" };
+            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+        }
+    } else {
+        eprintln!(
+            "storing coverage for {} tests ({region_count} ranges)...",
+            mappings.len()
+        );
+        db.store_coverage(&env_fingerprint, &collect_sha, &mappings)?;
+    }
 
     let evicted = db.gc(&env_fingerprint, FINGERPRINT_KEEP)?;
     if evicted > 0 {
@@ -320,6 +373,87 @@ pub fn collect(verbose: bool, allow_dirty: bool, nextest_args: &[String]) -> Res
         total_elapsed.as_secs_f64(),
     );
     Ok(nextest_exit)
+}
+
+/// Plan for the rerun side of `collect --diff`: which tests to invoke
+/// nextest with, and the full listing so a post-run prune can drop tests
+/// that disappeared since the last collect.
+struct DiffPlan {
+    /// Nextest `-E` filter expression matching the affected + new tests.
+    filter_expr: String,
+    /// Every test currently in `nextest list` — used to prune rows for
+    /// tests that were renamed/deleted between collects.
+    listed: BTreeSet<TestId>,
+}
+
+/// Run the diff-mode preflight + selection. Returns:
+/// - `Ok(Some(plan))` — there's work to do; caller proceeds with the rerun.
+/// - `Ok(None)` — nothing to recollect (no affected tests, no new tests);
+///   any stale tests were pruned in-place and the caller should short-circuit.
+/// - `Err(_)` — fingerprint mismatch, divergent sha, or query failure.
+fn plan_diff_collect(
+    project_root: &Path,
+    env_fingerprint: &str,
+    listing: &Listing,
+) -> Result<Option<DiffPlan>> {
+    let mut db = Db::open(project_root)?;
+    let prior_shas = db.collect_shas(env_fingerprint)?;
+    if prior_shas.is_empty() {
+        bail!(
+            "--diff requires a prior `cargo affected collect` for the \
+             current environment (Cargo.lock / rustc / build flags); \
+             no stored coverage matches"
+        );
+    }
+    let reach = check_shas_reachable(project_root, &prior_shas)?;
+    if !reach.diverged.is_empty() {
+        eprintln!(
+            "{}",
+            diverged_shas_notice(
+                &reach.diverged,
+                "will be rerun and re-anchored at the new HEAD",
+            ),
+        );
+    }
+    if reach.reachable.is_empty() {
+        bail!(
+            "no reachable collect_sha for the current environment (every \
+             stored sha is rebased away or otherwise unreachable from HEAD); \
+             run `cargo affected collect` to re-anchor"
+        );
+    }
+    if reach.max_commits_ahead > 0 {
+        eprintln!(
+            "note: {} commit(s) since prior collect — \
+             re-anchoring affected tests at the new HEAD",
+            reach.max_commits_ahead,
+        );
+    }
+
+    let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
+    let sel = selection::compute(
+        &db,
+        env_fingerprint,
+        &reach.reachable,
+        &changed_ranges_by_sha,
+        listing,
+    )?;
+    let selected = sel.selected();
+    if selected.is_empty() {
+        let pruned = db.prune_missing_tests(env_fingerprint, &sel.listed)?;
+        if pruned > 0 {
+            let s = if pruned == 1 { "" } else { "s" };
+            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+        }
+        return Ok(None);
+    }
+
+    eprintln!("\n{}\n", selection::format_summary(&sel, "to recollect", false));
+    let selected_vec: Vec<TestId> = selected.into_iter().collect();
+    Ok(Some(DiffPlan {
+        filter_expr: nextest_filter_expr(&selected_vec),
+        listed: sel.listed,
+    }))
 }
 
 /// Outcome of coverage extraction for a single per-test directory.
