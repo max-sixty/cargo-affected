@@ -135,7 +135,7 @@ The trade-off:
   changes because we diff text, not AST.
 - **Recomputing checksums every run** (testmon) is VCS-agnostic and
   ignores cosmetic edits, at the cost of reparsing all source on every
-  invocation and silently mutating the DB on every run.
+  invocation and updating the DB on every run.
 - **Static-graph approaches** ([jest], [Bazel], [Buck]) skip dynamic
   coverage entirely — fast and deterministic, but conservative on
   reflection, plugin loading, and runtime dispatch, where coverage-based
