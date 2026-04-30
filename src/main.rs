@@ -54,7 +54,7 @@ enum Action {
         #[arg(long)]
         allow_dirty: bool,
         /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(last = true)]
         nextest_args: Vec<String>,
     },
     /// Run only tests affected by current git changes.
@@ -66,7 +66,7 @@ enum Action {
         #[arg(short, long)]
         verbose: bool,
         /// Extra args forwarded to `cargo nextest run`. Separate with `--`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(last = true)]
         nextest_args: Vec<String>,
     },
     /// Show stored coverage data and what would run for current changes.
