@@ -21,8 +21,8 @@ the functional test suite.
 - `coverage.rs` — Parses `llvm-cov export` JSON into `(file, line_start, line_end)` ranges per hit function.
 - `fingerprint.rs` — SHA-256 of `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_BUILD_TARGET`. Queries scoped to the current fingerprint naturally miss when any tracked input changes — no explicit invalidation path.
 - `db.rs` — SQLite at `target/affected/coverage.db`. `test_regions` rows carry a per-row `collect_sha` so `--diff` can leave unaffected tests anchored at their original sha while re-anchoring rerun tests at the new HEAD; multiple shas can coexist for one fingerprint. Diverged-sha rows linger until `cargo affected clean`. Crate roots ride the same table with sentinel `(1, i64::MAX)` ranges (the structural-edit backstop). Legacy schemas drop on open.
-- `selection.rs` — Shared between `run`, `status`, and `collect --diff`. Computes affected + new + listed test sets given a nextest listing, the reachable shas, and per-sha changed-line ranges.
-- `run.rs` — `collect_shas` → reachability → per-sha `git diff -U0` → selection → `nextest run -E <filter>`. Widens to all tests only when every sha is diverged. Helpers (`check_shas_reachable`, `changed_ranges_per_sha`) are pub-crate so `status` / `collect --diff` share the same rules.
+- `selection.rs` — Shared between `run`, `status`, and `collect --diff`. Owns reachability classification (`check_shas_reachable`), per-sha diff collection (`changed_ranges_per_sha`), the divergence notice, and the affected + new + listed selection itself.
+- `run.rs` — `collect_shas` → reachability → per-sha `git diff -U0` → selection → `nextest run -E <filter>`. Widens to all tests only when every sha is diverged.
 - `status.rs` — Dry-run variant of `run`.
 
 ## Principles

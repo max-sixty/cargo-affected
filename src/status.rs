@@ -11,7 +11,6 @@ use crate::collect::{nextest_list, require_nextest};
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
-use crate::run::{changed_ranges_per_sha, check_shas_reachable, diverged_shas_notice};
 use crate::selection;
 
 /// Entry point for `cargo affected status`.
@@ -71,12 +70,12 @@ pub fn status(verbose: bool) -> Result<()> {
     sha_list.sort();
     println!("collect shas: {}", sha_list.join(", "));
 
-    let reach = check_shas_reachable(project_root, &collect_shas)?;
+    let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
     if !reach.diverged.is_empty() {
         let stale_rows = db.region_count_at_shas(&env_fingerprint, &reach.diverged)?;
         println!(
             "\n{}\nstale rows: {stale_rows} (anchored at diverged sha{})",
-            diverged_shas_notice(&reach.diverged, "would rerun as 'new'"),
+            selection::diverged_shas_notice(&reach.diverged, "would rerun as 'new'"),
             if reach.diverged.len() == 1 { "" } else { "s" },
         );
     }
@@ -106,7 +105,7 @@ pub fn status(verbose: bool) -> Result<()> {
         }
     }
 
-    let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
+    let changed_ranges_by_sha = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
 
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");

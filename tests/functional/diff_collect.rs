@@ -455,3 +455,135 @@ fn diff_collect_errors_when_sha_diverged() {
         "expected 'not reachable from HEAD' in error, got:\n{stderr}"
     );
 }
+
+/// Removing the `#[test]` attribute drops `test_multiply` from the listing
+/// while its rows linger in the DB. `--diff` must prune those stale rows so
+/// the cache doesn't carry phantom tests forward indefinitely. Renames take
+/// the same code path: old name absent from listing → row dropped.
+#[test]
+fn diff_collect_prunes_deleted_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_prune_deleted");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Strip just the `#[test]` attribute so the function still compiles
+    // (avoids a syntactic delete that would re-flow nearby line numbers
+    // in noisy ways) but stops appearing in `cargo nextest list`.
+    replace_in_file(
+        &dir.join("src/math.rs"),
+        "    #[test]\n    fn test_multiply()",
+        "    fn test_multiply()",
+    );
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "demote test_multiply"]);
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert!(
+        diff.status.success(),
+        "collect --diff failed: stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+    assert!(
+        combined.contains("pruned 1 test"),
+        "expected 'pruned 1 test' in --diff output, got:\n{combined}"
+    );
+
+    // DB invariant: test_multiply's rows are gone; the survivors stay.
+    let db_path = dir.join("target/affected/coverage.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let surviving: Vec<String> = conn
+        .prepare("SELECT DISTINCT test_name FROM test_regions")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        !surviving.iter().any(|t| t == "math::tests::test_multiply"),
+        "test_multiply rows should be pruned, got: {surviving:?}",
+    );
+    assert!(
+        surviving.iter().any(|t| t == "math::tests::test_add"),
+        "test_add rows should remain, got: {surviving:?}",
+    );
+    assert!(
+        surviving.iter().any(|t| t == "strings::tests::test_greet"),
+        "test_greet rows should remain, got: {surviving:?}",
+    );
+}
+
+/// `--diff` on a clean working tree (HEAD == prior collect_sha, no
+/// uncommitted edits) should short-circuit with exit 0 and announce that
+/// nothing needs to be recollected — no nextest invocation, no DB writes.
+#[test]
+fn diff_collect_clean_tree_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_clean_tree");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    let db_path = dir.join("target/affected/coverage.db");
+    let row_count = || -> i64 {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM test_regions", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = row_count();
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert_eq!(
+        diff.status.code(),
+        Some(0),
+        "collect --diff on clean tree should exit 0; stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+    assert!(
+        combined.contains("nothing to recollect"),
+        "expected 'nothing to recollect' in --diff output, got:\n{combined}"
+    );
+    // Sanity: we must not have invoked nextest run, since there's nothing to
+    // recollect. The "running tests with cargo nextest run..." line is only
+    // printed for the rerun path.
+    assert!(
+        !combined.contains("running tests with cargo nextest run"),
+        "clean-tree --diff should skip nextest; output suggests it ran:\n{combined}"
+    );
+    // DB invariant: no rows added or removed. The output assertions above
+    // are about user messaging; this is the structural check that the
+    // no-op path really was a no-op.
+    assert_eq!(
+        row_count(),
+        before,
+        "clean-tree --diff should leave test_regions row count unchanged"
+    );
+}

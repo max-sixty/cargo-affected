@@ -1,25 +1,28 @@
-//! Shared test-selection logic for `run`, `status`, and `collect --diff`.
+//! Shared test-selection plumbing for `run`, `status`, and `collect --diff`.
 //!
-//! All three callers do the same computation: list all tests via nextest, look
-//! up which of the known tests cover the changed line ranges, and union that
-//! with tests that are in the listing but not yet in the coverage DB (added
-//! since the last `collect`). This module owns that pipeline and the output
-//! format for the summary line so the callers don't drift apart.
+//! Reachability classification, per-sha diff collection, the selection
+//! computation itself, and the human-facing notices/summaries. The three
+//! callers all walk the same path: classify stored `collect_sha`s, gather
+//! per-sha changed line ranges, list tests via nextest, look up overlaps for
+//! known tests, and union with tests added since the last `collect`. This
+//! module owns the whole flow so the callers can't drift apart.
 //!
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
 //! from several distinct collect points at once for a single fingerprint.
-//! Callers iterate over those shas and pass per-sha changed-line ranges in;
-//! selection looks up overlaps in each sha's row set and unions the results.
+//! Reachability is per-sha — diverged shas are skipped and tests stranded
+//! only there surface as `new_tests` so they're rerun rather than silently
+//! dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::Result;
 
 use crate::collect::Listing;
 use crate::db::{Db, TestId};
-use crate::project::LineRange;
+use crate::project::{git_changed_line_ranges, relation_to_head, LineRange, ShaRelation};
 
 /// Result of the selection computation.
 pub(crate) struct Selection {
@@ -53,6 +56,88 @@ impl Selection {
 /// anchored at, inner map mirrors the existing per-file shape produced by
 /// `git_changed_line_ranges`.
 pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineRange>>>;
+
+/// Per-sha reachability for the stored `collect_sha`s under one fingerprint.
+///
+/// Splits cleanly so callers can proceed with the reachable subset rather
+/// than treating any divergence as all-or-nothing — important under `collect
+/// --diff`, where rows from several shas coexist for one fingerprint and a
+/// single rebase shouldn't invalidate unrelated tests' rows. Tests anchored
+/// at diverged shas remain in the DB; queries skip them, and selection
+/// surfaces them as "new tests" so they get rerun (and re-anchored, in
+/// `collect --diff`'s case). Old rows accumulate as bloat — clear with
+/// `cargo affected clean`.
+pub(crate) struct Reachability {
+    /// Stored shas reachable from HEAD (Equal or Ancestor).
+    pub(crate) reachable: BTreeSet<String>,
+    /// Stored shas no longer reachable (rebased away, garbage-collected,
+    /// beyond shallow boundary). Their rows are still in the DB but won't
+    /// be queried by `run`/`status`/`collect --diff`.
+    pub(crate) diverged: BTreeSet<String>,
+    /// Largest commits-ahead distance among reachable shas; 0 when every
+    /// reachable sha equals HEAD.
+    pub(crate) max_commits_ahead: u32,
+}
+
+/// Format the partial-divergence notice shared by `run`, `status`, and
+/// `collect --diff`. `verb_phrase` slots into "tests anchored only there
+/// VERB_PHRASE" — "will rerun as 'new'" for `run`/`collect --diff`, "would
+/// rerun as 'new'" for `status`. Returns the body without a trailing
+/// newline so callers can `eprintln!`/`println!` it directly.
+pub(crate) fn diverged_shas_notice(diverged: &BTreeSet<String>, verb_phrase: &str) -> String {
+    let plural = if diverged.len() == 1 { "" } else { "s" };
+    let list = diverged.iter().cloned().collect::<Vec<_>>().join(", ");
+    format!(
+        "note: {} collect_sha{plural} not reachable from HEAD ({list}) — \
+         tests anchored only there {verb_phrase}; \
+         run `cargo affected clean` to clear stale rows",
+        diverged.len(),
+    )
+}
+
+/// Classify each `collect_sha` in `shas` against HEAD. See [`Reachability`].
+pub(crate) fn check_shas_reachable(
+    project_root: &Path,
+    shas: &BTreeSet<String>,
+) -> Result<Reachability> {
+    let mut reachable = BTreeSet::new();
+    let mut diverged = BTreeSet::new();
+    let mut max_commits_ahead = 0u32;
+    for sha in shas {
+        match relation_to_head(project_root, sha)? {
+            ShaRelation::Equal => {
+                reachable.insert(sha.clone());
+            }
+            ShaRelation::Ancestor { commits_ahead } => {
+                reachable.insert(sha.clone());
+                max_commits_ahead = max_commits_ahead.max(commits_ahead);
+            }
+            ShaRelation::Diverged => {
+                diverged.insert(sha.clone());
+            }
+        }
+    }
+    Ok(Reachability {
+        reachable,
+        diverged,
+        max_commits_ahead,
+    })
+}
+
+/// Build the per-sha changed-ranges map: one `git diff -U0 <sha>` per
+/// distinct stored `collect_sha`. With a single sha (the common case) this
+/// is one diff invocation.
+pub(crate) fn changed_ranges_per_sha(
+    project_root: &Path,
+    shas: &BTreeSet<String>,
+) -> Result<ChangedRangesBySha> {
+    let mut out = BTreeMap::new();
+    for sha in shas {
+        let ranges = git_changed_line_ranges(project_root, sha)?;
+        out.insert(sha.clone(), ranges);
+    }
+    Ok(out)
+}
 
 /// Compute the selection from a pre-built nextest listing and per-sha changed
 /// ranges. Callers do their own `nextest list` so they can pass the listing

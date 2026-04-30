@@ -46,7 +46,6 @@ use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_head_sha, git_working_tree_dirty};
-use crate::run::{changed_ranges_per_sha, check_shas_reachable, diverged_shas_notice};
 use crate::selection;
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
@@ -188,17 +187,28 @@ pub fn collect(
     // Stray profraw files left in project root by the list-step build.
     clean_profraw_files(project_root)?;
 
+    // Open the DB once and thread it through. Eager open lets a busy/locked
+    // database error out before we spend time on extraction.
+    let mut db = Db::open(project_root)?;
+
     // Diff mode: validate prior collect, run selection, build the
     // nextest filter expression for the rerun set. Done after the listing
     // step so we use the same fingerprint for read and write — the list
     // step can update Cargo.lock, which would otherwise leave us reading
     // under one fingerprint and writing under another.
+    //
+    // The planner is read-only against the DB; any prune or row replacement
+    // happens later in this function so the DB write surface stays in one
+    // place.
     let diff_plan = if diff {
-        match plan_diff_collect(project_root, &env_fingerprint, &listing)? {
-            Some(plan) => Some(plan),
-            None => {
-                // Nothing to rerun — selection's prune already ran. Avoid the
-                // pre-run listing dance and the nextest invocation entirely.
+        match plan_diff_collect(project_root, &db, &env_fingerprint, &listing)? {
+            DiffOutcome::Plan(plan) => Some(plan),
+            DiffOutcome::NothingToRecollect { listed } => {
+                let pruned = db.prune_missing_tests(&env_fingerprint, &listed)?;
+                if pruned > 0 {
+                    let s = if pruned == 1 { "" } else { "s" };
+                    eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+                }
                 eprintln!(
                     "done. nothing to recollect — no affected tests and no new tests \
                      ({:.1}s total)",
@@ -259,6 +269,19 @@ pub fn collect(
              (nextest exit code: {nextest_exit})",
             profraw_dir.display(),
         );
+        // Prune still has to run in diff mode: the listing's set of tests
+        // (renamed/deleted between collects) is independent of whether
+        // nextest produced any per-test profraw dirs. Without this, a
+        // diff-mode collect that selects only phantom tests (every
+        // selected test absent from the current listing) silently leaves
+        // their stale rows in the DB.
+        if let Some(plan) = &diff_plan {
+            let pruned = db.prune_missing_tests(&env_fingerprint, &plan.listed)?;
+            if pruned > 0 {
+                let s = if pruned == 1 { "" } else { "s" };
+                eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+            }
+        }
         return Ok(nextest_exit);
     }
 
@@ -339,7 +362,6 @@ pub fn collect(
     let total_elapsed = total_start.elapsed();
     let region_count: usize = mappings.iter().map(|(_, r)| r.len()).sum();
 
-    let mut db = Db::open(project_root)?;
     if let Some(plan) = diff_plan {
         eprintln!(
             "updating coverage for {} tests ({region_count} ranges)...",
@@ -386,17 +408,30 @@ struct DiffPlan {
     listed: BTreeSet<TestId>,
 }
 
-/// Run the diff-mode preflight + selection. Returns:
-/// - `Ok(Some(plan))` — there's work to do; caller proceeds with the rerun.
-/// - `Ok(None)` — nothing to recollect (no affected tests, no new tests);
-///   any stale tests were pruned in-place and the caller should short-circuit.
-/// - `Err(_)` — fingerprint mismatch, divergent sha, or query failure.
+/// Result of the `collect --diff` preflight. The variant tells `collect`
+/// whether to invoke nextest or short-circuit, and either way the listing
+/// (carried as `listed`) drives the post-step prune.
+enum DiffOutcome {
+    /// Selection picked at least one test — invoke nextest with `Plan.filter_expr`,
+    /// then write rows and prune.
+    Plan(DiffPlan),
+    /// Nothing to recollect — no affected tests, no new tests. Caller still
+    /// runs prune so renamed/deleted tests' rows go away.
+    NothingToRecollect {
+        listed: BTreeSet<TestId>,
+    },
+}
+
+/// Run the diff-mode preflight + selection. Read-only against `db` — any
+/// row replacement or prune happens at the `collect` call site so the DB
+/// write surface stays in one place. Bails out on fingerprint mismatch
+/// (no stored coverage) or every-sha-diverged (nothing reachable to query).
 fn plan_diff_collect(
     project_root: &Path,
+    db: &Db,
     env_fingerprint: &str,
     listing: &Listing,
-) -> Result<Option<DiffPlan>> {
-    let mut db = Db::open(project_root)?;
+) -> Result<DiffOutcome> {
     let prior_shas = db.collect_shas(env_fingerprint)?;
     if prior_shas.is_empty() {
         bail!(
@@ -405,11 +440,11 @@ fn plan_diff_collect(
              no stored coverage matches"
         );
     }
-    let reach = check_shas_reachable(project_root, &prior_shas)?;
+    let reach = selection::check_shas_reachable(project_root, &prior_shas)?;
     if !reach.diverged.is_empty() {
         eprintln!(
             "{}",
-            diverged_shas_notice(
+            selection::diverged_shas_notice(
                 &reach.diverged,
                 "will be rerun and re-anchored at the new HEAD",
             ),
@@ -430,9 +465,9 @@ fn plan_diff_collect(
         );
     }
 
-    let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
+    let changed_ranges_by_sha = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
     let sel = selection::compute(
-        &db,
+        db,
         env_fingerprint,
         &reach.reachable,
         &changed_ranges_by_sha,
@@ -440,17 +475,12 @@ fn plan_diff_collect(
     )?;
     let selected = sel.selected();
     if selected.is_empty() {
-        let pruned = db.prune_missing_tests(env_fingerprint, &sel.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
-        return Ok(None);
+        return Ok(DiffOutcome::NothingToRecollect { listed: sel.listed });
     }
 
     eprintln!("\n{}\n", selection::format_summary(&sel, "to recollect", false));
     let selected_vec: Vec<TestId> = selected.into_iter().collect();
-    Ok(Some(DiffPlan {
+    Ok(DiffOutcome::Plan(DiffPlan {
         filter_expr: nextest_filter_expr(&selected_vec),
         listed: sel.listed,
     }))

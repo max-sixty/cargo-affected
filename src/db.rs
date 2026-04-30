@@ -158,6 +158,44 @@ fn in_placeholders(start_idx: usize, count: usize) -> String {
         .join(", ")
 }
 
+/// Delete every `test_regions` row matching one of `tests`, scoped to
+/// `fingerprint`. One DELETE per chunk instead of one per test, so a `--diff`
+/// touching many tests doesn't hammer SQLite with N round-trips. Chunked so
+/// the parameter count stays well under SQLite's default
+/// `SQLITE_MAX_VARIABLE_NUMBER` (999 on older builds, 32766 on modern ones).
+fn batch_delete_tests<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    fingerprint: &str,
+    tests: impl IntoIterator<Item = &'a TestId>,
+) -> Result<()> {
+    let tests: Vec<&TestId> = tests.into_iter().collect();
+    if tests.is_empty() {
+        return Ok(());
+    }
+    // 400 pairs → 801 bound parameters, comfortably below the conservative
+    // 999 limit. SQLite's row-tuple `IN ((?, ?), …)` syntax isn't universally
+    // supported across versions, so we expand into an OR predicate, which the
+    // planner reduces to the same lookup.
+    const CHUNK: usize = 400;
+    for chunk in tests.chunks(CHUNK) {
+        let predicate = (0..chunk.len())
+            .map(|i| format!("(binary_id = ?{} AND test_name = ?{})", 2 + i * 2, 3 + i * 2))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "DELETE FROM test_regions \
+             WHERE env_fingerprint = ?1 AND ({predicate})"
+        );
+        let params = std::iter::once(fingerprint).chain(
+            chunk
+                .iter()
+                .flat_map(|t| [t.binary_id.as_str(), t.test_name.as_str()]),
+        );
+        tx.execute(&sql, rusqlite::params_from_iter(params))?;
+    }
+    Ok(())
+}
+
 /// Insert every `(test_id, range)` pair as a `test_regions` row anchored at
 /// `collect_sha`. Shared between [`Db::store_coverage`] and
 /// [`Db::update_coverage_for_tests`] — both insert the same shape.
@@ -261,19 +299,7 @@ impl Db {
         mappings: &[(TestId, BTreeSet<HitRange>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        {
-            let mut delete_stmt = tx.prepare(
-                "DELETE FROM test_regions \
-                 WHERE env_fingerprint = ?1 AND binary_id = ?2 AND test_name = ?3",
-            )?;
-            for (test_id, _) in mappings {
-                delete_stmt.execute(rusqlite::params![
-                    fingerprint,
-                    test_id.binary_id,
-                    test_id.test_name,
-                ])?;
-            }
-        }
+        batch_delete_tests(&tx, fingerprint, mappings.iter().map(|(t, _)| t))?;
         insert_mappings(&tx, fingerprint, new_collect_sha, mappings)?;
         touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
@@ -291,9 +317,12 @@ impl Db {
         fingerprint: &str,
         present: &BTreeSet<TestId>,
     ) -> Result<usize> {
-        let tx = self.conn.transaction()?;
+        // Read with a plain `&Connection` so the no-op case (everything in
+        // the listing is already in the DB) doesn't open a write
+        // transaction at all. WAL gives us a snapshot read that won't see
+        // mid-flight changes from another collect.
         let stored: BTreeSet<TestId> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = self.conn.prepare(
                 "SELECT DISTINCT binary_id, test_name FROM test_regions \
                  WHERE env_fingerprint = ?1",
             )?;
@@ -305,19 +334,11 @@ impl Db {
             rows
         };
         let to_drop: Vec<TestId> = stored.difference(present).cloned().collect();
-        {
-            let mut delete_stmt = tx.prepare(
-                "DELETE FROM test_regions \
-                 WHERE env_fingerprint = ?1 AND binary_id = ?2 AND test_name = ?3",
-            )?;
-            for test in &to_drop {
-                delete_stmt.execute(rusqlite::params![
-                    fingerprint,
-                    test.binary_id,
-                    test.test_name,
-                ])?;
-            }
+        if to_drop.is_empty() {
+            return Ok(0);
         }
+        let tx = self.conn.transaction()?;
+        batch_delete_tests(&tx, fingerprint, to_drop.iter())?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit prune"))?;
         Ok(to_drop.len())
