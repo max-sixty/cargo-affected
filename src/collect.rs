@@ -122,6 +122,20 @@ pub fn collect(
     }
     std::fs::create_dir_all(&profraw_dir).context("failed to create profraw dir")?;
 
+    // Set LLVM_PROFILE_FILE on our own process so every spawned subprocess
+    // inherits it, not just the cargo invocations whose env we set explicitly.
+    // Without this, an instrumented binary the pipeline reaches indirectly —
+    // proc-macros loaded into rustc, build scripts that re-exec, etc. — falls
+    // back to LLVM's default `default_<hash>_<pid>.profraw` in cwd and litters
+    // the project root. The runner shim (per-test) overrides this for tests.
+    //
+    // SAFETY: set_var is process-global. Single-threaded at this point —
+    // collect() runs on main and only spawns the worker pool later.
+    let build_pattern = profraw_dir.join("build-%p-%m.profraw");
+    unsafe {
+        std::env::set_var("LLVM_PROFILE_FILE", &build_pattern);
+    }
+
     // Per-target sentinel set keyed by nextest's `binary_id`. Each test's
     // sentinel ranges cover its own crate root, its package's lib (if it's
     // not the lib itself), and the libs of any workspace packages it
@@ -929,13 +943,44 @@ fn list_test_dirs(profraw_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// Remove all .profraw files in the given directory (non-recursive).
-fn clean_profraw_files(dir: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "profraw") {
-            std::fs::remove_file(&path)?;
+/// Remove every `.profraw` under `project_root`, except those inside
+/// `target/` (where our own per-test profraws live). Top-level cleanup
+/// alone misses leaks dropped by build scripts and proc-macros that run
+/// with their package's directory as cwd; this walks the source tree.
+fn clean_profraw_files(project_root: &Path) -> Result<()> {
+    let target = project_root.join("target");
+    let mut stack = vec![project_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // Skip our own intentional profraw storage and the dotfiles that
+        // never contain build artifacts but bloat the walk.
+        if dir == target {
+            continue;
+        }
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            if name == ".git" || name == "node_modules" {
+                continue;
+            }
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", dir.display()))
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let path = entry.path();
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() && path.extension().is_some_and(|e| e == "profraw") {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+            }
         }
     }
     Ok(())
@@ -1164,5 +1209,44 @@ mod tests {
             err.to_string().contains("not in the initial listing"),
             "expected missing-triple error, got: {err}"
         );
+    }
+
+    #[test]
+    fn clean_profraw_files_walks_subdirs_and_skips_target() -> Result<()> {
+        // Stray profraws can land in any package directory whose build script
+        // ran with cwd=that-package — not just the workspace root. The sweep
+        // must remove them recursively, while leaving our own per-test
+        // profraws under target/ untouched.
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        // Stray leaks in the source tree at various depths.
+        std::fs::write(root.join("default_111_0_222.profraw"), "")?;
+        std::fs::create_dir_all(root.join("crate-a/src"))?;
+        std::fs::write(root.join("crate-a/default_333_0_444.profraw"), "")?;
+        std::fs::write(root.join("crate-a/src/default_555_0_666.profraw"), "")?;
+
+        // Our own intentional profraw under target/ — must survive.
+        let target_profraw = root.join("target/affected/profraw-1/build-1-2.profraw");
+        std::fs::create_dir_all(target_profraw.parent().unwrap())?;
+        std::fs::write(&target_profraw, "")?;
+
+        // .git holding a fake profraw — should be left alone (we skip .git).
+        std::fs::create_dir_all(root.join(".git/objects"))?;
+        let git_profraw = root.join(".git/objects/dont_touch.profraw");
+        std::fs::write(&git_profraw, "")?;
+
+        // Unrelated file should also survive.
+        std::fs::write(root.join("crate-a/src/lib.rs"), "")?;
+
+        clean_profraw_files(root)?;
+
+        assert!(!root.join("default_111_0_222.profraw").exists());
+        assert!(!root.join("crate-a/default_333_0_444.profraw").exists());
+        assert!(!root.join("crate-a/src/default_555_0_666.profraw").exists());
+        assert!(target_profraw.exists(), "target/ profraws must be preserved");
+        assert!(git_profraw.exists(), ".git profraws must be skipped");
+        assert!(root.join("crate-a/src/lib.rs").exists());
+        Ok(())
     }
 }

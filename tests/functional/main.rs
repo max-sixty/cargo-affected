@@ -30,6 +30,7 @@ mod duplicate_target_names;
 mod fingerprint;
 mod narrowing;
 mod new_test;
+mod no_profraw_leak;
 mod run;
 mod structural;
 mod workspace;
