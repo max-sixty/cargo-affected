@@ -279,48 +279,50 @@ fn run_uses_reachable_shas_when_one_sha_diverges() {
         String::from_utf8_lossy(&diff.stderr),
     );
 
-    // Reset HEAD back to sha0. sha1 is now diverged (orphan), sha0 reachable.
+    // Reset HEAD back to sha0. sha1 is now a sibling (still in the repo via
+    // its loose object, just not on HEAD's lineage); sha0 is HEAD itself.
     git(dir, &["reset", "--hard", "-q", &sha0]);
 
-    // Working tree is clean relative to sha0. Old behavior: any divergence
-    // → widen to all tests. New behavior: keep using sha0's rows; the
-    // test_fa rows (anchored at the now-diverged sha1) appear as "missing"
-    // and surface as a new test, so only test_fa runs.
+    // Working tree is clean relative to sha0. Both shas are reachable: sha0
+    // has zero diff against itself, and sha1's diff against HEAD shows the
+    // `/* edited */` line — which is exactly the line test_fa was last
+    // anchored at. So selection picks test_fa as `affected`, not `new`, and
+    // the other tests stay skipped.
     let run = cargo_affected(dir, &["affected", "run", "-v"]);
     assert!(
         run.status.success(),
-        "run with one diverged sha should succeed: stderr=\n{}\nstdout=\n{}",
+        "run across reachable shas should succeed: stderr=\n{}\nstdout=\n{}",
         String::from_utf8_lossy(&run.stderr),
         String::from_utf8_lossy(&run.stdout),
     );
     let combined = combined_output(&run);
 
-    // Notice fired about the diverged sha.
-    assert!(
-        combined.contains("not reachable from HEAD")
-            && combined.contains("rerun as 'new'"),
-        "expected partial-divergence notice, got:\n{combined}"
-    );
-    // Selection chose exactly one test (test_fa, surfaced as new).
+    // Selection chose exactly one test (test_fa — anchored at sha1, which is
+    // a sibling but reachable, and the diff against it picks up the edit).
     assert!(
         combined.contains("1 tests to run"),
-        "expected '1 tests to run' (test_fa as new), got:\n{combined}"
+        "expected '1 tests to run' (test_fa affected via sha1), got:\n{combined}"
     );
     assert!(
         combined.contains("test_fa"),
         "expected test_fa in selection, got:\n{combined}"
     );
-    // Crucially, *not* a full-suite widening.
+    // Sibling shas are usable, not missing — no full-suite widening, and no
+    // missing-sha notice.
     assert!(
         !combined.contains("running all tests"),
         "should not have widened to running all tests, got:\n{combined}"
     );
+    assert!(
+        !combined.contains("not in the repo"),
+        "sha1 is a sibling, not missing; should not emit the missing-sha notice, got:\n{combined}"
+    );
 
-    // The diverged sha's rows specifically must still be in the DB —
-    // they're not auto-dropped; `cargo affected clean` is the cure.
+    // Sha1's rows are still in the DB. `cargo affected clean` is the cure
+    // for stale rows; `run` doesn't auto-prune.
     let db_path = dir.join("target/affected/coverage.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let diverged_row_count: i64 = conn
+    let sibling_row_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM test_regions WHERE collect_sha = ?1",
             [&sha1],
@@ -328,8 +330,8 @@ fn run_uses_reachable_shas_when_one_sha_diverges() {
         )
         .unwrap();
     assert!(
-        diverged_row_count > 0,
-        "rows anchored at diverged sha {sha1} should remain in the DB; got {diverged_row_count}",
+        sibling_row_count > 0,
+        "rows anchored at sibling sha {sha1} should remain in the DB; got {sibling_row_count}",
     );
 }
 
@@ -400,16 +402,21 @@ fn run_unions_affected_and_stranded_when_partially_diverged() {
     );
 }
 
+/// `collect --diff` with a sibling `collect_sha` succeeds: the diff
+/// resolves both trees, selection feeds nextest, the rerun re-anchors
+/// every affected test at the new HEAD. Old behavior bailed because
+/// "not an ancestor" was treated as fatal — but the diff is still
+/// meaningful, so there's no reason to refuse.
 #[test]
-fn diff_collect_errors_when_sha_diverged() {
+fn diff_collect_succeeds_when_sha_is_sibling() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_two_module_project(dir, "sample_diff_collect_diverged");
+    write_two_module_project(dir, "sample_diff_collect_sibling");
     init_git_with_initial_commit(dir);
     let init_sha = git_head(dir);
 
     // Add a commit, collect at it, then reset back. The recorded collect_sha
-    // is now an orphan (present in the repo, not an ancestor of HEAD).
+    // is a sibling (present in the repo, not an ancestor of HEAD).
     std::fs::write(dir.join("src/extra.rs"), "pub fn extra() -> i32 { 1 }\n").unwrap();
     let lib_path = dir.join("src/lib.rs");
     let lib = std::fs::read_to_string(&lib_path).unwrap();
@@ -428,15 +435,15 @@ fn diff_collect_errors_when_sha_diverged() {
 
     let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
     assert!(
-        !diff.status.success(),
-        "collect --diff with a diverged collect_sha should fail; got success:\nstderr=\n{}",
+        diff.status.success(),
+        "collect --diff with a sibling collect_sha should succeed:\nstderr=\n{}\nstdout=\n{}",
         String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
     );
-
     let stderr = String::from_utf8_lossy(&diff.stderr);
     assert!(
-        stderr.contains("not reachable from HEAD"),
-        "expected 'not reachable from HEAD' in error, got:\n{stderr}"
+        !stderr.contains("not in the repo"),
+        "sibling sha must not be reported as missing, got:\n{stderr}"
     );
 }
 

@@ -71,12 +71,12 @@ pub fn status(verbose: bool) -> Result<()> {
     println!("collect shas: {}", sha_list.join(", "));
 
     let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
-    if !reach.diverged.is_empty() {
-        let stale_rows = db.region_count_at_shas(&env_fingerprint, &reach.diverged)?;
+    if !reach.missing.is_empty() {
+        let stale_rows = db.region_count_at_shas(&env_fingerprint, &reach.missing)?;
         println!(
-            "\n{}\nstale rows: {stale_rows} (anchored at diverged sha{})",
-            selection::diverged_shas_notice(&reach.diverged, "would rerun as 'new'"),
-            if reach.diverged.len() == 1 { "" } else { "s" },
+            "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
+            selection::missing_shas_notice(&reach.missing, "would rerun as 'new'"),
+            if reach.missing.len() == 1 { "" } else { "s" },
         );
     }
     if reach.reachable.is_empty() {
