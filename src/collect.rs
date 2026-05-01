@@ -455,7 +455,7 @@ enum DiffOutcome {
 /// Run the diff-mode preflight + selection. Read-only against `db` — any
 /// row replacement or prune happens at the `collect` call site so the DB
 /// write surface stays in one place. Bails out on fingerprint mismatch
-/// (no stored coverage) or every-sha-diverged (nothing reachable to query).
+/// (no stored coverage) or every-sha-missing (nothing reachable to query).
 fn plan_diff_collect(
     project_root: &Path,
     db: &Db,
@@ -471,11 +471,11 @@ fn plan_diff_collect(
         );
     }
     let reach = selection::check_shas_reachable(project_root, &prior_shas)?;
-    if !reach.diverged.is_empty() {
+    if !reach.missing.is_empty() {
         eprintln!(
             "{}",
-            selection::diverged_shas_notice(
-                &reach.diverged,
+            selection::missing_shas_notice(
+                &reach.missing,
                 "will be rerun and re-anchored at the new HEAD",
             ),
         );

@@ -17,19 +17,24 @@ pub struct LineRange {
 /// How a stored sha relates to the current `HEAD`.
 ///
 /// `Equal` — same commit, no drift.
-/// `Ancestor` — committed `commits_ahead` commits since collect; stored line
-/// numbers still align (collect_sha is in current history) but the diff
-/// against working tree includes those committed changes, so selection is
-/// noisier than necessary.
-/// `Diverged` — collect_sha is not reachable from HEAD (rebased, branch
-/// switched, garbage-collected, beyond shallow boundary). Stored line numbers
-/// no longer share a coordinate system with the working tree; the cache is
-/// unsafe to use.
+/// `Reachable` — sha exists in the repo. `commits_ahead` is the number of
+/// commits in `HEAD` that aren't in the sha (`git rev-list --count
+/// {sha}..HEAD`); zero when sha is the immediate parent of HEAD or shares its
+/// tip. The OLD-side line numbers in `git diff <sha> HEAD` still belong to
+/// the sha's coordinate system, which matches stored coverage ranges, so
+/// selection works whether the sha is a strict ancestor or a sibling on a
+/// different branch (CI's typical PR shape: cached collect ran on the latest
+/// main commit, which is *ahead of* the PR's merge-base rather than behind
+/// HEAD). Sibling diffs over-select for any commits-on-main-but-not-on-PR;
+/// strict ancestors don't have that noise.
+/// `Missing` — sha is not in the repo (rebased and pruned, garbage-collected,
+/// or beyond a shallow clone boundary). The diff has no anchor and the cache
+/// is unusable; tests anchored at this sha rerun as new.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShaRelation {
     Equal,
-    Ancestor { commits_ahead: u32 },
-    Diverged,
+    Reachable { commits_ahead: u32 },
+    Missing,
 }
 
 /// Project root information.
@@ -396,22 +401,24 @@ pub fn git_head_sha(project_root: &Path) -> Result<String> {
 
 /// Compare `sha` against current `HEAD` for drift reporting.
 ///
-/// Uses `git merge-base --is-ancestor` (exit 0 = ancestor, 1 = not ancestor;
-/// any non-zero exit folds into `Diverged` because the user-visible cure is
-/// the same: recollect — whether the sha was rebased away, garbage-collected,
-/// or simply beyond a shallow clone boundary).
+/// `Missing` only when the sha is not in the repo at all — rebased and
+/// pruned, garbage-collected, or beyond a shallow clone boundary. A sha that
+/// exists but isn't an ancestor of HEAD (sibling branches, post-`git reset`
+/// orphans, the PR-vs-main-tip shape) is still `Reachable`: `git diff <sha>
+/// HEAD` resolves the trees fine, and stored coverage ranges live in `sha`'s
+/// coordinate system, which matches the diff's OLD side either way.
 pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
     let head = git_head_sha(project_root)?;
     if head == sha {
         return Ok(ShaRelation::Equal);
     }
-    let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+    let exists = Command::new("git")
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
         .current_dir(project_root)
         .output()
-        .with_context(|| format!("failed to run git merge-base --is-ancestor {sha} HEAD"))?;
-    if !status.status.success() {
-        return Ok(ShaRelation::Diverged);
+        .with_context(|| format!("failed to run git cat-file -e {sha}"))?;
+    if !exists.status.success() {
+        return Ok(ShaRelation::Missing);
     }
     let lines = run_git(
         project_root,
@@ -424,7 +431,7 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
         .trim()
         .parse::<u32>()
         .context("git rev-list --count returned non-numeric output")?;
-    Ok(ShaRelation::Ancestor { commits_ahead: count })
+    Ok(ShaRelation::Reachable { commits_ahead: count })
 }
 
 /// Per-file changed line ranges between `collect_sha` and the working tree.
@@ -799,41 +806,44 @@ mod tests {
 
         assert_eq!(
             relation_to_head(dir.path(), &collect_sha)?,
-            ShaRelation::Ancestor { commits_ahead: 3 }
+            ShaRelation::Reachable { commits_ahead: 3 }
         );
         Ok(())
     }
 
     #[test]
-    fn relation_to_head_diverged_after_reset() -> Result<()> {
+    fn relation_to_head_reachable_after_reset() -> Result<()> {
         let dir = tempfile::tempdir()?;
         init_repo(dir.path())?;
         let init_sha = git_head_sha(dir.path())?;
 
         // Create a commit, capture its sha, then reset HEAD back. The captured
         // sha is now a sibling of HEAD's history — present in the repo but
-        // not an ancestor.
+        // not an ancestor. `git diff <sha> HEAD` still resolves both trees,
+        // so the cache is usable; classify as Reachable.
         std::fs::write(dir.path().join("a.txt"), b"x")?;
         git(dir.path(), &["add", "a.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "B"]);
         let b_sha = git_head_sha(dir.path())?;
         git(dir.path(), &["reset", "--hard", "-q", &init_sha]);
 
-        assert_eq!(
-            relation_to_head(dir.path(), &b_sha)?,
-            ShaRelation::Diverged
+        let rel = relation_to_head(dir.path(), &b_sha)?;
+        assert!(
+            matches!(rel, ShaRelation::Reachable { .. }),
+            "expected Reachable, got {rel:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn relation_to_head_diverged_when_sha_missing() -> Result<()> {
+    fn relation_to_head_missing_when_sha_absent() -> Result<()> {
         let dir = tempfile::tempdir()?;
         init_repo(dir.path())?;
-        // Sha that doesn't exist in the repo at all — folds into Diverged.
+        // Sha that doesn't exist in the repo at all — only this case is
+        // Missing; the diff has no anchor to resolve.
         assert_eq!(
             relation_to_head(dir.path(), "deadbeef00000000000000000000000000000000")?,
-            ShaRelation::Diverged
+            ShaRelation::Missing
         );
         Ok(())
     }

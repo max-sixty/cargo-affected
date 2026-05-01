@@ -1,15 +1,16 @@
-//! collect_sha drift: when the recorded `collect_sha` is no longer reachable
-//! from HEAD (rebased away, branch switched, history rewritten), stored line
-//! numbers no longer share a coordinate system with the working tree.
-//! `status` mirrors `run`'s widening — it reports "would run all tests" with
-//! a re-anchor hint, so the dry-run accurately predicts what `run` would do.
+//! Sibling-vs-missing collect_sha behavior in `status`. A sibling sha
+//! (still in the repo, just not on HEAD's lineage) keeps coverage usable —
+//! `status` should report a normal selection summary, not widen to the
+//! full suite. Only a sha the repo doesn't have at all (rebased and
+//! garbage-collected, beyond a shallow boundary) trips the
+//! "would run all tests" path.
 
 use crate::{
     cargo_affected, git, git_head, init_git_with_initial_commit, write_two_module_project,
 };
 
 #[test]
-fn unreachable_collect_sha_status_reports_full_suite() {
+fn sibling_collect_sha_status_uses_selection() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_two_module_project(dir, "sample_drift");
@@ -18,8 +19,8 @@ fn unreachable_collect_sha_status_reports_full_suite() {
 
     // Make a second commit so we have something to collect against and
     // something to reset back from. After collect, we'll reset HEAD back to
-    // the initial commit — the second commit's sha (where collect ran) will
-    // become unreachable.
+    // the initial commit — the second commit's sha (where collect ran)
+    // becomes a sibling: still in the repo, not an ancestor of HEAD.
     std::fs::write(
         dir.join("src/extra.rs"),
         "pub fn extra() -> i32 { 1 }\n",
@@ -40,30 +41,23 @@ fn unreachable_collect_sha_status_reports_full_suite() {
         String::from_utf8_lossy(&collect.stderr)
     );
 
-    // Reset HEAD back to the initial commit. The collect_sha (collect_commit)
-    // is now an orphaned object — present in the repo, but not an ancestor
-    // of HEAD. relation_to_head will return Diverged.
     git(dir, &["reset", "--hard", "-q", &init_sha]);
 
     let status = cargo_affected(dir, &["affected", "status"]);
     assert!(
         status.status.success(),
-        "status should succeed and report full-suite widening, got failure:\nstdout=\n{}\nstderr=\n{}",
+        "status with sibling collect_sha should succeed, got failure:\nstdout=\n{}\nstderr=\n{}",
         String::from_utf8_lossy(&status.stdout),
         String::from_utf8_lossy(&status.stderr)
     );
 
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
-        stdout.contains("not reachable from HEAD"),
-        "expected 'not reachable from HEAD' in notice, got:\n{stdout}"
+        !stdout.contains("would run all tests"),
+        "sibling collect_sha must not trigger full-suite widening, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("would run all tests"),
-        "expected 'would run all tests' in notice, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("re-anchor") || stdout.contains("collect"),
-        "expected re-anchor / collect hint in notice, got:\n{stdout}"
+        !stdout.contains("not in the repo"),
+        "sibling collect_sha must not be reported as missing, got:\n{stdout}"
     );
 }

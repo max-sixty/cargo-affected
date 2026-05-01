@@ -12,10 +12,10 @@
 //! ranges per sha so each row's hunk overlap is computed in matching
 //! coordinates.
 //!
-//! Reachability is per-sha: diverged shas are skipped and tests stranded
+//! Reachability is per-sha: missing shas are skipped and tests stranded
 //! only at them surface as "new" via selection. Widening to all tests
 //! happens only when the cache offers nothing usable — no coverage yet,
-//! fingerprint mismatch, or every stored sha unreachable from HEAD. That
+//! fingerprint mismatch, or every stored sha missing from the repo. That
 //! makes `cargo affected run` a strict superset of `cargo nextest run` —
 //! always at least as safe.
 
@@ -68,10 +68,10 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
 
     let collect_shas = db.collect_shas(&env_fingerprint)?;
     let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
-    if !reach.diverged.is_empty() {
+    if !reach.missing.is_empty() {
         eprintln!(
             "{}",
-            selection::diverged_shas_notice(&reach.diverged, "will rerun as 'new'")
+            selection::missing_shas_notice(&reach.missing, "will rerun as 'new'")
         );
     }
     if reach.reachable.is_empty() {
