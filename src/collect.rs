@@ -184,9 +184,6 @@ pub fn collect(
         .collect();
     let binary_map_path = profraw_dir.join("binary_map.json");
 
-    // Stray profraw files left in project root by the list-step build.
-    clean_profraw_files(project_root)?;
-
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.
     let mut db = Db::open(project_root)?;
@@ -232,7 +229,6 @@ pub fn collect(
     let pre_run = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
     let runtime_map = build_runtime_binary_map(&pre_run.binaries, &stable_by_target)?;
     write_binary_map(&binary_map_path, &runtime_map)?;
-    clean_profraw_files(project_root)?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
     // test writes to its own per-test profraw directory.
@@ -264,9 +260,6 @@ pub fn collect(
         .status()
         .context("failed to run cargo nextest run")?;
     let nextest_exit = status.code().unwrap_or(1);
-
-    // Sweep any stray profraw files instrumented subprocesses dropped in root.
-    clean_profraw_files(project_root)?;
 
     let test_dirs = list_test_dirs(&profraw_dir)?;
     let total = test_dirs.len();
@@ -927,18 +920,6 @@ fn list_test_dirs(profraw_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
-}
-
-/// Remove all .profraw files in the given directory (non-recursive).
-fn clean_profraw_files(dir: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "profraw") {
-            std::fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
 }
 
 /// List all .profraw files in the given directory.
