@@ -37,9 +37,14 @@ cargo affected clean      # wipe the coverage cache
 the last collect adds to the diff and broadens selection.
 
 When the coverage cache can't anchor a precise selection — no coverage yet,
-environment fingerprint changed, missing or unreachable `collect_sha` — `run`
-emits a stderr notice and runs every test. `cargo affected run` is therefore
-a strict superset of `cargo nextest run`: always at least as safe.
+environment fingerprint changed, every recorded `collect_sha` missing from
+the repo (rebased and pruned, garbage-collected, beyond a shallow boundary) —
+`run` emits a stderr notice and runs every test. A `collect_sha` that is
+*present* in the repo but not on `HEAD`'s lineage (siblings, post-`reset`
+orphans, the CI PR-vs-main-tip shape) is still usable: `git diff <sha>
+HEAD` resolves either way and stored ranges live in the sha's coordinate
+system. `cargo affected run` is therefore a strict superset of `cargo
+nextest run`: always at least as safe.
 
 ## How it works
 
@@ -124,15 +129,16 @@ the current source's checksums against the stored ones on every test run.
 | When state updates      | Explicit `cargo affected collect`                                           | Silently after every test run                                     | n/a                                                  | On every build                         |
 | Whitespace/comment edits | Count as changes (text diff)                                                | Ignored (checksums stable across formatting)                      | Count (file mtime / diff)                            | Ignored (no source diff)               |
 | Env invalidation        | Fingerprint: `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_BUILD_TARGET` | Python version, env vars, installed package versions             | n/a                                                  | Toolchain + declared inputs            |
-| Falls back to full run when | Fingerprint mismatch, missing/unreachable `collect_sha`, no coverage yet | DB schema mismatch                                                | No git repo / no merge base                          | n/a                                    |
+| Falls back to full run when | Fingerprint mismatch, every recorded `collect_sha` missing from the repo, no coverage yet | DB schema mismatch                                                | No git repo / no merge base                          | n/a                                    |
 
 The trade-off:
 
 - **Anchoring on a SHA** (cargo-affected) means `collect` is a separate,
   explicit step and `run` does cheap text diffs — but it depends on the
-  recorded `collect_sha` still being reachable, and any commit since
-  `collect` widens the diff. Whitespace and comment edits look like real
-  changes because we diff text, not AST.
+  recorded `collect_sha` still being in the repo (any commit reachable by
+  the local `.git/` works, including siblings of `HEAD`), and any commit
+  since `collect` widens the diff. Whitespace and comment edits look like
+  real changes because we diff text, not AST.
 - **Recomputing checksums every run** (testmon) is VCS-agnostic and
   ignores cosmetic edits, at the cost of reparsing all source on every
   invocation and updating the DB on every run.
