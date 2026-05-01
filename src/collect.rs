@@ -251,7 +251,9 @@ pub fn collect(
         .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
     if let Some(plan) = &diff_plan {
-        cmd.arg("-E").arg(plan.filter_expr());
+        for expr in plan.filter_exprs() {
+            cmd.arg("-E").arg(expr);
+        }
     }
     for a in nextest_args {
         cmd.arg(a);
@@ -402,11 +404,12 @@ struct DiffPlan {
 }
 
 impl DiffPlan {
-    /// Nextest `-E` filter expression matching every selected test, including
-    /// phantoms — nextest will silently match nothing for those.
-    fn filter_expr(&self) -> String {
+    /// Nextest `-E` filterset expressions matching every selected test,
+    /// including phantoms — nextest will silently match nothing for those.
+    /// Multiple chunks when the test set is large enough to risk `E2BIG`.
+    fn filter_exprs(&self) -> Vec<String> {
         let v: Vec<TestId> = self.selected.iter().cloned().collect();
-        nextest_filter_expr(&v)
+        nextest_filter_exprs(&v)
     }
 
     /// Selected tests that nextest can actually run (those present in the
@@ -658,14 +661,24 @@ fn extract_one(
     }
 }
 
-/// Build a nextest `-E` filter expression matching exactly the given tests,
-/// grouped by binary_id so one `binary_id(=X)` predicate covers each crate's
-/// tests: `(binary_id(=X) & (test(=a) | test(=b))) | (binary_id(=Y) & test(=c))`.
+/// Build nextest `-E` filterset expressions matching exactly the given tests,
+/// grouped by `binary_id`. Each returned chunk is a complete expression of the
+/// form `(binary_id(=X) & (test(=a) | test(=b)))`; nextest ORs multiple `-E`
+/// flags together.
 ///
 /// `binary_id()` (not `binary()`) is the right predicate: the latter matches
 /// the short binary name (e.g. `builds`) and so doesn't disambiguate
 /// same-named binaries across workspace crates.
-pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
+///
+/// The split exists because Linux's `MAX_ARG_STRLEN` caps a single argv string
+/// at ~128 KB. A workspace with ~1900 selected tests overflows that as one
+/// expression and `execve` fails with `E2BIG`. We emit one chunk per binary,
+/// further splitting a binary's tests across chunks when its predicate alone
+/// would exceed `FILTER_EXPR_MAX_BYTES`.
+pub(crate) fn nextest_filter_exprs(tests: &[TestId]) -> Vec<String> {
+    /// Cap per `-E` argument; conservative versus the 128 KB OS limit so the
+    /// command line as a whole stays comfortably under it.
+    const FILTER_EXPR_MAX_BYTES: usize = 60_000;
     let mut by_binary: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
     for t in tests {
@@ -674,18 +687,33 @@ pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
             .or_default()
             .push(t.test_name.as_str());
     }
-    by_binary
-        .into_iter()
-        .map(|(binary_id, names)| {
-            let inner = names
-                .iter()
-                .map(|n| format!("test(={n})"))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            format!("(binary_id(={binary_id}) & ({inner}))")
-        })
-        .collect::<Vec<_>>()
-        .join(" | ")
+    let mut exprs: Vec<String> = Vec::new();
+    for (binary_id, names) in by_binary {
+        let wrapper = format!("(binary_id(={binary_id}) & ())");
+        let inner_budget = FILTER_EXPR_MAX_BYTES.saturating_sub(wrapper.len());
+        let mut inner = String::new();
+        let flush = |inner: &mut String, exprs: &mut Vec<String>| {
+            if !inner.is_empty() {
+                exprs.push(format!("(binary_id(={binary_id}) & ({inner}))"));
+                inner.clear();
+            }
+        };
+        for n in &names {
+            let item_len = "test(=)".len() + n.len();
+            let sep_len = if inner.is_empty() { 0 } else { " | ".len() };
+            if !inner.is_empty() && inner.len() + sep_len + item_len > inner_budget {
+                flush(&mut inner, &mut exprs);
+            }
+            if !inner.is_empty() {
+                inner.push_str(" | ");
+            }
+            inner.push_str("test(=");
+            inner.push_str(n);
+            inner.push(')');
+        }
+        flush(&mut inner, &mut exprs);
+    }
+    exprs
 }
 
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
@@ -1018,25 +1046,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filter_expr_empty() {
-        assert_eq!(nextest_filter_expr(&[]), "");
+    fn filter_exprs_empty() {
+        assert!(nextest_filter_exprs(&[]).is_empty());
     }
 
     #[test]
-    fn filter_expr_groups_by_binary() {
+    fn filter_exprs_one_per_binary() {
         let tests = vec![
             TestId::new("mock-stub::builds", "builds"),
             TestId::new("wt-perf::builds", "builds"),
             TestId::new("worktrunk", "utils::tests::test_x"),
             TestId::new("worktrunk", "utils::tests::test_y"),
         ];
-        let expr = nextest_filter_expr(&tests);
+        let exprs = nextest_filter_exprs(&tests);
         assert_eq!(
-            expr,
-            "(binary_id(=mock-stub::builds) & (test(=builds))) | \
-             (binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y))) | \
-             (binary_id(=wt-perf::builds) & (test(=builds)))"
+            exprs,
+            vec![
+                "(binary_id(=mock-stub::builds) & (test(=builds)))".to_string(),
+                "(binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y)))".to_string(),
+                "(binary_id(=wt-perf::builds) & (test(=builds)))".to_string(),
+            ]
         );
+    }
+
+    /// Regression: ~1900 tests in one binary used to produce a single 80+ KB
+    /// `-E` argument and `execve` failed with `Argument list too long (E2BIG)`.
+    /// Each chunk must stay under ~60 KB and round-trip the full set.
+    #[test]
+    fn filter_exprs_chunks_oversized_binary() {
+        let names: Vec<String> = (0..2000).map(|i| format!("really_long_test_name_for_chunking_check_{i}")).collect();
+        let tests: Vec<TestId> = names
+            .iter()
+            .map(|n| TestId::new("worktrunk", n))
+            .collect();
+        let exprs = nextest_filter_exprs(&tests);
+        assert!(exprs.len() > 1, "expected chunking, got {} chunk(s)", exprs.len());
+        for expr in &exprs {
+            assert!(
+                expr.len() < 65_000,
+                "chunk too large: {} bytes",
+                expr.len()
+            );
+            assert!(expr.starts_with("(binary_id(=worktrunk) & ("));
+            assert!(expr.ends_with("))"));
+        }
+        // Every test name appears exactly once across all chunks.
+        let combined = exprs.join(" | ");
+        for n in &names {
+            assert!(
+                combined.contains(&format!("test(={n})")),
+                "missing {n}"
+            );
+        }
     }
 
     fn entry(

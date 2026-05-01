@@ -24,7 +24,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::collect::{nextest_filter_expr, nextest_list, require_nextest};
+use crate::collect::{nextest_filter_exprs, nextest_list, require_nextest};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
 use crate::project::{find_project_root, git_changed_files};
@@ -129,8 +129,8 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
 }
 
 /// Run tests via `cargo nextest run`. `tests == None` runs all tests;
-/// `Some(tests)` filters to the given set via a nextest `-E` expression of
-/// the form `(binary(=X) & (test(=a) | test(=b))) | ...`.
+/// `Some(tests)` filters to the given set via one or more nextest `-E`
+/// filterset arguments (split to stay under the OS argv-string limit).
 /// Returns nextest's exit code so callers can propagate it to CI.
 fn run_tests(
     project_root: &Path,
@@ -141,9 +141,10 @@ fn run_tests(
     cmd.arg("nextest").arg("run");
     match tests {
         Some(ts) => {
-            let filter_expr = nextest_filter_expr(ts);
             eprintln!("running {} tests with nextest", ts.len());
-            cmd.arg("-E").arg(&filter_expr);
+            for expr in nextest_filter_exprs(ts) {
+                cmd.arg("-E").arg(expr);
+            }
         }
         None => eprintln!("running all tests with nextest"),
     }
