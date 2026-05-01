@@ -72,3 +72,51 @@ fn collect_leaves_no_profraw_outside_target() {
             .join("\n  "),
     );
 }
+
+/// A successful collect must drop the per-PID `target/affected/profraw-*/`
+/// staging dir. The bundles in there feed the in-process llvm-cov extraction
+/// once and have no further use; on a real workspace they run to ~10+ GB,
+/// blowing the GitHub Actions cache cap when archived.
+#[test]
+fn collect_removes_profraw_staging_dir_on_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_profraw_cleanup");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    let affected = dir.join("target").join("affected");
+    let leftovers: Vec<PathBuf> = std::fs::read_dir(&affected)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("profraw-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "expected no profraw-* dirs under target/affected after collect, found:\n  {}",
+        leftovers
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    );
+    // Sanity: the DB the cleanup is supposed to preserve must still be there.
+    assert!(
+        affected.join("coverage.db").exists(),
+        "coverage.db missing after collect"
+    );
+}

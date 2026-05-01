@@ -266,13 +266,15 @@ pub fn collect(
     let test_dirs = list_test_dirs(&profraw_dir)?;
     let total = test_dirs.len();
     if total == 0 {
-        return handle_no_profraw_dirs(
+        let exit = handle_no_profraw_dirs(
             &mut db,
             &env_fingerprint,
             diff_plan.as_ref(),
             nextest_exit,
             &profraw_dir,
-        );
+        )?;
+        remove_profraw_dir(&profraw_dir)?;
+        return Ok(exit);
     }
 
     let num_workers = std::thread::available_parallelism()
@@ -384,7 +386,23 @@ pub fn collect(
         region_count,
         total_elapsed.as_secs_f64(),
     );
+    remove_profraw_dir(&profraw_dir)?;
     Ok(nextest_exit)
+}
+
+/// Drop the per-collect profraw directory. The raw profile bundles inside
+/// (~10 GB on a workspace this size) feed only the in-process `llvm-profdata`
+/// → `llvm-cov` extraction; once the resulting hit-ranges land in
+/// `coverage.db` they have no further use, and leaving them on disk wastes
+/// space locally and overflows the GitHub Actions repo cache cap in CI.
+/// Only called from the success paths — failed collects keep their bundles
+/// for debugging.
+fn remove_profraw_dir(profraw_dir: &Path) -> Result<()> {
+    if !profraw_dir.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(profraw_dir)
+        .with_context(|| format!("failed to remove profraw dir {}", profraw_dir.display()))
 }
 
 /// Plan for the rerun side of `collect --diff`: which tests to invoke
