@@ -51,10 +51,11 @@ enum Action {
         /// and selection will silently mis-target. Use only for throwaway runs.
         #[arg(long)]
         allow_dirty: bool,
-        /// Extra args forwarded to `cargo nextest run` (e.g. `--features foo`).
-        /// Captures every arg after the subcommand once an unknown one
-        /// appears, including hyphenated values; use `--` to be explicit.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Extra args forwarded to `cargo nextest run`. Must be preceded by
+        /// `--` (e.g. `cargo affected collect -- --features foo`); otherwise
+        /// clap rejects unknown flags rather than risk swallowing one of
+        /// cargo-affected's own (e.g. `--verbose`).
+        #[arg(last = true)]
         nextest_args: Vec<String>,
     },
     /// Run only tests affected by current git changes.
@@ -62,10 +63,11 @@ enum Action {
         /// Run all tests, skipping coverage-based selection.
         #[arg(long)]
         all: bool,
-        /// Extra args forwarded to `cargo nextest run` (e.g. `--features foo`).
-        /// Captures every arg after the subcommand once an unknown one
-        /// appears, including hyphenated values; use `--` to be explicit.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Extra args forwarded to `cargo nextest run`. Must be preceded by
+        /// `--` (e.g. `cargo affected run -- --features foo`); otherwise
+        /// clap rejects unknown flags rather than risk swallowing one of
+        /// cargo-affected's own (e.g. `--verbose`).
+        #[arg(last = true)]
         nextest_args: Vec<String>,
     },
     /// Show stored coverage data and what would run for current changes.
@@ -161,34 +163,47 @@ mod tests {
         Cli::parse_from(argv)
     }
 
-    #[test]
-    fn run_forwards_unknown_flags_without_double_dash() {
-        // Regression: with `last = true`, clap rejected `--features foo` as
-        // an unknown flag. The intent — and the prior behavior — is for
-        // anything cargo-affected doesn't recognise to flow through to nextest.
-        let cli = parse(&["run", "--features", "shell-integration-tests"]);
-        let Action::Run { all, nextest_args } = cli.action else {
-            panic!("expected Run");
-        };
-        assert!(!all);
-        assert_eq!(nextest_args, vec!["--features", "shell-integration-tests"]);
+    /// `try_parse` variant for the error-case tests below — `Cli::parse_from`
+    /// would `process::exit` on a clap error and abort the test run.
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["cargo-affected"];
+        argv.extend(args);
+        Cli::try_parse_from(argv)
     }
 
     #[test]
-    fn run_forwards_trailing_verbose_to_nextest() {
-        // Once the trailing capture starts, `--verbose` after an unknown flag
-        // belongs to nextest, not to cargo-affected.
-        let cli = parse(&["run", "--features", "foo", "--verbose"]);
-        assert!(!cli.verbose);
+    fn run_rejects_unknown_flags_without_double_dash() {
+        // Strict parsing: anything clap doesn't recognise must come after `--`.
+        // The looser "sweep trailing args into nextest_args" behavior would
+        // silently steal cargo-affected's own flags (e.g. `--verbose`).
+        let err = try_parse(&["run", "--features", "shell-integration-tests"])
+            .err()
+            .expect("expected clap to reject unknown flag without --");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn collect_rejects_unknown_flags_without_double_dash() {
+        let err = try_parse(&["collect", "--features", "foo"])
+            .err()
+            .expect("expected clap to reject unknown flag without --");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn run_accepts_explicit_double_dash_separator() {
+        // Args after `--` are forwarded verbatim; the `--` itself is consumed
+        // by the parser.
+        let cli = parse(&["run", "--", "--features", "foo"]);
         let Action::Run { nextest_args, .. } = cli.action else {
             panic!("expected Run");
         };
-        assert_eq!(nextest_args, vec!["--features", "foo", "--verbose"]);
+        assert_eq!(nextest_args, vec!["--features", "foo"]);
     }
 
     #[test]
-    fn collect_forwards_unknown_flags_without_double_dash() {
-        let cli = parse(&["collect", "--features", "foo"]);
+    fn collect_accepts_explicit_double_dash_separator() {
+        let cli = parse(&["collect", "--", "--features", "foo"]);
         let Action::Collect {
             diff,
             allow_dirty,
@@ -203,14 +218,26 @@ mod tests {
     }
 
     #[test]
-    fn run_accepts_explicit_double_dash_separator() {
-        // The documented form still works — args after `--` are forwarded
-        // verbatim, and the `--` itself is consumed by the parser.
-        let cli = parse(&["run", "--", "--features", "foo"]);
+    fn run_keeps_global_verbose_for_cargo_affected() {
+        // Without `--`, `--verbose` is unambiguously cargo-affected's global
+        // flag — the strict parse stops nextest from stealing it.
+        let cli = parse(&["run", "--verbose"]);
+        assert!(cli.verbose);
         let Action::Run { nextest_args, .. } = cli.action else {
             panic!("expected Run");
         };
-        assert_eq!(nextest_args, vec!["--features", "foo"]);
+        assert!(nextest_args.is_empty());
+    }
+
+    #[test]
+    fn run_forwards_verbose_to_nextest_after_double_dash() {
+        // If you really want nextest to see `--verbose`, put it after `--`.
+        let cli = parse(&["run", "--", "--verbose"]);
+        assert!(!cli.verbose);
+        let Action::Run { nextest_args, .. } = cli.action else {
+            panic!("expected Run");
+        };
+        assert_eq!(nextest_args, vec!["--verbose"]);
     }
 
     #[test]
@@ -224,10 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn known_run_flag_still_parses_before_trailing() {
-        // `--all` is a Run-specific flag and should be parsed by clap when
-        // it appears before any unknown argument.
-        let cli = parse(&["run", "--all", "--features", "foo"]);
+    fn known_run_flags_parse_before_double_dash() {
+        // Subcommand-owned flags still parse normally before `--`.
+        let cli = parse(&["run", "--all", "--", "--features", "foo"]);
         let Action::Run { all, nextest_args } = cli.action else {
             panic!("expected Run");
         };
