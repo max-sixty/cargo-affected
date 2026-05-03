@@ -114,6 +114,33 @@ pub fn collect(
     let collect_sha = git_head_sha(project_root)?;
     eprintln!("collect sha: {collect_sha}");
 
+    // Build artifacts live under target/affected/build/ rather than the
+    // project's default target/. Without isolation, cargo's main build phase
+    // compiles every workspace package — including helper binaries pulled in
+    // by `default-members` — into target/debug/ with the
+    // `-C instrument-coverage` we set below. Those instrumented binaries
+    // then linger after `collect` exits, and any later non-coverage
+    // `cargo test` that spawns them writes `default_*.profraw` files to its
+    // CWD. Routing the build into target/affected/build/ keeps the
+    // instrumented copies out of target/debug/, where downstream tooling
+    // (cargo-dist, IDEs, plain `cargo run`) expects clean artifacts.
+    //
+    // The matching `cargo affected run` flow leaves --target-dir unset so
+    // it reuses target/debug/ — the user's normal cache — since `run`
+    // doesn't enable instrumentation.
+    let build_dir = affected_dir(project_root).join("build");
+    std::fs::create_dir_all(&build_dir).context("failed to create build dir")?;
+    // Sweep stale build-script profraws from prior collects; they accumulate
+    // every time a build.rs reruns under instrumentation and aren't useful
+    // between collects (build scripts don't show up in the test coverage we
+    // care about — they ran during compile, not under the runner shim).
+    for entry in std::fs::read_dir(&build_dir).context("scanning build dir")? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|e| e == "profraw") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
     // Profraw files live under target/affected/ alongside the DB. PID suffix
     // so concurrent `collect` invocations don't wipe each other's files.
     let profraw_dir = affected_dir(project_root).join(format!("profraw-{}", std::process::id()));
@@ -169,7 +196,7 @@ pub fn collect(
     // so Cargo.lock is in its final state — status/run will compare against
     // that same state.
     eprintln!("listing tests with cargo nextest list...");
-    let listing = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
+    let listing = nextest_list(project_root, Some(&rustflags), Some(&build_dir))?;
     eprintln!(
         "found {} tests across {} binaries",
         listing.tests.len(),
@@ -226,16 +253,25 @@ pub fn collect(
     if verbose {
         eprintln!("refreshing binary paths before nextest run...");
     }
-    let pre_run = nextest_list(project_root, Some(&rustflags), Some(&profraw_dir))?;
+    let pre_run = nextest_list(project_root, Some(&rustflags), Some(&build_dir))?;
     let runtime_map = build_runtime_binary_map(&pre_run.binaries, &stable_by_target)?;
     write_binary_map(&binary_map_path, &runtime_map)?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
     // test writes to its own per-test profraw directory.
+    //
+    // `--target-dir` routes build artifacts into target/affected/build/. The
+    // build-script LLVM_PROFILE_FILE pattern lives at the target-dir root
+    // so consumers can recover the target-dir via dirname(LLVM_PROFILE_FILE)
+    // — same convention cargo-llvm-cov uses, which lets nextest setup-scripts
+    // that build helper binaries match the runner's target-dir without
+    // having to know cargo-affected's specific layout.
     eprintln!("running tests with cargo nextest run...");
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
         .arg("run")
+        .arg("--target-dir")
+        .arg(&build_dir)
         // `--no-tests=warn` so a filter that matches nothing real (every
         // selected test absent from the listing — common in `--diff` after
         // renames/deletions) doesn't make nextest exit non-zero. We
@@ -248,7 +284,7 @@ pub fn collect(
         .env("CARGO_AFFECTED_PROFRAW_BASE", &profraw_dir)
         .env("CARGO_AFFECTED_BINARY_MAP", &binary_map_path)
         // Catches build-script profraw before the runner shim kicks in for tests.
-        .env("LLVM_PROFILE_FILE", profraw_dir.join("build-%p-%m.profraw"))
+        .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
     if let Some(plan) = &diff_plan {
         for expr in plan.filter_exprs() {
@@ -810,12 +846,15 @@ fn marker_for(suite: &serde_json::Value, project_root: &Path) -> Option<String> 
 ///
 /// `rustflags_override` sets RUSTFLAGS in the child env (collect passes
 /// `-C instrument-coverage`; run/status leave it `None` to inherit the user's
-/// environment). `profraw_dir`, when set, redirects any build-script profraw
-/// so stray files don't land in the project root — only collect needs this.
+/// environment). `build_dir`, when set, routes build artifacts into that
+/// directory (via `--target-dir`) and points LLVM_PROFILE_FILE at the same
+/// directory so build-script profraws land alongside cargo's debug/ tree
+/// rather than in the project root. Only collect passes this — run/status
+/// reuse the user's default target/.
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
-    profraw_dir: Option<&Path>,
+    build_dir: Option<&Path>,
 ) -> Result<Listing> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
@@ -828,7 +867,8 @@ pub(crate) fn nextest_list(
     if let Some(rf) = rustflags_override {
         cmd.env("RUSTFLAGS", rf);
     }
-    if let Some(dir) = profraw_dir {
+    if let Some(dir) = build_dir {
+        cmd.arg("--target-dir").arg(dir);
         cmd.env("LLVM_PROFILE_FILE", dir.join("build-%p-%m.profraw"));
     }
     let output = cmd
