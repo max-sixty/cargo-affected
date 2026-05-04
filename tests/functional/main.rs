@@ -28,6 +28,7 @@ mod dirty;
 mod drift;
 mod duplicate_target_names;
 mod fingerprint;
+mod lib_bin_collision;
 mod narrowing;
 mod new_test;
 mod no_profraw_leak;
