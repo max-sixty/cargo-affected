@@ -33,7 +33,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::coverage::HitRange;
+use crate::coverage::{HitRange, CRATE_ROOT_SENTINEL_END};
 use crate::fingerprint::FingerprintComponent;
 use crate::project::LineRange;
 
@@ -133,6 +133,51 @@ impl TestId {
             test_name: test_name.into(),
         }
     }
+}
+
+/// One hit recorded by [`Db::tests_covering_ranges`]: which test got pulled
+/// in, and the reason for it. A single test can appear multiple times if it
+/// matched several rows or several hunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestHit {
+    pub test_id: TestId,
+    pub reason: HitReason,
+}
+
+/// Why a test was selected. The triple (`file`, `matched_hunk`, `kind`)
+/// describes one path through the selection logic; `stored_range` names the
+/// row that matched (absent for [`HitKind::StructuralBackstop`], where the
+/// whole point is that nothing matched).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitReason {
+    /// `collect_sha` the diff was anchored against. Hunks live in this
+    /// sha's coordinate system; the reason is only meaningful paired with it.
+    pub collect_sha: String,
+    /// Source file the hunk applies to.
+    pub file: String,
+    /// Selection-path classification.
+    pub kind: HitKind,
+    /// The diff hunk that triggered the selection. Inclusive `(start, end)`.
+    pub matched_hunk: (i64, i64),
+    /// The stored row that overlapped the hunk. `None` when [`HitKind::StructuralBackstop`]
+    /// fired (no row overlapped — the test was pulled in by file-presence alone).
+    pub stored_range: Option<(i64, i64)>,
+}
+
+/// How a test ended up in the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    /// A stored function-range row overlapped the hunk's line range.
+    LineOverlap,
+    /// No stored row overlapped the hunk; the test was pulled in because
+    /// its DB rows reference this file (struct-field, derive, const, use,
+    /// mod edits land in lines no test covered directly).
+    StructuralBackstop,
+    /// The stored row was a crate-root sentinel
+    /// ([`crate::coverage::CRATE_ROOT_SENTINEL_END`]) — an "any hunk in
+    /// this file selects this test" link the function-level coverage
+    /// can't observe directly.
+    CrateRootSentinel,
 }
 
 /// How many distinct fingerprints to retain. `gc()` evicts the least-recently-
@@ -398,6 +443,18 @@ impl Db {
     /// file at this sha" (the structural-edit backstop for struct-field,
     /// derive, const, use, mod edits).
     ///
+    /// Each returned [`TestHit`] carries the [`HitReason`] explaining
+    /// selection — which file, which hunk, and which kind of match
+    /// ([`HitKind::LineOverlap`], [`HitKind::CrateRootSentinel`], or
+    /// [`HitKind::StructuralBackstop`]). One unique test can appear
+    /// multiple times if it matched several rows or several hunks, so
+    /// callers that need the deduplicated test set should collect with
+    /// `into_iter().map(|h| h.test_id).collect::<BTreeSet<_>>()` or
+    /// aggregate by the strongest reason — see selection.rs for the
+    /// canonical aggregation. Backstop hits are emitted ONCE per unique
+    /// test per hunk (not once per stored row) so per-reason counters
+    /// remain meaningful.
+    ///
     /// Scoping by `collect_sha` matters because `collect --diff` lets rows
     /// from different collect points coexist for the same fingerprint —
     /// hunks must be matched against rows whose line numbers share a
@@ -414,10 +471,10 @@ impl Db {
         collect_sha: &str,
         file: &str,
         hunks: &[LineRange],
-    ) -> Result<BTreeSet<TestId>> {
-        let mut tests = BTreeSet::new();
+    ) -> Result<Vec<TestHit>> {
+        let mut hits = Vec::new();
         if hunks.is_empty() {
-            return Ok(tests);
+            return Ok(hits);
         }
 
         let mut stmt = self.conn.prepare(
@@ -434,7 +491,7 @@ impl Db {
             })?
             .collect::<rusqlite::Result<_>>()?;
         if rows.is_empty() {
-            return Ok(tests);
+            return Ok(hits);
         }
 
         for hunk in hunks {
@@ -443,17 +500,49 @@ impl Db {
             let mut overlapped = false;
             for (test, ls, le) in &rows {
                 if *ls <= hunk.end && *le >= hunk.start {
-                    tests.insert(test.clone());
+                    let kind = if *le == CRATE_ROOT_SENTINEL_END && *ls == 1 {
+                        HitKind::CrateRootSentinel
+                    } else {
+                        HitKind::LineOverlap
+                    };
+                    hits.push(TestHit {
+                        test_id: test.clone(),
+                        reason: HitReason {
+                            collect_sha: collect_sha.to_string(),
+                            file: file.to_string(),
+                            kind,
+                            matched_hunk: (hunk.start, hunk.end),
+                            stored_range: Some((*ls, *le)),
+                        },
+                    });
                     overlapped = true;
                 }
             }
             if !overlapped {
-                tests.extend(rows.iter().map(|(t, _, _)| t.clone()));
+                // Backstop: emit one hit per unique test for this file
+                // (rows can have many ranges per test; we don't want to
+                // multiply that into the reason counts).
+                let mut seen: BTreeSet<&TestId> = BTreeSet::new();
+                for (test, _, _) in &rows {
+                    if !seen.insert(test) {
+                        continue;
+                    }
+                    hits.push(TestHit {
+                        test_id: test.clone(),
+                        reason: HitReason {
+                            collect_sha: collect_sha.to_string(),
+                            file: file.to_string(),
+                            kind: HitKind::StructuralBackstop,
+                            matched_hunk: (hunk.start, hunk.end),
+                            stored_range: None,
+                        },
+                    });
+                }
             }
         }
 
         touch_fingerprint(&self.conn, fingerprint)?;
-        Ok(tests)
+        Ok(hits)
     }
 
     /// Distinct `collect_sha` values present in `test_regions` for this
@@ -849,6 +938,14 @@ mod tests {
         }]
     }
 
+    /// Collapse the per-row [`TestHit`] stream into the deduplicated
+    /// `(binary_id, test_name)` set the existing tests assert against.
+    /// The hit-reason aggregation lives in `selection.rs`; this helper is
+    /// just for readability inside the storage-layer tests.
+    fn ids(hits: Vec<TestHit>) -> BTreeSet<TestId> {
+        hits.into_iter().map(|h| h.test_id).collect()
+    }
+
     #[test]
     fn roundtrip_with_range_overlap() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -871,16 +968,17 @@ mod tests {
         assert_eq!(db.collect_shas(FP_A)?, BTreeSet::from([SHA_A.to_string()]));
 
         // Hunk overlapping test_a's lib.rs range.
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?);
         assert_eq!(hits, BTreeSet::from([tid(BIN_A, "test_a")]));
 
         // Hunk overlapping test_b's lib.rs range.
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(55, 55)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(55, 55)])?);
         assert_eq!(hits, BTreeSet::from([tid(BIN_A, "test_b")]));
 
         // Multiple hunks in same file → union.
-        let hits =
-            db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18), hunk(55, 55)])?;
+        let hits = ids(
+            db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18), hunk(55, 55)])?,
+        );
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -912,7 +1010,7 @@ mod tests {
 
         // No range overlaps line 25 → backstop fires → every test touching
         // lib.rs is selected.
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(25, 25)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(25, 25)])?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -920,12 +1018,12 @@ mod tests {
 
         // Backstop applies per-hunk: a body-edit hunk + a structural-edit
         // hunk in the same file still selects everyone.
-        let hits = db.tests_covering_ranges(
+        let hits = ids(db.tests_covering_ranges(
             FP_A,
             SHA_A,
             "src/lib.rs",
             &[hunk(15, 15), hunk(25, 25)],
-        )?;
+        )?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -954,7 +1052,7 @@ mod tests {
         ];
         db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
 
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -978,7 +1076,7 @@ mod tests {
         assert_eq!(db.region_count(FP_B)?, 0);
         assert!(db
             .tests_covering_ranges(FP_B, SHA_A, "src/lib.rs", &[hunk(1, 5)])?
-            .is_empty());
+            .is_empty());  // Vec<TestHit>::is_empty()
         assert!(!db.file_tracked(FP_B, "src/lib.rs")?);
         assert!(db
             .all_tests_at_shas(FP_B, &BTreeSet::from([SHA_A.to_string()]))?
@@ -1017,11 +1115,11 @@ mod tests {
         assert_eq!(db.test_count(FP_A)?, 1);
         assert_eq!(db.test_count(FP_B)?, 1);
         assert_eq!(
-            db.tests_covering_ranges(FP_B, SHA_B, "src/other.rs", &[hunk(10, 12)])?,
+            ids(db.tests_covering_ranges(FP_B, SHA_B, "src/other.rs", &[hunk(10, 12)])?),
             BTreeSet::from([tid(BIN_A, "test_b")])
         );
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/new.rs", &[hunk(1, 1)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/new.rs", &[hunk(1, 1)])?),
             BTreeSet::from([tid(BIN_A, "test_a")])
         );
         assert!(db
@@ -1048,9 +1146,9 @@ mod tests {
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 2);
-        let a = db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?;
+        let a = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(a, BTreeSet::from([tid(BIN_A, "builds")]));
-        let b = db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?;
+        let b = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(b, BTreeSet::from([tid(BIN_B, "builds")]));
         Ok(())
     }
@@ -1216,7 +1314,7 @@ mod tests {
 
         // test_a is queryable at SHA_B with its new range.
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_B, "src/a.rs", &[hunk(15, 15)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_B, "src/a.rs", &[hunk(15, 15)])?),
             BTreeSet::from([tid(BIN_A, "test_a")]),
         );
         // …and gone from SHA_A: its old (1,5) row was deleted.
@@ -1226,11 +1324,11 @@ mod tests {
 
         // test_b/test_c untouched — still anchored at SHA_A.
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/b.rs", &[hunk(1, 5)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/b.rs", &[hunk(1, 5)])?),
             BTreeSet::from([tid(BIN_A, "test_b")]),
         );
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/c.rs", &[hunk(1, 5)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/c.rs", &[hunk(1, 5)])?),
             BTreeSet::from([tid(BIN_A, "test_c")]),
         );
 
@@ -1263,7 +1361,7 @@ mod tests {
             .tests_covering_ranges(FP_A, SHA_A, "src/b.rs", &[hunk(1, 5)])?
             .is_empty());
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/a.rs", &[hunk(1, 5)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/a.rs", &[hunk(1, 5)])?),
             BTreeSet::from([tid(BIN_A, "test_a")]),
         );
         Ok(())
@@ -1572,6 +1670,99 @@ mod tests {
 
         let db = Db::open(dir.path())?;
         assert!(!db.has_any_coverage()?);
+        Ok(())
+    }
+
+    /// `tests_covering_ranges` returns one [`TestHit`] per (row, hunk)
+    /// match for the LineOverlap path; the hit's reason names the file,
+    /// the matched hunk, and the stored range.
+    #[test]
+    fn hits_classify_line_overlap() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)]))],
+        )?;
+
+        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].test_id, tid(BIN_A, "test_a"));
+        assert_eq!(hits[0].reason.kind, HitKind::LineOverlap);
+        assert_eq!(hits[0].reason.file, "src/lib.rs");
+        assert_eq!(hits[0].reason.collect_sha, SHA_A);
+        assert_eq!(hits[0].reason.matched_hunk, (15, 18));
+        assert_eq!(hits[0].reason.stored_range, Some((10, 20)));
+        Ok(())
+    }
+
+    /// A row matching the canonical `(1, CRATE_ROOT_SENTINEL_END)` shape
+    /// must classify as `CrateRootSentinel`, not `LineOverlap`.
+    #[test]
+    fn hits_classify_crate_root_sentinel() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
+            )],
+        )?;
+
+        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reason.kind, HitKind::CrateRootSentinel);
+        assert_eq!(hits[0].reason.stored_range, Some((1, CRATE_ROOT_SENTINEL_END)));
+        Ok(())
+    }
+
+    /// When no row overlaps the hunk, the structural-edit backstop fires:
+    /// emit one hit per unique test for the file (NOT once per row), with
+    /// `kind = StructuralBackstop` and `stored_range = None`.
+    #[test]
+    fn hits_classify_structural_backstop_dedupes_per_test() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        // test_a has TWO rows in lib.rs (10-15 and 30-35); test_b has one
+        // row (50-55). A hunk at line 25 overlaps NONE of them, so the
+        // backstop fires. test_a must appear exactly once despite having
+        // multiple rows for the file.
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([
+                        rng("src/lib.rs", 10, 15),
+                        rng("src/lib.rs", 30, 35),
+                    ]),
+                ),
+                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/lib.rs", 50, 55)])),
+            ],
+        )?;
+
+        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(25, 25)])?;
+        assert_eq!(hits.len(), 2, "one hit per unique test, not per row");
+        for hit in &hits {
+            assert_eq!(hit.reason.kind, HitKind::StructuralBackstop);
+            assert_eq!(hit.reason.stored_range, None);
+            assert_eq!(hit.reason.matched_hunk, (25, 25));
+        }
+        let unique: BTreeSet<TestId> = hits.iter().map(|h| h.test_id.clone()).collect();
+        assert_eq!(
+            unique,
+            BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
+        );
         Ok(())
     }
 }

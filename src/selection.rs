@@ -194,7 +194,12 @@ pub(crate) fn compute(
             }
             let hits =
                 db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
-            affected.extend(hits);
+            // tests_covering_ranges returns one TestHit per (row, hunk) pair
+            // — multiple entries per test are expected. The downstream
+            // diagnostic refactor will retain the per-hit reasons; for now
+            // we deduplicate by test_id since the existing selection
+            // contract is a set.
+            affected.extend(hits.into_iter().map(|h| h.test_id));
         }
     }
 
