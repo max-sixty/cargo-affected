@@ -590,10 +590,30 @@ impl Db {
         Ok(count > 0)
     }
 
+    /// Distinct (binary_id, test_name) pairs under `fingerprint`, ignoring
+    /// `collect_sha`. Used by selection to distinguish "stranded" tests
+    /// (in DB but only at currently-missing shas) from "genuinely new"
+    /// tests (not in DB at all): if a listed test appears here but not
+    /// in [`Db::all_tests_at_shas`] for the reachable subset, it's stranded.
+    pub fn all_tests_for_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<BTreeSet<TestId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT binary_id, test_name FROM test_regions \
+             WHERE env_fingerprint = ?1",
+        )?;
+        let rows = stmt.query_map([fingerprint], |row| {
+            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<BTreeSet<TestId>>>()
+            .map_err(Into::into)
+    }
+
     /// Distinct (binary_id, test_name) pairs under `fingerprint` whose rows
     /// are anchored at one of `shas`. Used by selection to compute "tests
     /// known to the cache *and reachable*" — tests anchored only at diverged
-    /// shas appear missing here, so selection surfaces them as new and
+    /// shas appear missing here, so selection surfaces them as stranded and
     /// reruns them.
     pub fn all_tests_at_shas(
         &self,

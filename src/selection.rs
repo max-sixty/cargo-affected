@@ -21,34 +21,111 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::collect::Listing;
-use crate::db::{Db, TestId};
+use crate::db::{Db, HitKind, HitReason, TestId};
 use crate::project::{git_changed_line_ranges, relation_to_head, LineRange, ShaRelation};
 
 /// Result of the selection computation.
 pub(crate) struct Selection {
     /// Known tests selected by line-range overlap with the changed hunks.
     pub(crate) affected: BTreeSet<TestId>,
-    /// Tests present in the nextest listing but missing from the DB —
-    /// added since the last `collect`. Always selected because we have no
-    /// coverage data to decide otherwise.
+    /// Tests present in the nextest listing but absent from the DB
+    /// entirely under the current fingerprint — added since the last
+    /// `collect`. Always selected because we have no coverage data.
     pub(crate) new_tests: BTreeSet<TestId>,
-    /// Distinct tests tracked in the DB under the current fingerprint.
-    pub(crate) known_count: usize,
+    /// Tests present in the nextest listing AND in the DB, but only
+    /// anchored at currently-missing collect_shas. Functionally identical
+    /// to "new" (rerun and re-anchor), but the diagnostic distinguishes
+    /// them so consumers can tell the difference between "added in this
+    /// PR" and "anchor sha got rebased away".
+    pub(crate) stranded_tests: BTreeSet<TestId>,
+    /// Distinct test count tracked under the current fingerprint at
+    /// reachable shas. The "tests we could have selected from" denominator.
+    pub(crate) reachable_known_count: usize,
     /// Every test currently present in the project's nextest listing —
     /// used by `collect --diff` to prune rows for tests that were renamed
     /// or removed.
     pub(crate) listed: BTreeSet<TestId>,
+    /// Per-file/per-test diagnostics retained at the level requested by
+    /// the caller. See [`SelectionDiagnostics`].
+    pub(crate) diagnostics: SelectionDiagnostics,
 }
 
 impl Selection {
-    /// Union of affected and new tests — what nextest will be asked to run.
+    /// Union of affected, stranded, and new tests — what nextest will be
+    /// asked to run.
     pub(crate) fn selected(&self) -> BTreeSet<TestId> {
-        self.affected.union(&self.new_tests).cloned().collect()
+        let mut out = self.affected.clone();
+        out.extend(self.new_tests.iter().cloned());
+        out.extend(self.stranded_tests.iter().cloned());
+        out
     }
 
     /// Known tests not selected this round.
     pub(crate) fn skipped(&self) -> usize {
-        self.known_count.saturating_sub(self.affected.len())
+        self.reachable_known_count
+            .saturating_sub(self.affected.len())
+    }
+}
+
+/// Detail level for retained diagnostics. Driven by the `--report-detail`
+/// CLI flag (default `summary`). Memory cost on a large workspace is
+/// dominated by `Full`'s per-test reason vectors, so the default is
+/// bounded; `Full` is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiagnosticDetail {
+    /// Per-file/per-kind aggregate counters only.
+    Summary,
+    /// Per-test reason vectors plus the per-file aggregates.
+    Full,
+}
+
+/// Diagnostics retained after selection — what the JSON report builder
+/// consumes. Contents depend on the requested detail level.
+pub(crate) enum SelectionDiagnostics {
+    /// Aggregate counts per changed file, no per-test detail. Bounded
+    /// regardless of test-suite size.
+    Summary {
+        per_file: BTreeMap<String, FileReasonCounts>,
+    },
+    /// Aggregates plus, for every selected test, the full vector of
+    /// reasons that pulled it in. Can be large on big workspaces.
+    Full {
+        per_file: BTreeMap<String, FileReasonCounts>,
+        per_test: BTreeMap<TestId, Vec<HitReason>>,
+    },
+}
+
+/// Per-changed-file counts of how each test got pulled in.
+///
+/// Counts are deduplicated by strongest reason: a test with both a
+/// LineOverlap hit and a CrateRootSentinel hit on the same file counts
+/// once, classified by the strongest reason
+/// (LineOverlap > StructuralBackstop > CrateRootSentinel). Per-file
+/// counts therefore sum to `total_unique_tests`, making the diagnostic
+/// arithmetic clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FileReasonCounts {
+    pub(crate) line_overlap: usize,
+    pub(crate) structural_backstop: usize,
+    pub(crate) crate_root_sentinel: usize,
+    pub(crate) total_unique_tests: usize,
+}
+
+/// Strongest-reason ordering. Used to dedupe per-test reasons when
+/// rolling up to per-file counts: a test counts ONCE per file, by its
+/// strongest reason.
+fn strongest(a: HitKind, b: HitKind) -> HitKind {
+    fn rank(k: HitKind) -> u8 {
+        match k {
+            HitKind::LineOverlap => 2,
+            HitKind::StructuralBackstop => 1,
+            HitKind::CrateRootSentinel => 0,
+        }
+    }
+    if rank(a) >= rank(b) {
+        a
+    } else {
+        b
     }
 }
 
@@ -68,6 +145,10 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// `collect --diff`'s case). Old rows accumulate as bloat — clear with
 /// `cargo affected clean`.
 pub(crate) struct Reachability {
+    /// Per-sha relation to HEAD for every checked sha. Lets the report
+    /// builder render which shas equal HEAD vs are ahead vs are missing
+    /// instead of just summarizing.
+    pub(crate) per_sha: BTreeMap<String, ShaRelation>,
     /// Stored shas the repo can still resolve to a commit. Includes strict
     /// ancestors of HEAD and siblings (e.g. a recent main tip when HEAD is a
     /// PR branched off an older main). Selection runs on every sha in here.
@@ -102,24 +183,28 @@ pub(crate) fn check_shas_reachable(
     project_root: &Path,
     shas: &BTreeSet<String>,
 ) -> Result<Reachability> {
+    let mut per_sha = BTreeMap::new();
     let mut reachable = BTreeSet::new();
     let mut missing = BTreeSet::new();
     let mut max_commits_ahead = 0u32;
     for sha in shas {
-        match relation_to_head(project_root, sha)? {
+        let relation = relation_to_head(project_root, sha)?;
+        match &relation {
             ShaRelation::Equal => {
                 reachable.insert(sha.clone());
             }
             ShaRelation::Reachable { commits_ahead } => {
                 reachable.insert(sha.clone());
-                max_commits_ahead = max_commits_ahead.max(commits_ahead);
+                max_commits_ahead = max_commits_ahead.max(*commits_ahead);
             }
             ShaRelation::Missing => {
                 missing.insert(sha.clone());
             }
         }
+        per_sha.insert(sha.clone(), relation);
     }
     Ok(Reachability {
+        per_sha,
         reachable,
         missing,
         max_commits_ahead,
@@ -155,9 +240,17 @@ pub(crate) fn select_with_reach(
     fingerprint: &str,
     listing: &Listing,
     reach: &Reachability,
+    detail: DiagnosticDetail,
 ) -> Result<Selection> {
     let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
-    compute(db, fingerprint, &reach.reachable, &changed_ranges_by_sha, listing)
+    compute(
+        db,
+        fingerprint,
+        &reach.reachable,
+        &changed_ranges_by_sha,
+        listing,
+        detail,
+    )
 }
 
 /// Compute the selection from a pre-built nextest listing and per-sha changed
@@ -167,26 +260,49 @@ pub(crate) fn select_with_reach(
 ///
 /// `reachable_shas` are the stored `collect_sha`s still reachable from HEAD;
 /// only tests anchored at one of those shas count as "known" to the cache.
-/// Tests anchored exclusively at diverged shas surface as `new_tests` so
-/// they're rerun (and, in `collect --diff`, re-anchored at the new HEAD)
-/// rather than silently skipped.
+/// Listed tests get split three ways:
+///
+/// - `affected`: known-reachable AND pulled in by a hunk overlap.
+/// - `new_tests = listed - all_db_tests` (genuinely new — never seen in
+///   the DB under this fingerprint).
+/// - `stranded_tests = listed ∩ (all_db_tests - reachable_known_tests)`
+///   (in DB but only at currently-missing shas).
+///
+/// Both `new` and `stranded` get rerun (and re-anchored, in `collect
+/// --diff`'s case); the split exists so the JSON report can tell them
+/// apart.
 pub(crate) fn compute(
     db: &Db,
     env_fingerprint: &str,
     reachable_shas: &BTreeSet<String>,
     changed_ranges_by_sha: &ChangedRangesBySha,
     listing: &Listing,
+    detail: DiagnosticDetail,
 ) -> Result<Selection> {
     let listed: BTreeSet<TestId> = listing.tests.iter().cloned().collect();
-    let known_tests = db.all_tests_at_shas(env_fingerprint, reachable_shas)?;
-    let known_count = known_tests.len();
-    let new_tests: BTreeSet<TestId> = listed
-        .iter()
-        .filter(|t| !known_tests.contains(*t))
-        .cloned()
-        .collect();
+    let reachable_known = db.all_tests_at_shas(env_fingerprint, reachable_shas)?;
+    let reachable_known_count = reachable_known.len();
+    let all_db_tests = db.all_tests_for_fingerprint(env_fingerprint)?;
 
+    let mut new_tests = BTreeSet::new();
+    let mut stranded_tests = BTreeSet::new();
+    for t in &listed {
+        if reachable_known.contains(t) {
+            continue;
+        }
+        if all_db_tests.contains(t) {
+            stranded_tests.insert(t.clone());
+        } else {
+            new_tests.insert(t.clone());
+        }
+    }
+
+    // Collect hits per file across all reachable shas. We accumulate the
+    // raw HitReason vector regardless of detail level — bounded by the
+    // hits actually produced — and decide later whether to retain it
+    // per-test (Full) or only fold to per-file counts (Summary).
     let mut affected = BTreeSet::new();
+    let mut per_test_reasons: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
     for (collect_sha, ranges_by_file) in changed_ranges_by_sha {
         for (file, hunks) in ranges_by_file {
             if hunks.is_empty() {
@@ -194,21 +310,72 @@ pub(crate) fn compute(
             }
             let hits =
                 db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
-            // tests_covering_ranges returns one TestHit per (row, hunk) pair
-            // — multiple entries per test are expected. The downstream
-            // diagnostic refactor will retain the per-hit reasons; for now
-            // we deduplicate by test_id since the existing selection
-            // contract is a set.
-            affected.extend(hits.into_iter().map(|h| h.test_id));
+            for hit in hits {
+                affected.insert(hit.test_id.clone());
+                per_test_reasons
+                    .entry(hit.test_id)
+                    .or_default()
+                    .push(hit.reason);
+            }
         }
     }
+
+    let per_file = roll_up_per_file(&per_test_reasons);
+    let diagnostics = match detail {
+        DiagnosticDetail::Summary => SelectionDiagnostics::Summary { per_file },
+        DiagnosticDetail::Full => SelectionDiagnostics::Full {
+            per_file,
+            per_test: per_test_reasons,
+        },
+    };
 
     Ok(Selection {
         affected,
         new_tests,
-        known_count,
+        stranded_tests,
+        reachable_known_count,
         listed,
+        diagnostics,
     })
+}
+
+/// Fold per-test reasons into per-file counts using strongest-reason
+/// dedup. A test with multiple reasons in the same file counts once,
+/// classified by its strongest reason; counts within a file therefore
+/// sum to `total_unique_tests`.
+fn roll_up_per_file(
+    per_test: &BTreeMap<TestId, Vec<HitReason>>,
+) -> BTreeMap<String, FileReasonCounts> {
+    // For each (file, test) pair, find the strongest reason kind across
+    // all matching reasons. Then bump the per-file counter for that kind.
+    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> =
+        BTreeMap::new();
+    for (test, reasons) in per_test {
+        for r in reasons {
+            let entry = strongest_per_file_test
+                .entry(r.file.clone())
+                .or_default()
+                .entry(test.clone());
+            entry
+                .and_modify(|k| *k = strongest(*k, r.kind))
+                .or_insert(r.kind);
+        }
+    }
+
+    let mut out: BTreeMap<String, FileReasonCounts> = BTreeMap::new();
+    for (file, by_test) in strongest_per_file_test {
+        let mut counts = FileReasonCounts::default();
+        for kind in by_test.values() {
+            match kind {
+                HitKind::LineOverlap => counts.line_overlap += 1,
+                HitKind::StructuralBackstop => counts.structural_backstop += 1,
+                HitKind::CrateRootSentinel => counts.crate_root_sentinel += 1,
+            }
+            counts.total_unique_tests += 1;
+        }
+        out.insert(file, counts);
+    }
+    out
 }
 
 /// Format the summary (and verbose per-test list) for a non-empty selection.
@@ -218,17 +385,25 @@ pub(crate) fn compute(
 pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> String {
     let selected = sel.selected();
     let mut out = format!(
-        "{} tests {verb} ({} affected + {} new, {} skipped of {} known)",
+        "{} tests {verb} ({} affected + {} new + {} stranded, \
+         {} skipped of {} reachable-known)",
         selected.len(),
         sel.affected.len(),
         sel.new_tests.len(),
+        sel.stranded_tests.len(),
         sel.skipped(),
-        sel.known_count,
+        sel.reachable_known_count,
     );
     if verbose {
         out.push(':');
         for t in &selected {
-            let tag = if sel.new_tests.contains(t) { " (new)" } else { "" };
+            let tag = if sel.new_tests.contains(t) {
+                " (new)"
+            } else if sel.stranded_tests.contains(t) {
+                " (stranded)"
+            } else {
+                ""
+            };
             let _ = write!(out, "\n  {}::{}{tag}", t.binary_id, t.test_name);
         }
     } else {
@@ -245,17 +420,27 @@ mod tests {
         TestId::new(binary_id, test_name)
     }
 
-    fn selection_with(affected: &[TestId], new_tests: &[TestId], known_count: usize) -> Selection {
+    fn selection_with(
+        affected: &[TestId],
+        new_tests: &[TestId],
+        stranded_tests: &[TestId],
+        reachable_known_count: usize,
+    ) -> Selection {
         let listed: BTreeSet<TestId> = affected
             .iter()
             .cloned()
             .chain(new_tests.iter().cloned())
+            .chain(stranded_tests.iter().cloned())
             .collect();
         Selection {
             affected: affected.iter().cloned().collect(),
             new_tests: new_tests.iter().cloned().collect(),
-            known_count,
+            stranded_tests: stranded_tests.iter().cloned().collect(),
+            reachable_known_count,
             listed,
+            diagnostics: SelectionDiagnostics::Summary {
+                per_file: BTreeMap::new(),
+            },
         }
     }
 
@@ -264,28 +449,33 @@ mod tests {
         let sel = selection_with(
             &[tid("crate_a", "test_a"), tid("crate_a", "test_b")],
             &[tid("crate_a", "test_c")],
+            &[],
             5,
         );
         let out = format_summary(&sel, "to run", false);
         assert_eq!(
             out,
-            "3 tests to run (2 affected + 1 new, 3 skipped of 5 known) — pass -v to list"
+            "3 tests to run (2 affected + 1 new + 0 stranded, \
+             3 skipped of 5 reachable-known) — pass -v to list"
         );
     }
 
     #[test]
-    fn summary_verbose_tags_new_tests() {
+    fn summary_verbose_tags_new_and_stranded() {
         let sel = selection_with(
             &[tid("crate_a", "test_a")],
             &[tid("crate_a", "test_b")],
-            3,
+            &[tid("crate_a", "test_c")],
+            4,
         );
         let out = format_summary(&sel, "would run", true);
         assert_eq!(
             out,
-            "2 tests would run (1 affected + 1 new, 2 skipped of 3 known):\n  \
+            "3 tests would run (1 affected + 1 new + 1 stranded, \
+             3 skipped of 4 reachable-known):\n  \
              crate_a::test_a\n  \
-             crate_a::test_b (new)"
+             crate_a::test_b (new)\n  \
+             crate_a::test_c (stranded)"
         );
     }
 
@@ -294,8 +484,58 @@ mod tests {
         let sel = selection_with(
             &[tid("crate_a", "a"), tid("crate_a", "b")],
             &[],
+            &[],
             2,
         );
         assert_eq!(sel.skipped(), 0);
+    }
+
+    #[test]
+    fn strongest_reason_orders_line_then_backstop_then_sentinel() {
+        // Pairwise: stronger arg returned regardless of position.
+        for (a, b, expected) in [
+            (HitKind::LineOverlap, HitKind::CrateRootSentinel, HitKind::LineOverlap),
+            (HitKind::CrateRootSentinel, HitKind::LineOverlap, HitKind::LineOverlap),
+            (HitKind::StructuralBackstop, HitKind::CrateRootSentinel, HitKind::StructuralBackstop),
+            (HitKind::CrateRootSentinel, HitKind::StructuralBackstop, HitKind::StructuralBackstop),
+            (HitKind::LineOverlap, HitKind::StructuralBackstop, HitKind::LineOverlap),
+            (HitKind::StructuralBackstop, HitKind::LineOverlap, HitKind::LineOverlap),
+        ] {
+            assert_eq!(strongest(a, b), expected, "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn roll_up_dedupes_test_per_file_by_strongest_reason() {
+        // test_a hit by LineOverlap AND CrateRootSentinel for the same
+        // file should count once, classified as LineOverlap.
+        let test_a = tid("crate_a", "a");
+        let mut per_test: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
+        per_test.insert(
+            test_a.clone(),
+            vec![
+                HitReason {
+                    collect_sha: "deadbeef".to_string(),
+                    file: "src/lib.rs".to_string(),
+                    kind: HitKind::CrateRootSentinel,
+                    matched_hunk: (5, 5),
+                    stored_range: Some((1, i64::MAX)),
+                },
+                HitReason {
+                    collect_sha: "deadbeef".to_string(),
+                    file: "src/lib.rs".to_string(),
+                    kind: HitKind::LineOverlap,
+                    matched_hunk: (5, 5),
+                    stored_range: Some((3, 7)),
+                },
+            ],
+        );
+
+        let counts = roll_up_per_file(&per_test);
+        let lib = counts.get("src/lib.rs").expect("src/lib.rs should appear");
+        assert_eq!(lib.line_overlap, 1);
+        assert_eq!(lib.structural_backstop, 0);
+        assert_eq!(lib.crate_root_sentinel, 0);
+        assert_eq!(lib.total_unique_tests, 1);
     }
 }

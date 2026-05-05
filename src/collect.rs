@@ -510,7 +510,14 @@ fn plan_diff_collect(
         );
     }
 
-    let sel = selection::select_with_reach(project_root, db, env_fingerprint, listing, &reach)?;
+    let sel = selection::select_with_reach(
+        project_root,
+        db,
+        env_fingerprint,
+        listing,
+        &reach,
+        selection::DiagnosticDetail::Summary,
+    )?;
     let selected = sel.selected();
     if selected.is_empty() {
         return Ok(DiffOutcome::NothingToRecollect { listed: sel.listed });

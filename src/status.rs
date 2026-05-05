@@ -114,6 +114,7 @@ pub fn status(verbose: bool) -> Result<()> {
         &env_fingerprint,
         &listing,
         &reach,
+        selection::DiagnosticDetail::Summary,
     )?;
     let selected = sel.selected();
     if selected.is_empty() {

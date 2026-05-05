@@ -108,6 +108,7 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
         &env_fingerprint,
         &listing,
         &reach,
+        selection::DiagnosticDetail::Summary,
     )?;
     let selected = sel.selected();
     if selected.is_empty() {
