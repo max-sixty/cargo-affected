@@ -132,6 +132,12 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
 /// `Some(tests)` filters to the given set via one or more nextest `-E`
 /// filterset arguments (split to stay under the OS argv-string limit).
 /// Returns nextest's exit code so callers can propagate it to CI.
+///
+/// `nextest_args` reach nextest verbatim — this is deliberate for the
+/// failure-handling flags (`--no-fail-fast`, `--max-fail=N`, `--retries`):
+/// nextest's own semantics govern when the run stops, and cargo-affected
+/// adds no fail-fast policy of its own. The functional suite's
+/// `run_forwards_fail_fast_flags_to_nextest` anchors that contract.
 fn run_tests(
     project_root: &Path,
     tests: Option<&[TestId]>,

@@ -66,7 +66,10 @@ enum Action {
         /// Extra args forwarded to `cargo nextest run`. Must be preceded by
         /// `--` (e.g. `cargo affected run -- --features foo`); otherwise
         /// clap rejects unknown flags rather than risk swallowing one of
-        /// cargo-affected's own (e.g. `--verbose`).
+        /// cargo-affected's own (e.g. `--verbose`). Includes nextest's own
+        /// failure-handling flags — `--no-fail-fast`, `--max-fail=N`,
+        /// `--retries` — which reach nextest verbatim so its semantics
+        /// govern when the run stops; cargo-affected adds no policy on top.
         #[arg(last = true)]
         nextest_args: Vec<String>,
     },
