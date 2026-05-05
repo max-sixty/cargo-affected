@@ -246,6 +246,29 @@ pub(crate) fn select_with_reach(
     )
 }
 
+/// Like [`select_with_reach`] but accepts a pre-computed per-sha
+/// changed-range map. Lets `run`/`status` compute the diffs once and
+/// pass the same map to both selection and the diagnostic report,
+/// avoiding a second round of `git diff` per reachable sha when
+/// `--report-json` is set.
+pub(crate) fn select_with_precomputed_ranges(
+    db: &Db,
+    fingerprint: &str,
+    listing: &Listing,
+    reach: &Reachability,
+    changed_ranges_by_sha: &ChangedRangesBySha,
+    detail: DiagnosticDetail,
+) -> Result<Selection> {
+    compute(
+        db,
+        fingerprint,
+        &reach.reachable,
+        changed_ranges_by_sha,
+        listing,
+        detail,
+    )
+}
+
 /// Compute the selection from a pre-built nextest listing and per-sha changed
 /// ranges. Most callers should use [`select_with_reach`] instead; this is the
 /// lower-level entry point for tests and any caller that already has the
@@ -272,6 +295,12 @@ pub(crate) fn compute(
     listing: &Listing,
     detail: DiagnosticDetail,
 ) -> Result<Selection> {
+    // Mark this fingerprint as recently used so the next collect's LRU
+    // eviction respects it. One write per selection invocation, not one
+    // per file-sha pair (which is what `tests_covering_ranges` used to
+    // do internally).
+    db.touch(env_fingerprint)?;
+
     let listed: BTreeSet<TestId> = listing.tests.iter().cloned().collect();
     let reachable_known = db.all_tests_at_shas(env_fingerprint, reachable_shas)?;
     let reachable_known_count = reachable_known.len();

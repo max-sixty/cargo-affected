@@ -167,12 +167,17 @@ pub fn run(
 
     eprintln!("checking for new tests...");
     let listing = nextest_list(project_root, None, None)?;
-    let sel = selection::select_with_reach(
-        project_root,
+    // Compute per-sha hunks once; selection consumes them and so does
+    // the report builder if --report-json is set. The previous code
+    // ran `git diff -U0 <sha>` twice per reachable sha on the report
+    // path.
+    let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
+    let sel = selection::select_with_precomputed_ranges(
         &db,
         &fingerprint.hex,
         &listing,
         &reach,
+        &changed_ranges,
         detail,
     )?;
 
@@ -189,6 +194,7 @@ pub fn run(
             &db,
             &fingerprint.hex,
             &reach,
+            &changed_ranges,
             &changed_files,
         )?;
         let inputs = SelectionInputs {

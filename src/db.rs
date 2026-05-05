@@ -550,9 +550,16 @@ impl Db {
                 }
             }
         }
-
-        touch_fingerprint(&self.conn, fingerprint)?;
         Ok(hits)
+    }
+
+    /// Mark `fingerprint` as recently used, refreshing its `last_seen`
+    /// timestamp for LRU eviction by [`Db::gc`]. Read-side callers
+    /// (`run`, `status`) should invoke this once per invocation rather
+    /// than once per query — `tests_covering_ranges` no longer touches
+    /// it implicitly, since it can be called many times per command.
+    pub fn touch(&self, fingerprint: &str) -> Result<()> {
+        touch_fingerprint(&self.conn, fingerprint)
     }
 
     /// Distinct `collect_sha` values present in `test_regions` for this
@@ -587,6 +594,33 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// All distinct `source_file` values referenced by `test_regions`
+    /// rows under `(fingerprint, any sha in shas)`. Returns the set of
+    /// files the cache "knows about" at the reachable shas — used by
+    /// the diagnostic report to set `tracked_by_coverage` on each
+    /// changed file in one query rather than N×files lookups.
+    pub fn tracked_files_at_shas(
+        &self,
+        fingerprint: &str,
+        shas: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        if shas.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let sql = format!(
+            "SELECT DISTINCT source_file FROM test_regions \
+             WHERE env_fingerprint = ?1 AND collect_sha IN ({})",
+            in_placeholders(2, shas.len()),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = std::iter::once(fingerprint).chain(shas.iter().map(String::as_str));
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<BTreeSet<String>>>()
+            .map_err(Into::into)
     }
 
     /// Whether a source file has coverage data under the current fingerprint.

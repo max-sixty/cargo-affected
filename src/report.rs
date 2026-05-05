@@ -37,9 +37,7 @@ use serde::Serialize;
 
 use crate::db::{Db, HitKind, HitReason, StoredFingerprintRow, TestId};
 use crate::fingerprint::FingerprintComponent;
-use crate::project::{
-    git_added_files_since, git_changed_line_ranges, LineRange, ShaRelation,
-};
+use crate::project::{git_added_files_since, LineRange, ShaRelation};
 use crate::selection::{FileReasonCounts, Reachability, Selection};
 
 /// JSON schema version. Bump on any incompatible field-shape change so
@@ -360,30 +358,29 @@ pub fn collect_sha_snapshots(
 
 /// Build per-changed-file input entries for the JSON report.
 ///
-/// The file set is the UNION of:
-///   - every file appearing in `git_changed_line_ranges(sha)` for any
-///     reachable sha (these have OLD-side hunks and drive selection),
-///   - committed-added files via `git_added_files_since(sha)` — these
-///     have no OLD side so the unified-diff parser skips them, but the
-///     report should still surface them,
-///   - working-tree changed files (untracked/staged/unstaged) so files
-///     that selection considered but produced no hunks are visible.
+/// Inputs:
+///   - `changed_ranges_by_sha`: the per-sha hunk maps already computed
+///     by selection (avoids re-diffing each reachable sha — selection
+///     and the report consume the same data).
+///   - `working_tree_files`: working-tree changes (uncommitted /
+///     staged / untracked) so files that selection considered but
+///     produced no hunks are still in the report.
+///   - committed-added files (via `git_added_files_since(sha)` per
+///     reachable sha) — these have no OLD-side and the unified-diff
+///     parser skips them, but the report should surface them.
+///
+/// `tracked_by_coverage` is set in one DB query
+/// ([`Db::tracked_files_at_shas`]) instead of one query per file.
 pub fn build_changed_file_inputs(
     project_root: &std::path::Path,
     db: &Db,
     fingerprint: &str,
     reach: &Reachability,
+    changed_ranges_by_sha: &BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
     working_tree_files: &[String],
 ) -> Result<Vec<ChangedFileInput>> {
-    // Cache hunks per sha so we don't re-diff for each file.
-    let mut hunks_per_sha: BTreeMap<String, BTreeMap<String, Vec<LineRange>>> = BTreeMap::new();
-    for sha in &reach.reachable {
-        let map = git_changed_line_ranges(project_root, sha)?;
-        hunks_per_sha.insert(sha.clone(), map);
-    }
-
     let mut all_files: BTreeSet<String> = working_tree_files.iter().cloned().collect();
-    for by_file in hunks_per_sha.values() {
+    for by_file in changed_ranges_by_sha.values() {
         for path in by_file.keys() {
             all_files.insert(path.clone());
         }
@@ -394,10 +391,14 @@ pub fn build_changed_file_inputs(
         }
     }
 
+    // One query for "which files does the cache know about?", indexed
+    // by path lookup below.
+    let tracked = db.tracked_files_at_shas(fingerprint, &reach.reachable)?;
+
     let mut out = Vec::new();
     for path in all_files {
         let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
-        for (sha, by_file) in &hunks_per_sha {
+        for (sha, by_file) in changed_ranges_by_sha {
             if let Some(hunks) = by_file.get(&path) {
                 hunks_by_sha.insert(
                     sha.clone(),
@@ -405,22 +406,9 @@ pub fn build_changed_file_inputs(
                 );
             }
         }
-        let mut tracked = false;
-        for sha in &reach.reachable {
-            let n = db.tests_covering_ranges(
-                fingerprint,
-                sha,
-                &path,
-                &[LineRange { start: 1, end: i64::MAX }],
-            )?;
-            if !n.is_empty() {
-                tracked = true;
-                break;
-            }
-        }
         out.push(ChangedFileInput {
+            tracked_by_coverage: tracked.contains(&path),
             path,
-            tracked_by_coverage: tracked,
             hunks_by_sha,
         });
     }
