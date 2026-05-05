@@ -40,7 +40,7 @@ use crate::fingerprint::FingerprintComponent;
 use crate::project::{
     git_added_files_since, git_changed_line_ranges, LineRange, ShaRelation,
 };
-use crate::selection::{FileReasonCounts, Reachability, Selection, SelectionDiagnostics};
+use crate::selection::{FileReasonCounts, Reachability, Selection};
 
 /// JSON schema version. Bump on any incompatible field-shape change so
 /// consumers can refuse to parse a too-new report.
@@ -134,8 +134,7 @@ pub struct StoredFingerprintEntry {
 #[derive(Debug, Serialize)]
 pub struct CollectShaEntry {
     pub sha: String,
-    /// `equal` | `reachable` | `missing`
-    pub relation: &'static str,
+    pub relation: ShaRelationKind,
     /// Number of commits between this sha and HEAD; absent for `equal`
     /// and `missing`. Skipped (not emitted as `null`) so consumers can
     /// use field presence to detect reachable shas — matches the
@@ -145,6 +144,16 @@ pub struct CollectShaEntry {
     /// Total `test_regions` rows anchored at this sha for the current
     /// fingerprint.
     pub row_count: usize,
+}
+
+/// JSON encoding of [`ShaRelation`]. Mirrors the variants but flattens
+/// `commits_ahead` into a sibling field on [`CollectShaEntry`].
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShaRelationKind {
+    Equal,
+    Reachable,
+    Missing,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,9 +171,18 @@ pub struct SelectionSummary {
     pub stranded: Option<usize>,
     pub skipped: Option<usize>,
     pub total_reachable_known: Option<usize>,
-    /// `selection` (counts populated) | `full-suite-no-listing`
-    /// (counts null; nextest will run everything).
-    pub mode: &'static str,
+    pub mode: SelectionMode,
+}
+
+/// Whether selection actually ran. `Selection` populates the count
+/// fields; `FullSuiteNoListing` leaves them all null because we
+/// intentionally skipped `nextest list` to keep cache-miss/`--all`
+/// paths cheap.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionMode {
+    Selection,
+    FullSuiteNoListing,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,24 +223,51 @@ pub struct ReasonCounts {
 pub struct SelectedTestEntry {
     pub binary_id: String,
     pub test_name: String,
-    /// `affected` | `new` | `stranded`
-    pub kind: &'static str,
+    pub kind: SelectedTestKind,
     /// All reasons that pulled this test in, sorted
     /// `(file, kind, collect_sha)`. Empty for `new` and `stranded`.
     pub reasons: Vec<ReasonEntry>,
+}
+
+/// Why a test ended up rerun. See `selection.rs` for the formal
+/// definitions of new vs stranded.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectedTestKind {
+    Affected,
+    New,
+    Stranded,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReasonEntry {
     pub collect_sha: String,
     pub file: String,
-    /// `line_overlap` | `structural_backstop` | `crate_root_sentinel`
-    pub kind: &'static str,
+    pub kind: ReasonKind,
     /// `[line_start, line_end]` of the stored row that matched. `None`
     /// for `structural_backstop` (no row matched by definition).
     pub stored_range: Option<[i64; 2]>,
     /// `[start, end]` of the diff hunk that triggered selection.
     pub matched_hunk: [i64; 2],
+}
+
+/// JSON encoding of [`HitKind`].
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonKind {
+    LineOverlap,
+    StructuralBackstop,
+    CrateRootSentinel,
+}
+
+impl From<HitKind> for ReasonKind {
+    fn from(kind: HitKind) -> Self {
+        match kind {
+            HitKind::LineOverlap => Self::LineOverlap,
+            HitKind::StructuralBackstop => Self::StructuralBackstop,
+            HitKind::CrateRootSentinel => Self::CrateRootSentinel,
+        }
+    }
 }
 
 /// Inputs for [`Report::build_selection`]. Bundles the data the report
@@ -434,27 +479,26 @@ impl Report {
             stranded: Some(selection.stranded_tests.len()),
             skipped: Some(selection.skipped()),
             total_reachable_known: Some(selection.reachable_known_count),
-            mode: "selection",
+            mode: SelectionMode::Selection,
         };
 
         let changed_files = if inputs.include_changed_files {
             Some(build_changed_files_entries(
                 &inputs.changed_files,
-                selection.diagnostics.per_file_counts(),
+                &selection.diagnostics.per_file,
             ))
         } else {
             None
         };
 
-        let selected_tests = match &selection.diagnostics {
-            SelectionDiagnostics::Summary { .. } => None,
-            SelectionDiagnostics::Full { per_test, .. } => Some(build_selected_tests(
+        let selected_tests = selection.diagnostics.per_test.as_ref().map(|per_test| {
+            build_selected_tests(
                 &selection.affected,
                 &selection.new_tests,
                 &selection.stranded_tests,
                 per_test,
-            )),
-        };
+            )
+        });
 
         Self {
             schema_version: SCHEMA_VERSION,
@@ -463,9 +507,8 @@ impl Report {
             cache: build_cache(
                 inputs.status,
                 Some(inputs.current_fingerprint),
-                Some(inputs.current_components.clone()),
+                Some(inputs.current_components),
                 inputs.stored_fingerprints,
-                inputs.current_components,
                 inputs.collect_shas,
             ),
             selection: SelectionReport {
@@ -489,9 +532,8 @@ impl Report {
             cache: build_cache(
                 inputs.status,
                 inputs.current_fingerprint,
-                inputs.current_components.clone(),
+                inputs.current_components,
                 inputs.stored_fingerprints,
-                inputs.current_components.unwrap_or_default(),
                 inputs.collect_shas,
             ),
             selection: SelectionReport {
@@ -502,7 +544,7 @@ impl Report {
                     stranded: None,
                     skipped: None,
                     total_reachable_known: None,
-                    mode: "full-suite-no-listing",
+                    mode: SelectionMode::FullSuiteNoListing,
                 },
                 changed_files: None,
                 selected_tests: None,
@@ -531,18 +573,19 @@ impl Report {
     }
 }
 
-/// Compose the cache section. `current_*` are `Option` so the
+/// Compose the cache section. `current_components` is `Option` so the
 /// full-suite path can omit them when we never even computed a
-/// fingerprint (no project root, etc.); `current_components_for_diff`
-/// is the same data without the `Option` for the diff calculation.
+/// fingerprint; absent components imply an empty diff against every
+/// stored snapshot (every label diffs).
 fn build_cache(
     status: CacheStatus,
     current_fingerprint: Option<String>,
     current_components: Option<Vec<FingerprintComponent>>,
     stored_fingerprints: Vec<StoredFingerprintSnapshot>,
-    current_components_for_diff: Vec<FingerprintComponent>,
     collect_shas: Vec<CollectShaSnapshot>,
 ) -> CacheReport {
+    let current_for_diff: &[FingerprintComponent] = current_components.as_deref().unwrap_or(&[]);
+    let stored = build_stored_fingerprints(stored_fingerprints, current_for_diff);
     CacheReport {
         status,
         current_fingerprint,
@@ -554,10 +597,7 @@ fn build_cache(
                 })
                 .collect()
         }),
-        stored_fingerprints: build_stored_fingerprints(
-            stored_fingerprints,
-            &current_components_for_diff,
-        ),
+        stored_fingerprints: stored,
         collect_shas: build_collect_shas(collect_shas),
     }
 }
@@ -614,9 +654,11 @@ fn build_collect_shas(shas: Vec<CollectShaSnapshot>) -> Vec<CollectShaEntry> {
         .into_iter()
         .map(|s| {
             let (relation, commits_ahead) = match s.relation {
-                ShaRelation::Equal => ("equal", None),
-                ShaRelation::Reachable { commits_ahead } => ("reachable", Some(commits_ahead)),
-                ShaRelation::Missing => ("missing", None),
+                ShaRelation::Equal => (ShaRelationKind::Equal, None),
+                ShaRelation::Reachable { commits_ahead } => {
+                    (ShaRelationKind::Reachable, Some(commits_ahead))
+                }
+                ShaRelation::Missing => (ShaRelationKind::Missing, None),
             };
             CollectShaEntry {
                 sha: s.sha,
@@ -685,11 +727,11 @@ fn build_selected_tests(
         .collect();
     for test in union {
         let kind = if new_tests.contains(test) {
-            "new"
+            SelectedTestKind::New
         } else if stranded.contains(test) {
-            "stranded"
+            SelectedTestKind::Stranded
         } else {
-            "affected"
+            SelectedTestKind::Affected
         };
         let mut reasons: Vec<ReasonEntry> = per_test
             .get(test)
@@ -699,7 +741,7 @@ fn build_selected_tests(
         reasons.sort_by(|a, b| {
             a.file
                 .cmp(&b.file)
-                .then(a.kind.cmp(b.kind))
+                .then(a.kind.cmp(&b.kind))
                 .then(a.collect_sha.cmp(&b.collect_sha))
         });
         out.push(SelectedTestEntry {
@@ -717,33 +759,9 @@ fn reason_entry(r: &HitReason) -> ReasonEntry {
     ReasonEntry {
         collect_sha: r.collect_sha.clone(),
         file: r.file.clone(),
-        kind: hit_kind_str(r.kind),
+        kind: r.kind.into(),
         stored_range: r.stored_range.map(|(s, e)| [s, e]),
         matched_hunk: [r.matched_hunk.0, r.matched_hunk.1],
-    }
-}
-
-fn hit_kind_str(kind: HitKind) -> &'static str {
-    match kind {
-        HitKind::LineOverlap => "line_overlap",
-        HitKind::StructuralBackstop => "structural_backstop",
-        HitKind::CrateRootSentinel => "crate_root_sentinel",
-    }
-}
-
-/// `SelectionDiagnostics` accessor used by the report builder. Lives
-/// here (rather than on the type) so the diagnostics type stays
-/// closer to the selection algorithm.
-trait DiagnosticsAccess {
-    fn per_file_counts(&self) -> &BTreeMap<String, FileReasonCounts>;
-}
-
-impl DiagnosticsAccess for SelectionDiagnostics {
-    fn per_file_counts(&self) -> &BTreeMap<String, FileReasonCounts> {
-        match self {
-            SelectionDiagnostics::Summary { per_file }
-            | SelectionDiagnostics::Full { per_file, .. } => per_file,
-        }
     }
 }
 
@@ -837,11 +855,11 @@ mod tests {
                 row_count: 5,
             },
         ]);
-        assert_eq!(entries[0].relation, "equal");
+        assert_eq!(entries[0].relation, ShaRelationKind::Equal);
         assert_eq!(entries[0].commits_ahead, None);
-        assert_eq!(entries[1].relation, "reachable");
+        assert_eq!(entries[1].relation, ShaRelationKind::Reachable);
         assert_eq!(entries[1].commits_ahead, Some(6));
-        assert_eq!(entries[2].relation, "missing");
+        assert_eq!(entries[2].relation, ShaRelationKind::Missing);
         assert_eq!(entries[2].commits_ahead, None);
     }
 

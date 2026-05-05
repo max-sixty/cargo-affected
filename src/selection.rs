@@ -80,19 +80,12 @@ pub enum DiagnosticDetail {
 }
 
 /// Diagnostics retained after selection — what the JSON report builder
-/// consumes. Contents depend on the requested detail level.
-pub(crate) enum SelectionDiagnostics {
-    /// Aggregate counts per changed file, no per-test detail. Bounded
-    /// regardless of test-suite size.
-    Summary {
-        per_file: BTreeMap<String, FileReasonCounts>,
-    },
-    /// Aggregates plus, for every selected test, the full vector of
-    /// reasons that pulled it in. Can be large on big workspaces.
-    Full {
-        per_file: BTreeMap<String, FileReasonCounts>,
-        per_test: BTreeMap<TestId, Vec<HitReason>>,
-    },
+/// consumes. `per_test` is `None` in summary mode (bounded regardless
+/// of test-suite size); `Some` in full mode (carries per-test reason
+/// vectors, can be large on big workspaces).
+pub(crate) struct SelectionDiagnostics {
+    pub(crate) per_file: BTreeMap<String, FileReasonCounts>,
+    pub(crate) per_test: Option<BTreeMap<TestId, Vec<HitReason>>>,
 }
 
 /// Per-changed-file counts of how each test got pulled in.
@@ -335,12 +328,9 @@ pub(crate) fn compute(
     }
 
     let per_file = aggregate_per_file_counts(&strongest_per_file_test);
-    let diagnostics = match detail {
-        DiagnosticDetail::Summary => SelectionDiagnostics::Summary { per_file },
-        DiagnosticDetail::Full => SelectionDiagnostics::Full {
-            per_file,
-            per_test: per_test_reasons,
-        },
+    let diagnostics = SelectionDiagnostics {
+        per_file,
+        per_test: retain_per_test.then_some(per_test_reasons),
     };
 
     Ok(Selection {
@@ -435,8 +425,9 @@ mod tests {
             stranded_tests: stranded_tests.iter().cloned().collect(),
             reachable_known_count,
             listed,
-            diagnostics: SelectionDiagnostics::Summary {
+            diagnostics: SelectionDiagnostics {
                 per_file: BTreeMap::new(),
+                per_test: None,
             },
         }
     }
