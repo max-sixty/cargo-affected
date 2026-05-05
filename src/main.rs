@@ -18,7 +18,7 @@ mod status;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 /// Run only the tests affected by your changes.
 #[derive(Parser)]
@@ -77,8 +77,8 @@ enum Action {
         /// keeps per-file aggregate counts only (bounded);
         /// `full` adds per-test reason vectors (can be megabytes on
         /// large test suites).
-        #[arg(long, value_enum, default_value_t = ReportDetail::Summary)]
-        report_detail: ReportDetail,
+        #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
+        report_detail: selection::DiagnosticDetail,
         /// Extra args forwarded to `cargo nextest run`. Must be preceded by
         /// `--` (e.g. `cargo affected run -- --features foo`); otherwise
         /// clap rejects unknown flags rather than risk swallowing one of
@@ -93,30 +93,11 @@ enum Action {
         #[arg(long, value_name = "PATH")]
         report_json: Option<PathBuf>,
         /// Detail level for the report's selection section.
-        #[arg(long, value_enum, default_value_t = ReportDetail::Summary)]
-        report_detail: ReportDetail,
+        #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
+        report_detail: selection::DiagnosticDetail,
     },
     /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
-}
-
-/// Mirrors `selection::DiagnosticDetail` at the CLI surface so clap can
-/// derive `ValueEnum` without importing into the selection module.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ReportDetail {
-    /// Per-file aggregate counters only.
-    Summary,
-    /// Per-test reason vectors plus per-file aggregates.
-    Full,
-}
-
-impl From<ReportDetail> for selection::DiagnosticDetail {
-    fn from(d: ReportDetail) -> Self {
-        match d {
-            ReportDetail::Summary => Self::Summary,
-            ReportDetail::Full => Self::Full,
-        }
-    }
 }
 
 fn clean() -> Result<()> {
@@ -189,14 +170,14 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
             all,
             verbose,
             report_json.as_deref(),
-            report_detail.into(),
+            report_detail,
             &nextest_args,
         ),
         Action::Status {
             report_json,
             report_detail,
         } => {
-            status::status(verbose, report_json.as_deref(), report_detail.into())?;
+            status::status(verbose, report_json.as_deref(), report_detail)?;
             Ok(0)
         }
         Action::Clean => {

@@ -35,10 +35,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::db::{HitKind, HitReason, TestId};
+use crate::db::{Db, HitKind, HitReason, StoredFingerprintRow, TestId};
 use crate::fingerprint::FingerprintComponent;
-use crate::project::ShaRelation;
-use crate::selection::{FileReasonCounts, Selection, SelectionDiagnostics};
+use crate::project::{
+    git_added_files_since, git_changed_line_ranges, LineRange, ShaRelation,
+};
+use crate::selection::{FileReasonCounts, Reachability, Selection, SelectionDiagnostics};
 
 /// JSON schema version. Bump on any incompatible field-shape change so
 /// consumers can refuse to parse a too-new report.
@@ -86,6 +88,28 @@ pub enum CacheStatus {
     MissNoReachableSha,
     /// `--all` was passed. Selection skipped intentionally.
     ForcedAll,
+}
+
+impl CacheStatus {
+    /// Stable kebab-case string used by the JSON serializer and the
+    /// stderr summary line. One canonical mapping; the serde derive
+    /// uses the same encoding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HitExact => "hit-exact",
+            Self::HitWithDivergence => "hit-with-divergence",
+            Self::MissFingerprint => "miss-fingerprint",
+            Self::MissNoCoverage => "miss-no-coverage",
+            Self::MissNoReachableSha => "miss-no-reachable-sha",
+            Self::ForcedAll => "forced-all",
+        }
+    }
+}
+
+impl std::fmt::Display for CacheStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -238,6 +262,22 @@ pub struct StoredFingerprintSnapshot {
     pub components: Vec<FingerprintComponent>,
 }
 
+impl From<StoredFingerprintRow> for StoredFingerprintSnapshot {
+    fn from(row: StoredFingerprintRow) -> Self {
+        Self {
+            fingerprint: row.fingerprint,
+            last_seen: row.last_seen,
+            components: row.components,
+        }
+    }
+}
+
+/// Convert a sequence of stored fingerprint rows from the DB into the
+/// snapshot shape the report builder consumes.
+pub fn snapshots_from(rows: Vec<StoredFingerprintRow>) -> Vec<StoredFingerprintSnapshot> {
+    rows.into_iter().map(Into::into).collect()
+}
+
 /// Snapshot of one collect_sha — what relation it has to HEAD and how
 /// many rows are anchored at it.
 pub struct CollectShaSnapshot {
@@ -252,6 +292,134 @@ pub struct ChangedFileInput {
     pub path: String,
     pub tracked_by_coverage: bool,
     pub hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>>,
+}
+
+/// Compose per-sha snapshots for the report from a `Reachability` (per-sha
+/// relation) and a sha → row-count map. Rows missing from `row_counts`
+/// land at 0 (the sha isn't anchoring any rows for the current
+/// fingerprint — common for `Missing` shas).
+pub fn collect_sha_snapshots(
+    reach: &Reachability,
+    row_counts: &BTreeMap<String, usize>,
+) -> Vec<CollectShaSnapshot> {
+    reach
+        .per_sha
+        .iter()
+        .map(|(sha, relation)| CollectShaSnapshot {
+            sha: sha.clone(),
+            relation: relation.clone(),
+            row_count: row_counts.get(sha).copied().unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Build per-changed-file input entries for the JSON report.
+///
+/// The file set is the UNION of:
+///   - every file appearing in `git_changed_line_ranges(sha)` for any
+///     reachable sha (these have OLD-side hunks and drive selection),
+///   - committed-added files via `git_added_files_since(sha)` — these
+///     have no OLD side so the unified-diff parser skips them, but the
+///     report should still surface them,
+///   - working-tree changed files (untracked/staged/unstaged) so files
+///     that selection considered but produced no hunks are visible.
+pub fn build_changed_file_inputs(
+    project_root: &std::path::Path,
+    db: &Db,
+    fingerprint: &str,
+    reach: &Reachability,
+    working_tree_files: &[String],
+) -> Result<Vec<ChangedFileInput>> {
+    // Cache hunks per sha so we don't re-diff for each file.
+    let mut hunks_per_sha: BTreeMap<String, BTreeMap<String, Vec<LineRange>>> = BTreeMap::new();
+    for sha in &reach.reachable {
+        let map = git_changed_line_ranges(project_root, sha)?;
+        hunks_per_sha.insert(sha.clone(), map);
+    }
+
+    let mut all_files: BTreeSet<String> = working_tree_files.iter().cloned().collect();
+    for by_file in hunks_per_sha.values() {
+        for path in by_file.keys() {
+            all_files.insert(path.clone());
+        }
+    }
+    for sha in &reach.reachable {
+        for added in git_added_files_since(project_root, sha)? {
+            all_files.insert(added);
+        }
+    }
+
+    let mut out = Vec::new();
+    for path in all_files {
+        let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+        for (sha, by_file) in &hunks_per_sha {
+            if let Some(hunks) = by_file.get(&path) {
+                hunks_by_sha.insert(
+                    sha.clone(),
+                    hunks.iter().map(|h| (h.start, h.end)).collect(),
+                );
+            }
+        }
+        let mut tracked = false;
+        for sha in &reach.reachable {
+            let n = db.tests_covering_ranges(
+                fingerprint,
+                sha,
+                &path,
+                &[LineRange { start: 1, end: i64::MAX }],
+            )?;
+            if !n.is_empty() {
+                tracked = true;
+                break;
+            }
+        }
+        out.push(ChangedFileInput {
+            path,
+            tracked_by_coverage: tracked,
+            hunks_by_sha,
+        });
+    }
+    Ok(out)
+}
+
+/// Final stderr line a CI consumer can grep to track selection ratios
+/// over time. Format depends on cache status; per the design doc, miss
+/// statuses get `mode=full-suite`; hit statuses get the selection ratio
+/// plus divergence detail when any sha is non-Equal.
+///
+/// `selection` is `(selected_count, total_reachable_known)` — `None` on
+/// full-suite paths where no listing happened.
+pub fn summary_line(
+    status: CacheStatus,
+    selection: Option<(usize, usize)>,
+    missing_shas: usize,
+    max_commits_ahead: u32,
+) -> String {
+    match status {
+        CacheStatus::HitExact | CacheStatus::HitWithDivergence => {
+            let (selected, total) = selection.unwrap_or((0, 0));
+            // Empty cache → vacuous 100% (we ran nothing of nothing).
+            let pct = (selected * 100).checked_div(total).unwrap_or(100);
+            let mut line = format!(
+                "cargo-affected: cache={status} selection={selected}/{total} ({pct}%)"
+            );
+            if matches!(status, CacheStatus::HitWithDivergence) {
+                if missing_shas > 0 {
+                    line.push_str(&format!(" missing_shas={missing_shas}"));
+                }
+                if max_commits_ahead > 0 {
+                    line.push_str(&format!(" max_commits_ahead={max_commits_ahead}"));
+                }
+            }
+            line
+        }
+        CacheStatus::MissNoReachableSha => {
+            format!(
+                "cargo-affected: cache={status} mode=full-suite missing_shas={missing_shas}"
+            )
+        }
+        _ => format!("cargo-affected: cache={status} mode=full-suite"),
+    }
 }
 
 impl Report {

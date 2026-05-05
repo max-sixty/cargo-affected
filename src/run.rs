@@ -30,14 +30,11 @@ use anyhow::{Context, Result};
 use crate::collect::{nextest_filter_exprs, nextest_list, require_nextest};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint::{self, Fingerprint};
-use crate::project::{
-    find_project_root, git_added_files_since, git_changed_files, git_changed_line_ranges,
-};
+use crate::project::{find_project_root, git_changed_files, ShaRelation};
 use crate::report::{
-    CacheStatus, ChangedFileInput, CollectShaSnapshot, FullSuiteInputs, Report,
-    SelectionInputs, StoredFingerprintSnapshot,
+    self, CacheStatus, FullSuiteInputs, Report, SelectionInputs,
 };
-use crate::selection::{self, DiagnosticDetail, Reachability, Selection};
+use crate::selection::{self, DiagnosticDetail, Reachability};
 
 /// Entry point for `cargo affected run`. Returns the exit code to propagate.
 ///
@@ -61,24 +58,24 @@ pub fn run(
         eprintln!("running all tests (--all)");
         // Skip the DB open + fingerprint compute entirely when no report
         // was requested — `--all` is the user explicitly bypassing
-        // cache-aware selection, and an unrelated cache lock or
-        // schema reset shouldn't be able to fail or mutate state on
-        // this path. With a report requested, we still need the
-        // fingerprint and stored snapshots so the artifact has
-        // diagnostic value.
-        if report_json.is_some() {
+        // cache-aware selection, so an unrelated cache lock or schema
+        // reset shouldn't be able to fail or mutate state on this path.
+        if let Some(path) = report_json {
             let fingerprint = fingerprint::compute(&project)?;
-            let db_opt = open_db_if_present(project_root)?;
-            emit_full_suite(
+            let stored = match open_db_if_present(project_root)? {
+                Some(d) => d.stored_fingerprint_snapshots()?,
+                None => vec![],
+            };
+            write_full_suite(
                 "run",
                 CacheStatus::ForcedAll,
-                &fingerprint,
-                db_opt.as_ref(),
-                report_json,
+                Some(fingerprint),
+                stored,
+                vec![],
+                path,
             )?;
-        } else {
-            emit_summary_line(CacheStatus::ForcedAll, None, None, None);
         }
+        eprintln!("{}", report::summary_line(CacheStatus::ForcedAll, None, 0, 0));
         return run_tests(project_root, None, nextest_args);
     }
 
@@ -107,16 +104,10 @@ pub fn run(
             );
             CacheStatus::MissNoCoverage
         };
-        write_full_suite_report(
-            "run",
-            status,
-            Some(fingerprint.hex.clone()),
-            Some(fingerprint.components.clone()),
-            stored,
-            vec![],
-            report_json,
-        )?;
-        emit_summary_line(status, None, None, None);
+        if let Some(path) = report_json {
+            write_full_suite("run", status, Some(fingerprint.clone()), stored, vec![], path)?;
+        }
+        eprintln!("{}", report::summary_line(status, None, 0, 0));
         return run_tests(project_root, None, nextest_args);
     }
 
@@ -133,25 +124,26 @@ pub fn run(
             "note: no reachable collect_sha for the current environment — \
              running all tests; run `cargo affected collect` to re-anchor"
         );
-        if report_json.is_some() {
+        if let Some(path) = report_json {
             let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
-            let collect_sha_snapshots =
-                collect_sha_snapshots_from(&reach, &row_counts);
-            write_full_suite_report(
+            let collect_sha_snapshots = report::collect_sha_snapshots(&reach, &row_counts);
+            write_full_suite(
                 "run",
                 CacheStatus::MissNoReachableSha,
-                Some(fingerprint.hex.clone()),
-                Some(fingerprint.components.clone()),
+                Some(fingerprint.clone()),
                 stored,
                 collect_sha_snapshots,
-                report_json,
+                path,
             )?;
         }
-        emit_summary_line(
-            CacheStatus::MissNoReachableSha,
-            None,
-            Some(reach.missing.len()),
-            None,
+        eprintln!(
+            "{}",
+            report::summary_line(
+                CacheStatus::MissNoReachableSha,
+                None,
+                reach.missing.len(),
+                0,
+            )
         );
         return run_tests(project_root, None, nextest_args);
     }
@@ -191,30 +183,35 @@ pub fn run(
     // doesn't need. Compute them only when --report-json is set.
     if let Some(path) = report_json {
         let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
-        let collect_sha_snapshots = collect_sha_snapshots_from(&reach, &row_counts);
-        let changed_files_input = build_changed_file_inputs(
+        let collect_sha_snapshots = report::collect_sha_snapshots(&reach, &row_counts);
+        let changed_files_input = report::build_changed_file_inputs(
             project_root,
             &db,
             &fingerprint.hex,
             &reach,
             &changed_files,
         )?;
-        write_selection_report(
-            "run",
+        let inputs = SelectionInputs {
+            command: "run",
+            current_fingerprint: fingerprint.hex.clone(),
+            current_components: fingerprint.components.clone(),
+            stored_fingerprints: report::snapshots_from(stored),
+            collect_shas: collect_sha_snapshots,
             status,
-            &fingerprint,
-            stored,
-            collect_sha_snapshots,
-            &sel,
-            changed_files_input,
-            path,
-        )?;
+            selection: &sel,
+            changed_files: changed_files_input,
+            include_changed_files: true,
+        };
+        Report::build_selection(inputs).write_json(path)?;
     }
-    emit_summary_line(
-        status,
-        Some((sel.selected().len(), sel.reachable_known_count)),
-        Some(reach.missing.len()),
-        Some(reach.max_commits_ahead),
+    eprintln!(
+        "{}",
+        report::summary_line(
+            status,
+            Some((sel.selected().len(), sel.reachable_known_count)),
+            reach.missing.len(),
+            reach.max_commits_ahead,
+        )
     );
 
     let selected = sel.selected();
@@ -246,257 +243,47 @@ fn open_db_if_present(project_root: &Path) -> Result<Option<Db>> {
     Ok(Some(Db::open(project_root)?))
 }
 
-/// Compose per-sha snapshots for the report from a `Reachability`
-/// (per-sha relation) and a sha → row-count map.
-fn collect_sha_snapshots_from(
-    reach: &Reachability,
-    row_counts: &std::collections::BTreeMap<String, usize>,
-) -> Vec<CollectShaSnapshot> {
+/// True iff any reachable sha differs from HEAD. Drives the choice
+/// between `hit-exact` and `hit-with-divergence`. status.rs uses the
+/// same predicate. `Reachable { commits_ahead: 0 }` (sibling of HEAD
+/// after `git reset --hard` to its parent) counts as divergence —
+/// the sha resolves but its tree is different from HEAD's.
+fn any_divergence(reach: &Reachability) -> bool {
     reach
         .per_sha
-        .iter()
-        .map(|(sha, relation)| CollectShaSnapshot {
-            sha: sha.clone(),
-            relation: relation.clone(),
-            row_count: row_counts.get(sha).copied().unwrap_or(0),
-        })
-        .collect()
-}
-
-/// Build per-changed-file input entries for the JSON report.
-///
-/// The file set is the UNION of:
-///   - every file appearing in `git_changed_line_ranges(sha)` for any
-///     reachable sha (these have OLD-side hunks and drive selection),
-///   - plus the working-tree changed files (untracked / staged /
-///     unstaged) that don't appear above (no hunks against any sha,
-///     but worth surfacing so consumers see what was considered).
-///
-/// Iterating only the working-tree changes — as we did originally —
-/// would miss files in committed diffs after `collect`, which is the
-/// dominant case (clean tree, HEAD ahead of collect_sha). Selection
-/// runs against those files even though `git_changed_files()` returns
-/// nothing, so the report would show empty `changed_files` while the
-/// actual selection picked tests up.
-fn build_changed_file_inputs(
-    project_root: &Path,
-    db: &Db,
-    fingerprint: &str,
-    reach: &Reachability,
-    working_tree_files: &[String],
-) -> Result<Vec<ChangedFileInput>> {
-    use std::collections::BTreeMap;
-
-    // Cache hunks per sha so we don't re-diff for each file.
-    let mut hunks_per_sha: BTreeMap<String, BTreeMap<String, Vec<crate::project::LineRange>>> =
-        BTreeMap::new();
-    for sha in &reach.reachable {
-        let map = git_changed_line_ranges(project_root, sha)?;
-        hunks_per_sha.insert(sha.clone(), map);
-    }
-
-    // Union: every file mentioned in any per-sha diff, plus committed
-    // additions (which `git_changed_line_ranges` skips because their
-    // OLD side is /dev/null), plus working-tree changes.
-    let mut all_files: std::collections::BTreeSet<String> =
-        working_tree_files.iter().cloned().collect();
-    for by_file in hunks_per_sha.values() {
-        for path in by_file.keys() {
-            all_files.insert(path.clone());
-        }
-    }
-    for sha in &reach.reachable {
-        for added in git_added_files_since(project_root, sha)? {
-            all_files.insert(added);
-        }
-    }
-
-    let mut out = Vec::new();
-    for path in all_files {
-        let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
-        for (sha, by_file) in &hunks_per_sha {
-            if let Some(hunks) = by_file.get(&path) {
-                hunks_by_sha.insert(
-                    sha.clone(),
-                    hunks.iter().map(|h| (h.start, h.end)).collect(),
-                );
-            }
-        }
-        let mut tracked = false;
-        for sha in &reach.reachable {
-            let n = db.tests_covering_ranges(
-                fingerprint,
-                sha,
-                &path,
-                &[crate::project::LineRange { start: 1, end: i64::MAX }],
-            )?;
-            if !n.is_empty() {
-                tracked = true;
-                break;
-            }
-        }
-        out.push(ChangedFileInput {
-            path,
-            tracked_by_coverage: tracked,
-            hunks_by_sha,
-        });
-    }
-    Ok(out)
+        .values()
+        .any(|r| !matches!(r, ShaRelation::Equal))
 }
 
 fn classify_hit_status(reach: &Reachability) -> CacheStatus {
-    // Any sha that isn't `Equal` is divergence: `Reachable { commits_ahead: 0 }`
-    // is still a sibling of HEAD (e.g., after a `git reset --hard` to the
-    // collect_sha's parent — the sha resolves but its tree is different),
-    // and `Missing` shas leave their tests stranded. status.rs uses the
-    // same predicate.
-    let any_divergence = reach
-        .per_sha
-        .values()
-        .any(|r| !matches!(r, crate::project::ShaRelation::Equal));
-    if any_divergence {
+    if any_divergence(reach) {
         CacheStatus::HitWithDivergence
     } else {
         CacheStatus::HitExact
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_selection_report(
+/// Build and write a full-suite report. The Fingerprint is `Option`
+/// because the `--all` path before any DB exists may not have one to
+/// supply (currently it always does, but keep the optional shape so
+/// future fast paths can stay cheap).
+fn write_full_suite(
     command: &'static str,
     status: CacheStatus,
-    fingerprint: &Fingerprint,
+    fingerprint: Option<Fingerprint>,
     stored: Vec<crate::db::StoredFingerprintRow>,
-    collect_shas: Vec<CollectShaSnapshot>,
-    selection: &Selection,
-    changed_files: Vec<ChangedFileInput>,
+    collect_shas: Vec<crate::report::CollectShaSnapshot>,
     path: &Path,
 ) -> Result<()> {
-    let inputs = SelectionInputs {
-        command,
-        current_fingerprint: fingerprint.hex.clone(),
-        current_components: fingerprint.components.clone(),
-        stored_fingerprints: to_snapshots(stored),
-        collect_shas,
-        status,
-        selection,
-        changed_files,
-        include_changed_files: true,
-    };
-    Report::build_selection(inputs).write_json(path)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_full_suite_report(
-    command: &'static str,
-    status: CacheStatus,
-    current_fingerprint: Option<String>,
-    current_components: Option<Vec<crate::fingerprint::FingerprintComponent>>,
-    stored: Vec<crate::db::StoredFingerprintRow>,
-    collect_shas: Vec<CollectShaSnapshot>,
-    report_json: Option<&Path>,
-) -> Result<()> {
-    let Some(path) = report_json else {
-        return Ok(());
-    };
     let inputs = FullSuiteInputs {
         command,
-        current_fingerprint,
-        current_components,
-        stored_fingerprints: to_snapshots(stored),
+        current_fingerprint: fingerprint.as_ref().map(|f| f.hex.clone()),
+        current_components: fingerprint.map(|f| f.components),
+        stored_fingerprints: report::snapshots_from(stored),
         collect_shas,
         status,
     };
     Report::build_full_suite(inputs).write_json(path)
-}
-
-fn to_snapshots(rows: Vec<crate::db::StoredFingerprintRow>) -> Vec<StoredFingerprintSnapshot> {
-    rows.into_iter()
-        .map(|r| StoredFingerprintSnapshot {
-            fingerprint: r.fingerprint,
-            last_seen: r.last_seen,
-            components: r.components,
-        })
-        .collect()
-}
-
-/// Helper for the `--all` path which doesn't open the DB unless one
-/// exists. Builds the report from whatever's available (empty stored /
-/// collect arrays are fine).
-fn emit_full_suite(
-    command: &'static str,
-    status: CacheStatus,
-    fingerprint: &Fingerprint,
-    db: Option<&Db>,
-    report_json: Option<&Path>,
-) -> Result<()> {
-    let stored = match db {
-        Some(d) => d.stored_fingerprint_snapshots()?,
-        None => vec![],
-    };
-    write_full_suite_report(
-        command,
-        status,
-        Some(fingerprint.hex.clone()),
-        Some(fingerprint.components.clone()),
-        stored,
-        vec![],
-        report_json,
-    )?;
-    emit_summary_line(status, None, None, None);
-    Ok(())
-}
-
-/// Final stderr line a CI consumer can grep to track selection ratios
-/// over time. Format depends on cache status; per the design doc, miss
-/// statuses get `mode=full-suite` and the closest-component label as
-/// `reason=`; hit statuses get the selection ratio.
-fn emit_summary_line(
-    status: CacheStatus,
-    selection: Option<(usize, usize)>,
-    missing_shas: Option<usize>,
-    max_commits_ahead: Option<u32>,
-) {
-    let status_str = match status {
-        CacheStatus::HitExact => "hit-exact",
-        CacheStatus::HitWithDivergence => "hit-with-divergence",
-        CacheStatus::MissFingerprint => "miss-fingerprint",
-        CacheStatus::MissNoCoverage => "miss-no-coverage",
-        CacheStatus::MissNoReachableSha => "miss-no-reachable-sha",
-        CacheStatus::ForcedAll => "forced-all",
-    };
-    match status {
-        CacheStatus::HitExact | CacheStatus::HitWithDivergence => {
-            let (selected, total) = selection.unwrap_or((0, 0));
-            // Empty cache → vacuous 100% (we ran nothing of nothing).
-            let pct = (selected * 100).checked_div(total).unwrap_or(100);
-            let mut line = format!(
-                "cargo-affected: cache={status_str} selection={selected}/{total} ({pct}%)"
-            );
-            if matches!(status, CacheStatus::HitWithDivergence) {
-                if let Some(m) = missing_shas {
-                    if m > 0 {
-                        line.push_str(&format!(" missing_shas={m}"));
-                    }
-                }
-                if let Some(c) = max_commits_ahead {
-                    if c > 0 {
-                        line.push_str(&format!(" max_commits_ahead={c}"));
-                    }
-                }
-            }
-            eprintln!("{line}");
-        }
-        CacheStatus::MissNoReachableSha => {
-            let m = missing_shas.unwrap_or(0);
-            eprintln!(
-                "cargo-affected: cache={status_str} mode=full-suite missing_shas={m}"
-            );
-        }
-        _ => {
-            eprintln!("cargo-affected: cache={status_str} mode=full-suite");
-        }
-    }
 }
 
 /// Run tests via `cargo nextest run`. `tests == None` runs all tests;
