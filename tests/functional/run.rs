@@ -80,6 +80,10 @@ fn run_executes_only_affected_tests() {
 /// execution so the contrast between fail-fast modes is deterministic (with
 /// parallel workers both might already be in flight before the first failure
 /// triggers a cancel).
+///
+/// Assertions look at ANSI-stable substrings (`Cancelling`, `test_multiply`)
+/// rather than nextest's count summaries (`1/2 tests run`), which CI's
+/// `CARGO_TERM_COLOR=always` sprays with escape sequences between digits.
 #[test]
 fn run_forwards_fail_fast_flags_to_nextest() {
     let tmp = tempfile::tempdir().unwrap();
@@ -111,8 +115,14 @@ fn run_forwards_fail_fast_flags_to_nextest() {
     );
     let default_out = combined_output(&default);
     assert!(
-        default_out.contains("1/2 tests run"),
-        "expected nextest to cancel after first failure (1/2 tests run); got:\n{default_out}"
+        default_out.contains("Cancelling"),
+        "expected nextest to print its 'Cancelling due to test failure' \
+         line on default fail-fast; got:\n{default_out}"
+    );
+    assert!(
+        !default_out.contains("test_multiply"),
+        "test_multiply must not run when default fail-fast cancels after \
+         the first failure; got:\n{default_out}"
     );
 
     // --no-fail-fast: nextest must run both selected tests despite the first
@@ -127,23 +137,25 @@ fn run_forwards_fail_fast_flags_to_nextest() {
     );
     let nff_out = combined_output(&nff);
     assert!(
-        nff_out.contains("2 tests run"),
-        "expected --no-fail-fast to run both tests (2 tests run); got:\n{nff_out}"
+        !nff_out.contains("Cancelling"),
+        "expected --no-fail-fast to skip nextest's cancel path; got:\n{nff_out}"
     );
     assert!(
         nff_out.contains("test_add") && nff_out.contains("test_multiply"),
-        "expected both failing tests in output, got:\n{nff_out}"
+        "expected both failing tests to appear with --no-fail-fast; got:\n{nff_out}"
     );
 
     // --max-fail=2 reaches nextest the same way: both tests are attempted
-    // because the second failure is still within budget.
+    // because the second failure is still within budget. (nextest still
+    // prints a 'Cancelling' line at the end since the budget is exactly hit
+    // — that's expected, so we don't assert on its presence/absence here.)
     let mf2 = cargo_affected(
         dir,
         &["affected", "run", "--", "--test-threads=1", "--max-fail=2"],
     );
     let mf2_out = combined_output(&mf2);
     assert!(
-        mf2_out.contains("2 tests run"),
+        mf2_out.contains("test_add") && mf2_out.contains("test_multiply"),
         "expected --max-fail=2 to run both tests; got:\n{mf2_out}"
     );
 
