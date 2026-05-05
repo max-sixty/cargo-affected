@@ -33,7 +33,7 @@ pub fn status(verbose: bool) -> Result<()> {
         return Ok(());
     }
 
-    let env_fingerprint = fingerprint::compute(&project)?;
+    let env_fingerprint = fingerprint::compute(&project)?.hex;
     let db = Db::open(project_root)?;
 
     let known_count = db.test_count(&env_fingerprint)?;

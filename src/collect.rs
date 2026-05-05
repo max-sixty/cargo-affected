@@ -190,7 +190,7 @@ pub fn collect(
         listing.tests.len(),
         listing.binaries.len()
     );
-    let env_fingerprint = fingerprint::compute(&project)?;
+    let env_fingerprint = fingerprint::compute(&project)?.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.

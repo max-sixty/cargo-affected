@@ -47,7 +47,7 @@ pub fn run(all: bool, verbose: bool, nextest_args: &[String]) -> Result<i32> {
         return run_tests(project_root, None, nextest_args);
     }
 
-    let env_fingerprint = fingerprint::compute(&project)?;
+    let env_fingerprint = fingerprint::compute(&project)?.hex;
     let db = Db::open(project_root)?;
 
     if db.test_count(&env_fingerprint)? == 0 {
