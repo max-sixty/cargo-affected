@@ -26,7 +26,7 @@
 //! caller's current fingerprint, so a mismatch naturally reads as "no data"
 //! without any special-case invalidation path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -133,6 +133,16 @@ impl TestId {
             test_name: test_name.into(),
         }
     }
+}
+
+/// One row in the `fingerprints` table, materialized with its component
+/// hashes from `fingerprint_components`. Returned by
+/// [`Db::stored_fingerprint_snapshots`] for the diagnostic report.
+#[derive(Debug, Clone)]
+pub struct StoredFingerprintRow {
+    pub fingerprint: String,
+    pub last_seen: String,
+    pub components: Vec<FingerprintComponent>,
 }
 
 /// One hit recorded by [`Db::tests_covering_ranges`]: which test got pulled
@@ -588,6 +598,68 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Snapshot of every stored fingerprint with its `last_seen`
+    /// timestamp and component hashes. Used by the diagnostic report to
+    /// compute "which input differs?" diffs against the current
+    /// fingerprint. Empty when the DB has never been written to.
+    pub fn stored_fingerprint_snapshots(&self) -> Result<Vec<StoredFingerprintRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fingerprint, last_seen FROM fingerprints \
+             ORDER BY last_seen DESC, fingerprint ASC",
+        )?;
+        let mut fps: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(fps.len());
+        let mut comp_stmt = self.conn.prepare(
+            "SELECT label, content_hash FROM fingerprint_components \
+             WHERE env_fingerprint = ?1 ORDER BY label",
+        )?;
+        for (fp, last_seen) in fps.drain(..) {
+            let components: Vec<FingerprintComponent> = comp_stmt
+                .query_map([&fp], |row| {
+                    Ok(FingerprintComponent {
+                        label: row.get::<_, String>(0)?,
+                        hash: row.get::<_, String>(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out.push(StoredFingerprintRow {
+                fingerprint: fp,
+                last_seen,
+                components,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `test_regions` row counts per `collect_sha`, scoped to one
+    /// fingerprint. Used by the report to show how much data is
+    /// anchored at each sha. One query — diagnostic, not a hot path.
+    pub fn row_counts_by_sha(
+        &self,
+        fingerprint: &str,
+    ) -> Result<BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT collect_sha, COUNT(*) FROM test_regions \
+             WHERE env_fingerprint = ?1 \
+             GROUP BY collect_sha",
+        )?;
+        let rows = stmt.query_map([fingerprint], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for r in rows {
+            let (sha, count) = r?;
+            out.insert(sha, count as usize);
+        }
+        Ok(out)
     }
 
     /// Distinct (binary_id, test_name) pairs under `fingerprint`, ignoring

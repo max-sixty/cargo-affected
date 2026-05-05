@@ -32,6 +32,11 @@ cargo affected status     # dry-run: show what would run
 cargo affected clean      # wipe the coverage cache
 ```
 
+For CI integration or debugging selection, both `run` and `status`
+accept `--report-json <PATH>` to emit a structured artifact alongside
+their normal output. See [`docs/report-json.md`](docs/report-json.md)
+for the schema and a stable summary line CI can grep.
+
 `run` diffs the working tree against the git sha that was HEAD when
 `collect` last ran. Recollect periodically — every committed change since
 the last collect adds to the diff and broadens selection.

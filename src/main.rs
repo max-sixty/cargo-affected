@@ -8,14 +8,17 @@ mod coverage;
 mod db;
 mod fingerprint;
 mod project;
+mod report;
 mod run;
 mod selection;
 #[cfg(unix)]
 mod shim;
 mod status;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Run only the tests affected by your changes.
 #[derive(Parser)]
@@ -63,6 +66,19 @@ enum Action {
         /// Run all tests, skipping coverage-based selection.
         #[arg(long)]
         all: bool,
+        /// Write a structured JSON diagnostic report to PATH after
+        /// selection but before invoking nextest. The report names
+        /// the cache status, which inputs differ from any cached
+        /// snapshot (on miss), and per-file/per-test selection
+        /// reasoning. See docs/report-json.md for the schema.
+        #[arg(long, value_name = "PATH")]
+        report_json: Option<PathBuf>,
+        /// Detail level for the report's selection section. `summary`
+        /// keeps per-file aggregate counts only (bounded);
+        /// `full` adds per-test reason vectors (can be megabytes on
+        /// large test suites).
+        #[arg(long, value_enum, default_value_t = ReportDetail::Summary)]
+        report_detail: ReportDetail,
         /// Extra args forwarded to `cargo nextest run`. Must be preceded by
         /// `--` (e.g. `cargo affected run -- --features foo`); otherwise
         /// clap rejects unknown flags rather than risk swallowing one of
@@ -71,9 +87,36 @@ enum Action {
         nextest_args: Vec<String>,
     },
     /// Show stored coverage data and what would run for current changes.
-    Status,
+    Status {
+        /// Write a structured JSON diagnostic report to PATH. See
+        /// docs/report-json.md for the schema.
+        #[arg(long, value_name = "PATH")]
+        report_json: Option<PathBuf>,
+        /// Detail level for the report's selection section.
+        #[arg(long, value_enum, default_value_t = ReportDetail::Summary)]
+        report_detail: ReportDetail,
+    },
     /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
+}
+
+/// Mirrors `selection::DiagnosticDetail` at the CLI surface so clap can
+/// derive `ValueEnum` without importing into the selection module.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReportDetail {
+    /// Per-file aggregate counters only.
+    Summary,
+    /// Per-test reason vectors plus per-file aggregates.
+    Full,
+}
+
+impl From<ReportDetail> for selection::DiagnosticDetail {
+    fn from(d: ReportDetail) -> Self {
+        match d {
+            ReportDetail::Summary => Self::Summary,
+            ReportDetail::Full => Self::Full,
+        }
+    }
 }
 
 fn clean() -> Result<()> {
@@ -137,9 +180,23 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
             allow_dirty,
             nextest_args,
         } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
-        Action::Run { all, nextest_args } => run::run(all, verbose, &nextest_args),
-        Action::Status => {
-            status::status(verbose)?;
+        Action::Run {
+            all,
+            report_json,
+            report_detail,
+            nextest_args,
+        } => run::run(
+            all,
+            verbose,
+            report_json.as_deref(),
+            report_detail.into(),
+            &nextest_args,
+        ),
+        Action::Status {
+            report_json,
+            report_detail,
+        } => {
+            status::status(verbose, report_json.as_deref(), report_detail.into())?;
             Ok(0)
         }
         Action::Clean => {
@@ -254,7 +311,7 @@ mod tests {
     fn known_run_flags_parse_before_double_dash() {
         // Subcommand-owned flags still parse normally before `--`.
         let cli = parse(&["run", "--all", "--", "--features", "foo"]);
-        let Action::Run { all, nextest_args } = cli.action else {
+        let Action::Run { all, nextest_args, .. } = cli.action else {
             panic!("expected Run");
         };
         assert!(all);
