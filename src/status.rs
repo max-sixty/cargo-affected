@@ -64,8 +64,13 @@ pub fn status(
 
     let fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
-    let stored = db.stored_fingerprint_snapshots()?;
-    let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
+    // Stored snapshots and per-sha row counts are diagnostic-only;
+    // skip the reads when no report was requested.
+    let stored = if report_json.is_some() {
+        db.stored_fingerprint_snapshots()?
+    } else {
+        Vec::new()
+    };
 
     let known_count = db.test_count(&fingerprint.hex)?;
     let region_count = db.region_count(&fingerprint.hex)?;
@@ -134,6 +139,7 @@ pub fn status(
              would run all tests; run `cargo affected collect` to re-anchor"
         );
         if let Some(report_path) = report_json {
+            let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
             let collect_sha_snapshots = collect_sha_snapshots_from_reach(&reach, &row_counts);
             write_full_suite_report(
                 "status",
@@ -197,6 +203,7 @@ pub fn status(
     // they cost extra git diffs and SQLite queries that status itself
     // doesn't need.
     if let Some(report_path) = report_json {
+        let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
         let collect_sha_snapshots = collect_sha_snapshots_from_reach(&reach, &row_counts);
         let changed_files_input = build_changed_file_inputs(
             project_root,
@@ -289,6 +296,11 @@ fn build_changed_file_inputs(
     for by_file in hunks_per_sha.values() {
         for path in by_file.keys() {
             all_files.insert(path.clone());
+        }
+    }
+    for sha in &reach.reachable {
+        for added in crate::project::git_added_files_since(project_root, sha)? {
+            all_files.insert(added);
         }
     }
 

@@ -30,7 +30,9 @@ use anyhow::{Context, Result};
 use crate::collect::{nextest_filter_exprs, nextest_list, require_nextest};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint::{self, Fingerprint};
-use crate::project::{find_project_root, git_changed_files, git_changed_line_ranges};
+use crate::project::{
+    find_project_root, git_added_files_since, git_changed_files, git_changed_line_ranges,
+};
 use crate::report::{
     CacheStatus, ChangedFileInput, CollectShaSnapshot, FullSuiteInputs, Report,
     SelectionInputs, StoredFingerprintSnapshot,
@@ -82,8 +84,13 @@ pub fn run(
 
     let fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
-    let stored = db.stored_fingerprint_snapshots()?;
-    let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
+    let stored = if report_json.is_some() {
+        db.stored_fingerprint_snapshots()?
+    } else {
+        // Stored snapshots are diagnostic-only — skip the read when no
+        // report is requested.
+        Vec::new()
+    };
 
     if db.test_count(&fingerprint.hex)? == 0 {
         let status = if db.has_any_coverage()? {
@@ -126,17 +133,20 @@ pub fn run(
             "note: no reachable collect_sha for the current environment — \
              running all tests; run `cargo affected collect` to re-anchor"
         );
-        let collect_sha_snapshots =
-            collect_sha_snapshots_from(&reach, &row_counts);
-        write_full_suite_report(
-            "run",
-            CacheStatus::MissNoReachableSha,
-            Some(fingerprint.hex.clone()),
-            Some(fingerprint.components.clone()),
-            stored,
-            collect_sha_snapshots,
-            report_json,
-        )?;
+        if report_json.is_some() {
+            let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
+            let collect_sha_snapshots =
+                collect_sha_snapshots_from(&reach, &row_counts);
+            write_full_suite_report(
+                "run",
+                CacheStatus::MissNoReachableSha,
+                Some(fingerprint.hex.clone()),
+                Some(fingerprint.components.clone()),
+                stored,
+                collect_sha_snapshots,
+                report_json,
+            )?;
+        }
         emit_summary_line(
             CacheStatus::MissNoReachableSha,
             None,
@@ -180,6 +190,7 @@ pub fn run(
     // they cost extra git diffs and SQLite queries that selection itself
     // doesn't need. Compute them only when --report-json is set.
     if let Some(path) = report_json {
+        let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
         let collect_sha_snapshots = collect_sha_snapshots_from(&reach, &row_counts);
         let changed_files_input = build_changed_file_inputs(
             project_root,
@@ -284,12 +295,19 @@ fn build_changed_file_inputs(
         hunks_per_sha.insert(sha.clone(), map);
     }
 
-    // Union: every file mentioned in any per-sha diff, plus working-tree
-    // changes. BTreeSet keeps the order stable for downstream sorting.
-    let mut all_files: std::collections::BTreeSet<String> = working_tree_files.iter().cloned().collect();
+    // Union: every file mentioned in any per-sha diff, plus committed
+    // additions (which `git_changed_line_ranges` skips because their
+    // OLD side is /dev/null), plus working-tree changes.
+    let mut all_files: std::collections::BTreeSet<String> =
+        working_tree_files.iter().cloned().collect();
     for by_file in hunks_per_sha.values() {
         for path in by_file.keys() {
             all_files.insert(path.clone());
+        }
+    }
+    for sha in &reach.reachable {
+        for added in git_added_files_since(project_root, sha)? {
+            all_files.insert(added);
         }
     }
 
