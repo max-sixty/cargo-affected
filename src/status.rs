@@ -182,14 +182,6 @@ pub fn status(
         detail,
     )?;
 
-    let collect_sha_snapshots = collect_sha_snapshots_from_reach(&reach, &row_counts);
-    let changed_files_input = build_changed_file_inputs(
-        project_root,
-        &db,
-        &fingerprint.hex,
-        &reach,
-        &changed_files,
-    )?;
     let status = if reach.missing.is_empty()
         && reach
             .per_sha
@@ -201,7 +193,18 @@ pub fn status(
         CacheStatus::HitWithDivergence
     };
 
+    // Per-changed-file diagnostics + per-sha snapshots are report-only:
+    // they cost extra git diffs and SQLite queries that status itself
+    // doesn't need.
     if let Some(report_path) = report_json {
+        let collect_sha_snapshots = collect_sha_snapshots_from_reach(&reach, &row_counts);
+        let changed_files_input = build_changed_file_inputs(
+            project_root,
+            &db,
+            &fingerprint.hex,
+            &reach,
+            &changed_files,
+        )?;
         let inputs = SelectionInputs {
             command: "status",
             current_fingerprint: fingerprint.hex.clone(),

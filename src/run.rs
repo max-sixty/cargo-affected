@@ -55,21 +55,32 @@ pub fn run(
     let project_root = &project.workspace_root;
     require_nextest(project_root)?;
 
-    let fingerprint = fingerprint::compute(&project)?;
-
     if all {
         eprintln!("running all tests (--all)");
-        let db_opt = open_db_if_present(project_root)?;
-        emit_full_suite(
-            "run",
-            CacheStatus::ForcedAll,
-            &fingerprint,
-            db_opt.as_ref(),
-            report_json,
-        )?;
+        // Skip the DB open + fingerprint compute entirely when no report
+        // was requested — `--all` is the user explicitly bypassing
+        // cache-aware selection, and an unrelated cache lock or
+        // schema reset shouldn't be able to fail or mutate state on
+        // this path. With a report requested, we still need the
+        // fingerprint and stored snapshots so the artifact has
+        // diagnostic value.
+        if report_json.is_some() {
+            let fingerprint = fingerprint::compute(&project)?;
+            let db_opt = open_db_if_present(project_root)?;
+            emit_full_suite(
+                "run",
+                CacheStatus::ForcedAll,
+                &fingerprint,
+                db_opt.as_ref(),
+                report_json,
+            )?;
+        } else {
+            emit_summary_line(CacheStatus::ForcedAll, None, None, None);
+        }
         return run_tests(project_root, None, nextest_args);
     }
 
+    let fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
     let stored = db.stored_fingerprint_snapshots()?;
     let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
@@ -163,26 +174,31 @@ pub fn run(
         detail,
     )?;
 
-    let collect_sha_snapshots = collect_sha_snapshots_from(&reach, &row_counts);
-    let changed_files_input = build_changed_file_inputs(
-        project_root,
-        &db,
-        &fingerprint.hex,
-        &reach,
-        &changed_files,
-    )?;
     let status = classify_hit_status(&reach);
 
-    write_selection_report(
-        "run",
-        status,
-        &fingerprint,
-        stored,
-        collect_sha_snapshots,
-        &sel,
-        changed_files_input,
-        report_json,
-    )?;
+    // Per-changed-file diagnostics + per-sha snapshots are report-only:
+    // they cost extra git diffs and SQLite queries that selection itself
+    // doesn't need. Compute them only when --report-json is set.
+    if let Some(path) = report_json {
+        let collect_sha_snapshots = collect_sha_snapshots_from(&reach, &row_counts);
+        let changed_files_input = build_changed_file_inputs(
+            project_root,
+            &db,
+            &fingerprint.hex,
+            &reach,
+            &changed_files,
+        )?;
+        write_selection_report(
+            "run",
+            status,
+            &fingerprint,
+            stored,
+            collect_sha_snapshots,
+            &sel,
+            changed_files_input,
+            path,
+        )?;
+    }
     emit_summary_line(
         status,
         Some((sel.selected().len(), sel.reachable_known_count)),
@@ -290,11 +306,15 @@ fn build_changed_file_inputs(
 }
 
 fn classify_hit_status(reach: &Reachability) -> CacheStatus {
-    let any_divergence = !reach.missing.is_empty()
-        || reach
-            .per_sha
-            .values()
-            .any(|r| matches!(r, crate::project::ShaRelation::Reachable { commits_ahead } if *commits_ahead > 0));
+    // Any sha that isn't `Equal` is divergence: `Reachable { commits_ahead: 0 }`
+    // is still a sibling of HEAD (e.g., after a `git reset --hard` to the
+    // collect_sha's parent — the sha resolves but its tree is different),
+    // and `Missing` shas leave their tests stranded. status.rs uses the
+    // same predicate.
+    let any_divergence = reach
+        .per_sha
+        .values()
+        .any(|r| !matches!(r, crate::project::ShaRelation::Equal));
     if any_divergence {
         CacheStatus::HitWithDivergence
     } else {
@@ -311,11 +331,8 @@ fn write_selection_report(
     collect_shas: Vec<CollectShaSnapshot>,
     selection: &Selection,
     changed_files: Vec<ChangedFileInput>,
-    report_json: Option<&Path>,
+    path: &Path,
 ) -> Result<()> {
-    let Some(path) = report_json else {
-        return Ok(());
-    };
     let inputs = SelectionInputs {
         command,
         current_fingerprint: fingerprint.hex.clone(),
