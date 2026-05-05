@@ -265,12 +265,16 @@ fn collect_sha_snapshots_from_reach(
         .collect()
 }
 
+/// Mirrors `run.rs::build_changed_file_inputs` — the file set is the
+/// UNION of files in any per-sha diff plus working-tree changes, so
+/// the report doesn't drop committed-diff files that selection
+/// actually consumed.
 fn build_changed_file_inputs(
     project_root: &Path,
     db: &Db,
     fingerprint: &str,
     reach: &selection::Reachability,
-    changed_files: &[String],
+    working_tree_files: &[String],
 ) -> Result<Vec<crate::report::ChangedFileInput>> {
     use std::collections::BTreeMap;
     let mut hunks_per_sha: BTreeMap<String, BTreeMap<String, Vec<crate::project::LineRange>>> =
@@ -280,11 +284,19 @@ fn build_changed_file_inputs(
         hunks_per_sha.insert(sha.clone(), map);
     }
 
+    let mut all_files: std::collections::BTreeSet<String> =
+        working_tree_files.iter().cloned().collect();
+    for by_file in hunks_per_sha.values() {
+        for path in by_file.keys() {
+            all_files.insert(path.clone());
+        }
+    }
+
     let mut out = Vec::new();
-    for path in changed_files {
+    for path in all_files {
         let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
         for (sha, by_file) in &hunks_per_sha {
-            if let Some(hunks) = by_file.get(path) {
+            if let Some(hunks) = by_file.get(&path) {
                 hunks_by_sha.insert(
                     sha.clone(),
                     hunks.iter().map(|h| (h.start, h.end)).collect(),
@@ -296,7 +308,7 @@ fn build_changed_file_inputs(
             let n = db.tests_covering_ranges(
                 fingerprint,
                 sha,
-                path,
+                &path,
                 &[crate::project::LineRange { start: 1, end: i64::MAX }],
             )?;
             if !n.is_empty() {
@@ -305,7 +317,7 @@ fn build_changed_file_inputs(
             }
         }
         out.push(crate::report::ChangedFileInput {
-            path: path.clone(),
+            path,
             tracked_by_coverage: tracked,
             hunks_by_sha,
         });

@@ -252,15 +252,27 @@ fn collect_sha_snapshots_from(
         .collect()
 }
 
-/// Build per-changed-file input entries: for each file, compute hunks
-/// against every reachable sha and decide whether the file is tracked
-/// by coverage (has at least one stored row at any reachable sha).
+/// Build per-changed-file input entries for the JSON report.
+///
+/// The file set is the UNION of:
+///   - every file appearing in `git_changed_line_ranges(sha)` for any
+///     reachable sha (these have OLD-side hunks and drive selection),
+///   - plus the working-tree changed files (untracked / staged /
+///     unstaged) that don't appear above (no hunks against any sha,
+///     but worth surfacing so consumers see what was considered).
+///
+/// Iterating only the working-tree changes — as we did originally —
+/// would miss files in committed diffs after `collect`, which is the
+/// dominant case (clean tree, HEAD ahead of collect_sha). Selection
+/// runs against those files even though `git_changed_files()` returns
+/// nothing, so the report would show empty `changed_files` while the
+/// actual selection picked tests up.
 fn build_changed_file_inputs(
     project_root: &Path,
     db: &Db,
     fingerprint: &str,
     reach: &Reachability,
-    changed_files: &[String],
+    working_tree_files: &[String],
 ) -> Result<Vec<ChangedFileInput>> {
     use std::collections::BTreeMap;
 
@@ -272,11 +284,20 @@ fn build_changed_file_inputs(
         hunks_per_sha.insert(sha.clone(), map);
     }
 
+    // Union: every file mentioned in any per-sha diff, plus working-tree
+    // changes. BTreeSet keeps the order stable for downstream sorting.
+    let mut all_files: std::collections::BTreeSet<String> = working_tree_files.iter().cloned().collect();
+    for by_file in hunks_per_sha.values() {
+        for path in by_file.keys() {
+            all_files.insert(path.clone());
+        }
+    }
+
     let mut out = Vec::new();
-    for path in changed_files {
+    for path in all_files {
         let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
         for (sha, by_file) in &hunks_per_sha {
-            if let Some(hunks) = by_file.get(path) {
+            if let Some(hunks) = by_file.get(&path) {
                 hunks_by_sha.insert(
                     sha.clone(),
                     hunks.iter().map(|h| (h.start, h.end)).collect(),
@@ -288,7 +309,7 @@ fn build_changed_file_inputs(
             let n = db.tests_covering_ranges(
                 fingerprint,
                 sha,
-                path,
+                &path,
                 &[crate::project::LineRange { start: 1, end: i64::MAX }],
             )?;
             if !n.is_empty() {
@@ -297,7 +318,7 @@ fn build_changed_file_inputs(
             }
         }
         out.push(ChangedFileInput {
-            path: path.clone(),
+            path,
             tracked_by_coverage: tracked,
             hunks_by_sha,
         });

@@ -113,7 +113,10 @@ pub struct CollectShaEntry {
     /// `equal` | `reachable` | `missing`
     pub relation: &'static str,
     /// Number of commits between this sha and HEAD; absent for `equal`
-    /// and `missing`.
+    /// and `missing`. Skipped (not emitted as `null`) so consumers can
+    /// use field presence to detect reachable shas — matches the
+    /// documented v1 schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub commits_ahead: Option<u32>,
     /// Total `test_regions` rows anchored at this sha for the current
     /// fingerprint.

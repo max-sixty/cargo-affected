@@ -297,12 +297,16 @@ pub(crate) fn compute(
         }
     }
 
-    // Collect hits per file across all reachable shas. We accumulate the
-    // raw HitReason vector regardless of detail level — bounded by the
-    // hits actually produced — and decide later whether to retain it
-    // per-test (Full) or only fold to per-file counts (Summary).
+    // Detail-aware retention. In `Summary` mode we never materialize
+    // a per-test reason vector — we stream each hit directly into the
+    // (file, test) → strongest-kind map and discard the reason after.
+    // In `Full` mode we additionally retain the per-test vector for the
+    // JSON report to consume.
     let mut affected = BTreeSet::new();
+    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> =
+        BTreeMap::new();
     let mut per_test_reasons: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
+    let retain_per_test = matches!(detail, DiagnosticDetail::Full);
     for (collect_sha, ranges_by_file) in changed_ranges_by_sha {
         for (file, hunks) in ranges_by_file {
             if hunks.is_empty() {
@@ -312,15 +316,25 @@ pub(crate) fn compute(
                 db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
                 affected.insert(hit.test_id.clone());
-                per_test_reasons
-                    .entry(hit.test_id)
+                let kind = hit.reason.kind;
+                let entry = strongest_per_file_test
+                    .entry(hit.reason.file.clone())
                     .or_default()
-                    .push(hit.reason);
+                    .entry(hit.test_id.clone());
+                entry
+                    .and_modify(|existing| *existing = strongest(*existing, kind))
+                    .or_insert(kind);
+                if retain_per_test {
+                    per_test_reasons
+                        .entry(hit.test_id)
+                        .or_default()
+                        .push(hit.reason);
+                }
             }
         }
     }
 
-    let per_file = roll_up_per_file(&per_test_reasons);
+    let per_file = aggregate_per_file_counts(&strongest_per_file_test);
     let diagnostics = match detail {
         DiagnosticDetail::Summary => SelectionDiagnostics::Summary { per_file },
         DiagnosticDetail::Full => SelectionDiagnostics::Full {
@@ -339,29 +353,12 @@ pub(crate) fn compute(
     })
 }
 
-/// Fold per-test reasons into per-file counts using strongest-reason
-/// dedup. A test with multiple reasons in the same file counts once,
-/// classified by its strongest reason; counts within a file therefore
-/// sum to `total_unique_tests`.
-fn roll_up_per_file(
-    per_test: &BTreeMap<TestId, Vec<HitReason>>,
+/// Fold the (file → test → strongest-kind) map into per-file counts.
+/// Each (file, test) contributes once, classified by its strongest kind;
+/// counts within a file therefore sum to `total_unique_tests`.
+fn aggregate_per_file_counts(
+    strongest_per_file_test: &BTreeMap<String, BTreeMap<TestId, HitKind>>,
 ) -> BTreeMap<String, FileReasonCounts> {
-    // For each (file, test) pair, find the strongest reason kind across
-    // all matching reasons. Then bump the per-file counter for that kind.
-    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> =
-        BTreeMap::new();
-    for (test, reasons) in per_test {
-        for r in reasons {
-            let entry = strongest_per_file_test
-                .entry(r.file.clone())
-                .or_default()
-                .entry(test.clone());
-            entry
-                .and_modify(|k| *k = strongest(*k, r.kind))
-                .or_insert(r.kind);
-        }
-    }
-
     let mut out: BTreeMap<String, FileReasonCounts> = BTreeMap::new();
     for (file, by_test) in strongest_per_file_test {
         let mut counts = FileReasonCounts::default();
@@ -373,7 +370,7 @@ fn roll_up_per_file(
             }
             counts.total_unique_tests += 1;
         }
-        out.insert(file, counts);
+        out.insert(file.clone(), counts);
     }
     out
 }
@@ -506,32 +503,23 @@ mod tests {
     }
 
     #[test]
-    fn roll_up_dedupes_test_per_file_by_strongest_reason() {
+    fn aggregate_dedupes_test_per_file_by_strongest_reason() {
         // test_a hit by LineOverlap AND CrateRootSentinel for the same
-        // file should count once, classified as LineOverlap.
+        // file should count once, classified as LineOverlap. The
+        // strongest-kind map is what `compute()` builds in summary mode
+        // (avoiding the per-test reason vector).
         let test_a = tid("crate_a", "a");
-        let mut per_test: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
-        per_test.insert(
-            test_a.clone(),
-            vec![
-                HitReason {
-                    collect_sha: "deadbeef".to_string(),
-                    file: "src/lib.rs".to_string(),
-                    kind: HitKind::CrateRootSentinel,
-                    matched_hunk: (5, 5),
-                    stored_range: Some((1, i64::MAX)),
-                },
-                HitReason {
-                    collect_sha: "deadbeef".to_string(),
-                    file: "src/lib.rs".to_string(),
-                    kind: HitKind::LineOverlap,
-                    matched_hunk: (5, 5),
-                    stored_range: Some((3, 7)),
-                },
-            ],
-        );
+        let mut strongest: BTreeMap<String, BTreeMap<TestId, HitKind>> = BTreeMap::new();
+        let by_test = strongest.entry("src/lib.rs".to_string()).or_default();
+        // Insert sentinel first, then LineOverlap — the upgrade path is
+        // what we're exercising.
+        by_test.insert(test_a.clone(), HitKind::CrateRootSentinel);
+        let entry = by_test.entry(test_a.clone());
+        entry
+            .and_modify(|k| *k = super::strongest(*k, HitKind::LineOverlap))
+            .or_insert(HitKind::LineOverlap);
 
-        let counts = roll_up_per_file(&per_test);
+        let counts = aggregate_per_file_counts(&strongest);
         let lib = counts.get("src/lib.rs").expect("src/lib.rs should appear");
         assert_eq!(lib.line_overlap, 1);
         assert_eq!(lib.structural_backstop, 0);
