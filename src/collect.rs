@@ -190,7 +190,8 @@ pub fn collect(
         listing.tests.len(),
         listing.binaries.len()
     );
-    let env_fingerprint = fingerprint::compute(&project)?.hex;
+    let fingerprint = fingerprint::compute(&project)?;
+    let env_fingerprint = &fingerprint.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.
@@ -206,10 +207,10 @@ pub fn collect(
     // happens later in this function so the DB write surface stays in one
     // place.
     let diff_plan = if diff {
-        match plan_diff_collect(project_root, &db, &env_fingerprint, &listing)? {
+        match plan_diff_collect(project_root, &db, env_fingerprint, &listing)? {
             DiffOutcome::Plan(plan) => Some(plan),
             DiffOutcome::NothingToRecollect { listed } => {
-                let pruned = db.prune_missing_tests(&env_fingerprint, &listed)?;
+                let pruned = db.prune_missing_tests(env_fingerprint, &listed)?;
                 if pruned > 0 {
                     let s = if pruned == 1 { "" } else { "s" };
                     eprintln!("pruned {pruned} test{s} no longer present in nextest list");
@@ -272,7 +273,7 @@ pub fn collect(
     if total == 0 {
         let exit = handle_no_profraw_dirs(
             &mut db,
-            &env_fingerprint,
+            env_fingerprint,
             diff_plan.as_ref(),
             nextest_exit,
             &profraw_dir,
@@ -363,8 +364,13 @@ pub fn collect(
             "updating coverage for {} tests ({region_count} ranges)...",
             mappings.len()
         );
-        db.update_coverage_for_tests(&env_fingerprint, &collect_sha, &mappings)?;
-        let pruned = db.prune_missing_tests(&env_fingerprint, &plan.listed)?;
+        db.update_coverage_for_tests(
+            env_fingerprint,
+            &fingerprint.components,
+            &collect_sha,
+            &mappings,
+        )?;
+        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
         if pruned > 0 {
             let s = if pruned == 1 { "" } else { "s" };
             eprintln!("pruned {pruned} test{s} no longer present in nextest list");
@@ -374,10 +380,15 @@ pub fn collect(
             "storing coverage for {} tests ({region_count} ranges)...",
             mappings.len()
         );
-        db.store_coverage(&env_fingerprint, &collect_sha, &mappings)?;
+        db.store_coverage(
+            env_fingerprint,
+            &fingerprint.components,
+            &collect_sha,
+            &mappings,
+        )?;
     }
 
-    let evicted = db.gc(&env_fingerprint, FINGERPRINT_KEEP)?;
+    let evicted = db.gc(env_fingerprint, FINGERPRINT_KEEP)?;
     if evicted > 0 {
         let kept = db.fingerprint_count()?;
         let s = if evicted == 1 { "" } else { "s" };

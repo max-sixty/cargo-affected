@@ -34,6 +34,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::coverage::HitRange;
+use crate::fingerprint::FingerprintComponent;
 use crate::project::LineRange;
 
 /// How long to wait for a conflicting lock before giving up. Long enough to
@@ -96,6 +97,18 @@ CREATE INDEX IF NOT EXISTS idx_test_regions_lookup
 CREATE TABLE IF NOT EXISTS fingerprints (
     fingerprint TEXT PRIMARY KEY,
     last_seen TEXT NOT NULL
+);
+-- Per-fingerprint per-input component hashes. Lets a 'fingerprint
+-- mismatch' miss be diagnosed at the component level: 'this PR's
+-- manifest:tests/helpers/wt-perf/Cargo.toml differs from every cached
+-- fingerprint, but Cargo.lock and rustc match'. Composite hash in
+-- env_fingerprint already encodes the same information; this is the
+-- diagnostic decomposition.
+CREATE TABLE IF NOT EXISTS fingerprint_components (
+    env_fingerprint TEXT NOT NULL,
+    label TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (env_fingerprint, label)
 );
 ";
 
@@ -196,6 +209,34 @@ fn batch_delete_tests<'a>(
     Ok(())
 }
 
+/// Replace every `fingerprint_components` row for `fingerprint` with the
+/// supplied `components`. Idempotent: a re-run with the same inputs leaves
+/// the table in the same state. Called from both `store_coverage` and
+/// `update_coverage_for_tests` so the components table stays in sync with
+/// `test_regions` writes within the same transaction.
+fn upsert_components(
+    tx: &rusqlite::Transaction<'_>,
+    fingerprint: &str,
+    components: &[FingerprintComponent],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM fingerprint_components WHERE env_fingerprint = ?1",
+        [fingerprint],
+    )?;
+    let mut stmt = tx.prepare(
+        "INSERT INTO fingerprint_components (env_fingerprint, label, content_hash) \
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for component in components {
+        stmt.execute(rusqlite::params![
+            fingerprint,
+            component.label.as_str(),
+            component.hash.as_str(),
+        ])?;
+    }
+    Ok(())
+}
+
 /// Insert every `(test_id, range)` pair as a `test_regions` row anchored at
 /// `collect_sha`. Shared between [`Db::store_coverage`] and
 /// [`Db::update_coverage_for_tests`] — both insert the same shape.
@@ -265,13 +306,16 @@ impl Db {
 
     /// Replace coverage data for the current fingerprint with a fresh
     /// collection, anchoring every new row at `collect_sha` (the git HEAD
-    /// when this collection ran).
+    /// when this collection ran). `components` are the per-input hashes
+    /// that make up `fingerprint`; stored in `fingerprint_components` for
+    /// later "which input changed?" diagnostics.
     ///
     /// Leaves rows from other fingerprints alone — they remain queryable if
     /// the user switches environments.
     pub fn store_coverage(
         &mut self,
         fingerprint: &str,
+        components: &[FingerprintComponent],
         collect_sha: &str,
         mappings: &[(TestId, BTreeSet<HitRange>)],
     ) -> Result<()> {
@@ -281,6 +325,7 @@ impl Db {
             [fingerprint],
         )?;
         insert_mappings(&tx, fingerprint, collect_sha, mappings)?;
+        upsert_components(&tx, fingerprint, components)?;
         touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
         tx.commit()
@@ -291,16 +336,19 @@ impl Db {
     /// Replace coverage data for just the tests in `mappings` (regardless of
     /// the sha they're currently anchored at) with rows anchored at
     /// `new_collect_sha`. Other tests' rows under the same fingerprint stay
-    /// put — that's the whole point of `collect --diff`.
+    /// put — that's the whole point of `collect --diff`. Component hashes
+    /// are refreshed to match `components` (the current build environment).
     pub fn update_coverage_for_tests(
         &mut self,
         fingerprint: &str,
+        components: &[FingerprintComponent],
         new_collect_sha: &str,
         mappings: &[(TestId, BTreeSet<HitRange>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         batch_delete_tests(&tx, fingerprint, mappings.iter().map(|(t, _)| t))?;
         insert_mappings(&tx, fingerprint, new_collect_sha, mappings)?;
+        upsert_components(&tx, fingerprint, components)?;
         touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
         tx.commit()
@@ -524,6 +572,7 @@ impl Db {
             .map_err(|e| translate_busy(e, "failed to start clear transaction"))?;
         tx.execute("DELETE FROM test_regions", [])?;
         tx.execute("DELETE FROM fingerprints", [])?;
+        tx.execute("DELETE FROM fingerprint_components", [])?;
         tx.execute("DELETE FROM meta", [])?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit clear"))?;
@@ -555,6 +604,10 @@ impl Db {
         for fp in &to_evict {
             tx.execute("DELETE FROM test_regions WHERE env_fingerprint = ?1", [fp])?;
             tx.execute("DELETE FROM fingerprints WHERE fingerprint = ?1", [fp])?;
+            tx.execute(
+                "DELETE FROM fingerprint_components WHERE env_fingerprint = ?1",
+                [fp],
+            )?;
         }
 
         tx.commit()
@@ -642,6 +695,59 @@ fn migrate_legacy_tables(conn: &Connection) -> Result<()> {
             conn.execute("DROP TABLE fingerprints", [])?;
         }
     }
+
+    // The `fingerprint_components` table was added to support the
+    // diagnostic JSON report ("which input differs?"). Existing rows in
+    // `test_regions` from a pre-components binary have no component data
+    // we can retroactively recover, so reset the coverage tables and let
+    // the next `collect` repopulate everything. Likewise if the components
+    // table itself has the wrong shape.
+    let coverage_needs_reset = if table_exists(conn, "fingerprint_components")? {
+        let columns = table_columns(conn, "fingerprint_components")?;
+        let needed = ["env_fingerprint", "label", "content_hash"];
+        !needed.iter().all(|c| columns.iter().any(|col| col == c))
+    } else {
+        // No components table at all: any test_regions rows reference
+        // fingerprints we can't decompose. Drop them.
+        table_exists(conn, "test_regions")?
+    };
+
+    if coverage_needs_reset {
+        drop_coverage_tables(conn)?;
+    }
+
+    // Invariant: every fingerprint referenced by `test_regions` must have
+    // matching `fingerprint_components` rows. A mismatch means an old
+    // binary wrote rows after the new schema was created (or vice versa);
+    // either way we can't trust the components table to answer "what
+    // differs?" for those rows. Reset.
+    if table_exists(conn, "test_regions")? && table_exists(conn, "fingerprint_components")? {
+        let orphan: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ( \
+                SELECT 1 FROM test_regions tr \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 FROM fingerprint_components fc \
+                    WHERE fc.env_fingerprint = tr.env_fingerprint \
+                ) LIMIT 1 \
+             )",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphan > 0 {
+            drop_coverage_tables(conn)?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop every table that holds coverage state (test rows, fingerprints,
+/// component hashes). The next collect rebuilds them from scratch via the
+/// `CREATE TABLE IF NOT EXISTS` schema.
+fn drop_coverage_tables(conn: &Connection) -> Result<()> {
+    conn.execute("DROP TABLE IF EXISTS test_regions", [])?;
+    conn.execute("DROP INDEX IF EXISTS idx_test_regions_lookup", [])?;
+    conn.execute("DROP TABLE IF EXISTS fingerprints", [])?;
+    conn.execute("DROP TABLE IF EXISTS fingerprint_components", [])?;
     Ok(())
 }
 
@@ -733,6 +839,16 @@ mod tests {
         LineRange { start, end }
     }
 
+    /// Synthetic per-fingerprint components for tests. Production uses
+    /// `fingerprint::compute`; tests just need the components table to
+    /// have rows so the migration's invariant check stays satisfied.
+    fn comps_for(fp: &str) -> Vec<FingerprintComponent> {
+        vec![FingerprintComponent {
+            label: "cargo_lock".to_string(),
+            hash: format!("hash-of-{fp}-cargo_lock"),
+        }]
+    }
+
     #[test]
     fn roundtrip_with_range_overlap() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -745,6 +861,7 @@ mod tests {
         let b_ranges = BTreeSet::from([rng("src/lib.rs", 50, 60)]);
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), a_ranges), (tid(BIN_A, "test_b"), b_ranges)],
         )?;
@@ -785,6 +902,7 @@ mod tests {
         // touches line 25 (the "struct field" edit zone).
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)])),
@@ -834,7 +952,7 @@ mod tests {
                 BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
             ),
         ];
-        db.store_coverage(FP_A, SHA_A, &mappings)?;
+        db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
 
         let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
         assert_eq!(
@@ -851,6 +969,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 10)]))],
         )?;
@@ -876,11 +995,13 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
         )?;
         db.store_coverage(
             FP_B,
+            &comps_for(FP_B),
             SHA_B,
             &[(tid(BIN_A, "test_b"), BTreeSet::from([rng("src/other.rs", 10, 15)]))],
         )?;
@@ -888,6 +1009,7 @@ mod tests {
         // Rewriting FP_A leaves FP_B alone.
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/new.rs", 1, 1)]))],
         )?;
@@ -917,6 +1039,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "builds"), BTreeSet::from([rng("crate_a/tests/builds.rs", 1, 5)])),
@@ -939,8 +1062,8 @@ mod tests {
 
         let mappings =
             vec![(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
-        db.store_coverage(FP_A, SHA_A, &mappings)?;
-        db.store_coverage(FP_B, SHA_B, &mappings)?;
+        db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
+        db.store_coverage(FP_B, &comps_for(FP_B), SHA_B, &mappings)?;
         assert!(db.has_any_coverage()?);
 
         db.clear()?;
@@ -950,7 +1073,7 @@ mod tests {
         assert!(db.last_collected()?.is_none());
 
         // Still usable.
-        db.store_coverage(FP_A, SHA_A, &mappings)?;
+        db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
         assert_eq!(db.test_count(FP_A)?, 1);
         Ok(())
     }
@@ -964,7 +1087,7 @@ mod tests {
             vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         for fp in ["fp1", "fp2", "fp3", "fp4"] {
-            db.store_coverage(fp, SHA_A, &mappings)?;
+            db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
             db.conn.execute(
                 "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
                 rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
@@ -1067,6 +1190,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
@@ -1079,6 +1203,7 @@ mod tests {
         // Rerun only test_a, with new ranges anchored at SHA_B.
         db.update_coverage_for_tests(
             FP_A,
+            &comps_for(FP_A),
             SHA_B,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 10, 20)]))],
         )?;
@@ -1121,6 +1246,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
@@ -1152,6 +1278,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "ta"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
@@ -1160,6 +1287,7 @@ mod tests {
         )?;
         db.update_coverage_for_tests(
             FP_A,
+            &comps_for(FP_A),
             SHA_B,
             &[(tid(BIN_A, "ta"), BTreeSet::from([rng("src/a.rs", 10, 20)]))],
         )?;
@@ -1187,6 +1315,263 @@ mod tests {
             db.region_count_at_shas(FP_B, &BTreeSet::from([SHA_A.to_string()]))?,
             0,
         );
+        Ok(())
+    }
+
+    /// Reads back the (label, hash) component rows for a fingerprint via
+    /// the same query the report builder will use, so we exercise the
+    /// SQL shape too.
+    fn read_components(db: &Db, fingerprint: &str) -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT label, content_hash FROM fingerprint_components \
+                 WHERE env_fingerprint = ?1 ORDER BY label",
+            )
+            .unwrap();
+        stmt.query_map([fingerprint], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn store_coverage_writes_components() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let comps = vec![
+            FingerprintComponent {
+                label: "cargo_lock".to_string(),
+                hash: "h-lock".to_string(),
+            },
+            FingerprintComponent {
+                label: "rustc".to_string(),
+                hash: "h-rustc".to_string(),
+            },
+        ];
+        db.store_coverage(
+            FP_A,
+            &comps,
+            SHA_A,
+            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+        )?;
+
+        assert_eq!(
+            read_components(&db, FP_A),
+            vec![
+                ("cargo_lock".to_string(), "h-lock".to_string()),
+                ("rustc".to_string(), "h-rustc".to_string()),
+            ],
+        );
+        Ok(())
+    }
+
+    /// Re-storing under the same fingerprint replaces — not duplicates —
+    /// the component rows.
+    #[test]
+    fn store_coverage_replaces_components_idempotently() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings =
+            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+
+        db.store_coverage(
+            FP_A,
+            &[FingerprintComponent {
+                label: "cargo_lock".to_string(),
+                hash: "first".to_string(),
+            }],
+            SHA_A,
+            &mappings,
+        )?;
+        db.store_coverage(
+            FP_A,
+            &[FingerprintComponent {
+                label: "cargo_lock".to_string(),
+                hash: "second".to_string(),
+            }],
+            SHA_A,
+            &mappings,
+        )?;
+
+        assert_eq!(
+            read_components(&db, FP_A),
+            vec![("cargo_lock".to_string(), "second".to_string())],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gc_evicts_components() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings =
+            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+
+        for fp in ["fp1", "fp2", "fp3", "fp4"] {
+            db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
+            db.conn.execute(
+                "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
+                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+            )?;
+        }
+        // Sanity: every fingerprint has a components row.
+        for fp in ["fp1", "fp2", "fp3", "fp4"] {
+            assert_eq!(read_components(&db, fp).len(), 1);
+        }
+
+        db.gc("fp4", 2)?;
+        // Evicted fingerprints' component rows must be gone too.
+        assert!(read_components(&db, "fp1").is_empty());
+        assert!(read_components(&db, "fp2").is_empty());
+        // Survivors retained.
+        assert_eq!(read_components(&db, "fp3").len(), 1);
+        assert_eq!(read_components(&db, "fp4").len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_wipes_components() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+        )?;
+        assert!(!read_components(&db, FP_A).is_empty());
+
+        db.clear()?;
+        assert!(read_components(&db, FP_A).is_empty());
+        Ok(())
+    }
+
+    /// A pre-components DB (test_regions populated, no fingerprint_components
+    /// table at all) must be reset on open. There's no way to retroactively
+    /// generate component hashes for the existing rows.
+    #[test]
+    fn migration_resets_pre_components_db() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        // Build the pre-components schema by hand: same shape as the
+        // current `test_regions`/`fingerprints`, no `fingerprint_components`.
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE test_regions (
+                    binary_id TEXT NOT NULL,
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    collect_sha TEXT NOT NULL,
+                    PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
+                );
+                INSERT INTO test_regions VALUES ('bin1', 't1', 'src/lib.rs', 1, 5, 'old_fp', 'sha');
+                CREATE TABLE fingerprints (
+                    fingerprint TEXT PRIMARY KEY,
+                    last_seen TEXT NOT NULL
+                );
+                INSERT INTO fingerprints VALUES ('old_fp', '2020-01-01T00:00:00Z');
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
+        assert_eq!(db.fingerprint_count()?, 0);
+        Ok(())
+    }
+
+    /// If `fingerprint_components` exists but has the wrong column shape,
+    /// drop it and reset coverage. Same destructive cutover as every other
+    /// shape mismatch.
+    #[test]
+    fn migration_resets_on_components_column_mismatch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE test_regions (
+                    binary_id TEXT NOT NULL,
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    collect_sha TEXT NOT NULL,
+                    PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
+                );
+                INSERT INTO test_regions VALUES ('bin1', 't1', 'src/lib.rs', 1, 5, 'fp', 'sha');
+                CREATE TABLE fingerprint_components (
+                    env_fingerprint TEXT NOT NULL,
+                    label_OLD TEXT NOT NULL,    -- wrong column name
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (env_fingerprint, label_OLD)
+                );
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
+        Ok(())
+    }
+
+    /// Mixed old/new binary use can leave `test_regions` rows referencing
+    /// fingerprints absent from `fingerprint_components`. The invariant
+    /// check catches that and resets.
+    #[test]
+    fn migration_resets_on_orphan_test_regions_rows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE test_regions (
+                    binary_id TEXT NOT NULL,
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    collect_sha TEXT NOT NULL,
+                    PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
+                );
+                CREATE TABLE fingerprint_components (
+                    env_fingerprint TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (env_fingerprint, label)
+                );
+                INSERT INTO test_regions VALUES ('bin1', 't1', 'src/lib.rs', 1, 5, 'orphan_fp', 'sha');
+                -- No matching fingerprint_components row for orphan_fp.
+                INSERT INTO fingerprint_components VALUES ('different_fp', 'cargo_lock', 'h');
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
         Ok(())
     }
 }
