@@ -487,6 +487,33 @@ pub fn git_changed_line_ranges(
     parse_unified_diff(stdout)
 }
 
+/// Files added between `collect_sha` and the working tree (status `A`).
+/// `git_changed_line_ranges` skips these (no OLD-side hunks), and
+/// `git_changed_files` only sees uncommitted changes — so for committed
+/// additions, the diagnostic report needs this dedicated query to know
+/// the file existed in the diff at all. Returns paths relative to the
+/// project root.
+pub fn git_added_files_since(
+    project_root: &Path,
+    collect_sha: &str,
+) -> Result<Vec<String>> {
+    let mut out = run_git(
+        project_root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-color",
+            "--no-renames",
+            "--diff-filter=A",
+            "-z",
+            collect_sha,
+        ],
+    )?;
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 fn parse_unified_diff(diff: &str) -> Result<BTreeMap<String, Vec<LineRange>>> {
     let mut map: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
     let mut current_file: Option<String> = None;

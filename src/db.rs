@@ -26,14 +26,15 @@
 //! caller's current fingerprint, so a mismatch naturally reads as "no data"
 //! without any special-case invalidation path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::coverage::HitRange;
+use crate::coverage::{HitRange, CRATE_ROOT_SENTINEL_END};
+use crate::fingerprint::FingerprintComponent;
 use crate::project::LineRange;
 
 /// How long to wait for a conflicting lock before giving up. Long enough to
@@ -97,6 +98,18 @@ CREATE TABLE IF NOT EXISTS fingerprints (
     fingerprint TEXT PRIMARY KEY,
     last_seen TEXT NOT NULL
 );
+-- Per-fingerprint per-input component hashes. Lets a 'fingerprint
+-- mismatch' miss be diagnosed at the component level: 'this PR's
+-- manifest:tests/helpers/wt-perf/Cargo.toml differs from every cached
+-- fingerprint, but Cargo.lock and rustc match'. Composite hash in
+-- env_fingerprint already encodes the same information; this is the
+-- diagnostic decomposition.
+CREATE TABLE IF NOT EXISTS fingerprint_components (
+    env_fingerprint TEXT NOT NULL,
+    label TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (env_fingerprint, label)
+);
 ";
 
 /// Identifier for a single test: nextest's stable `binary_id`
@@ -120,6 +133,61 @@ impl TestId {
             test_name: test_name.into(),
         }
     }
+}
+
+/// One row in the `fingerprints` table, materialized with its component
+/// hashes from `fingerprint_components`. Returned by
+/// [`Db::stored_fingerprint_snapshots`] for the diagnostic report.
+#[derive(Debug, Clone)]
+pub struct StoredFingerprintRow {
+    pub fingerprint: String,
+    pub last_seen: String,
+    pub components: Vec<FingerprintComponent>,
+}
+
+/// One hit recorded by [`Db::tests_covering_ranges`]: which test got pulled
+/// in, and the reason for it. A single test can appear multiple times if it
+/// matched several rows or several hunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestHit {
+    pub test_id: TestId,
+    pub reason: HitReason,
+}
+
+/// Why a test was selected. The triple (`file`, `matched_hunk`, `kind`)
+/// describes one path through the selection logic; `stored_range` names the
+/// row that matched (absent for [`HitKind::StructuralBackstop`], where the
+/// whole point is that nothing matched).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitReason {
+    /// `collect_sha` the diff was anchored against. Hunks live in this
+    /// sha's coordinate system; the reason is only meaningful paired with it.
+    pub collect_sha: String,
+    /// Source file the hunk applies to.
+    pub file: String,
+    /// Selection-path classification.
+    pub kind: HitKind,
+    /// The diff hunk that triggered the selection. Inclusive `(start, end)`.
+    pub matched_hunk: (i64, i64),
+    /// The stored row that overlapped the hunk. `None` when [`HitKind::StructuralBackstop`]
+    /// fired (no row overlapped — the test was pulled in by file-presence alone).
+    pub stored_range: Option<(i64, i64)>,
+}
+
+/// How a test ended up in the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    /// A stored function-range row overlapped the hunk's line range.
+    LineOverlap,
+    /// No stored row overlapped the hunk; the test was pulled in because
+    /// its DB rows reference this file (struct-field, derive, const, use,
+    /// mod edits land in lines no test covered directly).
+    StructuralBackstop,
+    /// The stored row was a crate-root sentinel
+    /// ([`crate::coverage::CRATE_ROOT_SENTINEL_END`]) — an "any hunk in
+    /// this file selects this test" link the function-level coverage
+    /// can't observe directly.
+    CrateRootSentinel,
 }
 
 /// How many distinct fingerprints to retain. `gc()` evicts the least-recently-
@@ -196,6 +264,34 @@ fn batch_delete_tests<'a>(
     Ok(())
 }
 
+/// Replace every `fingerprint_components` row for `fingerprint` with the
+/// supplied `components`. Idempotent: a re-run with the same inputs leaves
+/// the table in the same state. Called from both `store_coverage` and
+/// `update_coverage_for_tests` so the components table stays in sync with
+/// `test_regions` writes within the same transaction.
+fn upsert_components(
+    tx: &rusqlite::Transaction<'_>,
+    fingerprint: &str,
+    components: &[FingerprintComponent],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM fingerprint_components WHERE env_fingerprint = ?1",
+        [fingerprint],
+    )?;
+    let mut stmt = tx.prepare(
+        "INSERT INTO fingerprint_components (env_fingerprint, label, content_hash) \
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for component in components {
+        stmt.execute(rusqlite::params![
+            fingerprint,
+            component.label.as_str(),
+            component.hash.as_str(),
+        ])?;
+    }
+    Ok(())
+}
+
 /// Insert every `(test_id, range)` pair as a `test_regions` row anchored at
 /// `collect_sha`. Shared between [`Db::store_coverage`] and
 /// [`Db::update_coverage_for_tests`] — both insert the same shape.
@@ -216,8 +312,8 @@ fn insert_mappings(
                 test_id.binary_id,
                 test_id.test_name,
                 range.file.as_str(),
-                range.line_start as i64,
-                range.line_end as i64,
+                range.line_start,
+                range.line_end,
                 fingerprint,
                 collect_sha,
             ])?;
@@ -265,13 +361,16 @@ impl Db {
 
     /// Replace coverage data for the current fingerprint with a fresh
     /// collection, anchoring every new row at `collect_sha` (the git HEAD
-    /// when this collection ran).
+    /// when this collection ran). `components` are the per-input hashes
+    /// that make up `fingerprint`; stored in `fingerprint_components` for
+    /// later "which input changed?" diagnostics.
     ///
     /// Leaves rows from other fingerprints alone — they remain queryable if
     /// the user switches environments.
     pub fn store_coverage(
         &mut self,
         fingerprint: &str,
+        components: &[FingerprintComponent],
         collect_sha: &str,
         mappings: &[(TestId, BTreeSet<HitRange>)],
     ) -> Result<()> {
@@ -281,6 +380,7 @@ impl Db {
             [fingerprint],
         )?;
         insert_mappings(&tx, fingerprint, collect_sha, mappings)?;
+        upsert_components(&tx, fingerprint, components)?;
         touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
         tx.commit()
@@ -291,16 +391,19 @@ impl Db {
     /// Replace coverage data for just the tests in `mappings` (regardless of
     /// the sha they're currently anchored at) with rows anchored at
     /// `new_collect_sha`. Other tests' rows under the same fingerprint stay
-    /// put — that's the whole point of `collect --diff`.
+    /// put — that's the whole point of `collect --diff`. Component hashes
+    /// are refreshed to match `components` (the current build environment).
     pub fn update_coverage_for_tests(
         &mut self,
         fingerprint: &str,
+        components: &[FingerprintComponent],
         new_collect_sha: &str,
         mappings: &[(TestId, BTreeSet<HitRange>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         batch_delete_tests(&tx, fingerprint, mappings.iter().map(|(t, _)| t))?;
         insert_mappings(&tx, fingerprint, new_collect_sha, mappings)?;
+        upsert_components(&tx, fingerprint, components)?;
         touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
         tx.commit()
@@ -350,6 +453,18 @@ impl Db {
     /// file at this sha" (the structural-edit backstop for struct-field,
     /// derive, const, use, mod edits).
     ///
+    /// Each returned [`TestHit`] carries the [`HitReason`] explaining
+    /// selection — which file, which hunk, and which kind of match
+    /// ([`HitKind::LineOverlap`], [`HitKind::CrateRootSentinel`], or
+    /// [`HitKind::StructuralBackstop`]). One unique test can appear
+    /// multiple times if it matched several rows or several hunks, so
+    /// callers that need the deduplicated test set should collect with
+    /// `into_iter().map(|h| h.test_id).collect::<BTreeSet<_>>()` or
+    /// aggregate by the strongest reason — see selection.rs for the
+    /// canonical aggregation. Backstop hits are emitted ONCE per unique
+    /// test per hunk (not once per stored row) so per-reason counters
+    /// remain meaningful.
+    ///
     /// Scoping by `collect_sha` matters because `collect --diff` lets rows
     /// from different collect points coexist for the same fingerprint —
     /// hunks must be matched against rows whose line numbers share a
@@ -366,10 +481,10 @@ impl Db {
         collect_sha: &str,
         file: &str,
         hunks: &[LineRange],
-    ) -> Result<BTreeSet<TestId>> {
-        let mut tests = BTreeSet::new();
+    ) -> Result<Vec<TestHit>> {
+        let mut hits = Vec::new();
         if hunks.is_empty() {
-            return Ok(tests);
+            return Ok(hits);
         }
 
         let mut stmt = self.conn.prepare(
@@ -386,7 +501,7 @@ impl Db {
             })?
             .collect::<rusqlite::Result<_>>()?;
         if rows.is_empty() {
-            return Ok(tests);
+            return Ok(hits);
         }
 
         for hunk in hunks {
@@ -395,17 +510,56 @@ impl Db {
             let mut overlapped = false;
             for (test, ls, le) in &rows {
                 if *ls <= hunk.end && *le >= hunk.start {
-                    tests.insert(test.clone());
+                    let kind = if *le == CRATE_ROOT_SENTINEL_END && *ls == 1 {
+                        HitKind::CrateRootSentinel
+                    } else {
+                        HitKind::LineOverlap
+                    };
+                    hits.push(TestHit {
+                        test_id: test.clone(),
+                        reason: HitReason {
+                            collect_sha: collect_sha.to_string(),
+                            file: file.to_string(),
+                            kind,
+                            matched_hunk: (hunk.start, hunk.end),
+                            stored_range: Some((*ls, *le)),
+                        },
+                    });
                     overlapped = true;
                 }
             }
             if !overlapped {
-                tests.extend(rows.iter().map(|(t, _, _)| t.clone()));
+                // Backstop: emit one hit per unique test for this file
+                // (rows can have many ranges per test; we don't want to
+                // multiply that into the reason counts).
+                let mut seen: BTreeSet<&TestId> = BTreeSet::new();
+                for (test, _, _) in &rows {
+                    if !seen.insert(test) {
+                        continue;
+                    }
+                    hits.push(TestHit {
+                        test_id: test.clone(),
+                        reason: HitReason {
+                            collect_sha: collect_sha.to_string(),
+                            file: file.to_string(),
+                            kind: HitKind::StructuralBackstop,
+                            matched_hunk: (hunk.start, hunk.end),
+                            stored_range: None,
+                        },
+                    });
+                }
             }
         }
+        Ok(hits)
+    }
 
-        touch_fingerprint(&self.conn, fingerprint)?;
-        Ok(tests)
+    /// Mark `fingerprint` as recently used, refreshing its `last_seen`
+    /// timestamp for LRU eviction by [`Db::gc`]. Read-side callers
+    /// (`run`, `status`) should invoke this once per invocation rather
+    /// than once per query — `tests_covering_ranges` no longer touches
+    /// it implicitly, since it can be called many times per command.
+    pub fn touch(&self, fingerprint: &str) -> Result<()> {
+        touch_fingerprint(&self.conn, fingerprint)
     }
 
     /// Distinct `collect_sha` values present in `test_regions` for this
@@ -442,6 +596,33 @@ impl Db {
         Ok(count as usize)
     }
 
+    /// All distinct `source_file` values referenced by `test_regions`
+    /// rows under `(fingerprint, any sha in shas)`. Returns the set of
+    /// files the cache "knows about" at the reachable shas — used by
+    /// the diagnostic report to set `tracked_by_coverage` on each
+    /// changed file in one query rather than N×files lookups.
+    pub fn tracked_files_at_shas(
+        &self,
+        fingerprint: &str,
+        shas: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        if shas.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let sql = format!(
+            "SELECT DISTINCT source_file FROM test_regions \
+             WHERE env_fingerprint = ?1 AND collect_sha IN ({})",
+            in_placeholders(2, shas.len()),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = std::iter::once(fingerprint).chain(shas.iter().map(String::as_str));
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<BTreeSet<String>>>()
+            .map_err(Into::into)
+    }
+
     /// Whether a source file has coverage data under the current fingerprint.
     pub fn file_tracked(&self, fingerprint: &str, file: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
@@ -453,10 +634,92 @@ impl Db {
         Ok(count > 0)
     }
 
+    /// Snapshot of every stored fingerprint with its `last_seen`
+    /// timestamp and component hashes. Used by the diagnostic report to
+    /// compute "which input differs?" diffs against the current
+    /// fingerprint. Empty when the DB has never been written to.
+    pub fn stored_fingerprint_snapshots(&self) -> Result<Vec<StoredFingerprintRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fingerprint, last_seen FROM fingerprints \
+             ORDER BY last_seen DESC, fingerprint ASC",
+        )?;
+        let mut fps: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(fps.len());
+        let mut comp_stmt = self.conn.prepare(
+            "SELECT label, content_hash FROM fingerprint_components \
+             WHERE env_fingerprint = ?1 ORDER BY label",
+        )?;
+        for (fp, last_seen) in fps.drain(..) {
+            let components: Vec<FingerprintComponent> = comp_stmt
+                .query_map([&fp], |row| {
+                    Ok(FingerprintComponent {
+                        label: row.get::<_, String>(0)?,
+                        hash: row.get::<_, String>(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out.push(StoredFingerprintRow {
+                fingerprint: fp,
+                last_seen,
+                components,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `test_regions` row counts per `collect_sha`, scoped to one
+    /// fingerprint. Used by the report to show how much data is
+    /// anchored at each sha. One query — diagnostic, not a hot path.
+    pub fn row_counts_by_sha(
+        &self,
+        fingerprint: &str,
+    ) -> Result<BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT collect_sha, COUNT(*) FROM test_regions \
+             WHERE env_fingerprint = ?1 \
+             GROUP BY collect_sha",
+        )?;
+        let rows = stmt.query_map([fingerprint], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for r in rows {
+            let (sha, count) = r?;
+            out.insert(sha, count as usize);
+        }
+        Ok(out)
+    }
+
+    /// Distinct (binary_id, test_name) pairs under `fingerprint`, ignoring
+    /// `collect_sha`. Used by selection to distinguish "stranded" tests
+    /// (in DB but only at currently-missing shas) from "genuinely new"
+    /// tests (not in DB at all): if a listed test appears here but not
+    /// in [`Db::all_tests_at_shas`] for the reachable subset, it's stranded.
+    pub fn all_tests_for_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<BTreeSet<TestId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT binary_id, test_name FROM test_regions \
+             WHERE env_fingerprint = ?1",
+        )?;
+        let rows = stmt.query_map([fingerprint], |row| {
+            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<BTreeSet<TestId>>>()
+            .map_err(Into::into)
+    }
+
     /// Distinct (binary_id, test_name) pairs under `fingerprint` whose rows
     /// are anchored at one of `shas`. Used by selection to compute "tests
     /// known to the cache *and reachable*" — tests anchored only at diverged
-    /// shas appear missing here, so selection surfaces them as new and
+    /// shas appear missing here, so selection surfaces them as stranded and
     /// reruns them.
     pub fn all_tests_at_shas(
         &self,
@@ -524,6 +787,7 @@ impl Db {
             .map_err(|e| translate_busy(e, "failed to start clear transaction"))?;
         tx.execute("DELETE FROM test_regions", [])?;
         tx.execute("DELETE FROM fingerprints", [])?;
+        tx.execute("DELETE FROM fingerprint_components", [])?;
         tx.execute("DELETE FROM meta", [])?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit clear"))?;
@@ -555,6 +819,10 @@ impl Db {
         for fp in &to_evict {
             tx.execute("DELETE FROM test_regions WHERE env_fingerprint = ?1", [fp])?;
             tx.execute("DELETE FROM fingerprints WHERE fingerprint = ?1", [fp])?;
+            tx.execute(
+                "DELETE FROM fingerprint_components WHERE env_fingerprint = ?1",
+                [fp],
+            )?;
         }
 
         tx.commit()
@@ -642,6 +910,59 @@ fn migrate_legacy_tables(conn: &Connection) -> Result<()> {
             conn.execute("DROP TABLE fingerprints", [])?;
         }
     }
+
+    // The `fingerprint_components` table was added to support the
+    // diagnostic JSON report ("which input differs?"). Existing rows in
+    // `test_regions` from a pre-components binary have no component data
+    // we can retroactively recover, so reset the coverage tables and let
+    // the next `collect` repopulate everything. Likewise if the components
+    // table itself has the wrong shape.
+    let coverage_needs_reset = if table_exists(conn, "fingerprint_components")? {
+        let columns = table_columns(conn, "fingerprint_components")?;
+        let needed = ["env_fingerprint", "label", "content_hash"];
+        !needed.iter().all(|c| columns.iter().any(|col| col == c))
+    } else {
+        // No components table at all: any test_regions rows reference
+        // fingerprints we can't decompose. Drop them.
+        table_exists(conn, "test_regions")?
+    };
+
+    if coverage_needs_reset {
+        drop_coverage_tables(conn)?;
+    }
+
+    // Invariant: every fingerprint referenced by `test_regions` must have
+    // matching `fingerprint_components` rows. A mismatch means an old
+    // binary wrote rows after the new schema was created (or vice versa);
+    // either way we can't trust the components table to answer "what
+    // differs?" for those rows. Reset.
+    if table_exists(conn, "test_regions")? && table_exists(conn, "fingerprint_components")? {
+        let orphan: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ( \
+                SELECT 1 FROM test_regions tr \
+                WHERE NOT EXISTS ( \
+                    SELECT 1 FROM fingerprint_components fc \
+                    WHERE fc.env_fingerprint = tr.env_fingerprint \
+                ) LIMIT 1 \
+             )",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphan > 0 {
+            drop_coverage_tables(conn)?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop every table that holds coverage state (test rows, fingerprints,
+/// component hashes). The next collect rebuilds them from scratch via the
+/// `CREATE TABLE IF NOT EXISTS` schema.
+fn drop_coverage_tables(conn: &Connection) -> Result<()> {
+    conn.execute("DROP TABLE IF EXISTS test_regions", [])?;
+    conn.execute("DROP INDEX IF EXISTS idx_test_regions_lookup", [])?;
+    conn.execute("DROP TABLE IF EXISTS fingerprints", [])?;
+    conn.execute("DROP TABLE IF EXISTS fingerprint_components", [])?;
     Ok(())
 }
 
@@ -721,7 +1042,7 @@ mod tests {
         TestId::new(binary_id, test_name)
     }
 
-    fn rng(file: &str, line_start: u32, line_end: u32) -> HitRange {
+    fn rng(file: &str, line_start: i64, line_end: i64) -> HitRange {
         HitRange {
             file: Utf8PathBuf::from(file),
             line_start,
@@ -731,6 +1052,24 @@ mod tests {
 
     fn hunk(start: i64, end: i64) -> LineRange {
         LineRange { start, end }
+    }
+
+    /// Synthetic per-fingerprint components for tests. Production uses
+    /// `fingerprint::compute`; tests just need the components table to
+    /// have rows so the migration's invariant check stays satisfied.
+    fn comps_for(fp: &str) -> Vec<FingerprintComponent> {
+        vec![FingerprintComponent {
+            label: "cargo_lock".to_string(),
+            hash: format!("hash-of-{fp}-cargo_lock"),
+        }]
+    }
+
+    /// Collapse the per-row [`TestHit`] stream into the deduplicated
+    /// `(binary_id, test_name)` set the existing tests assert against.
+    /// The hit-reason aggregation lives in `selection.rs`; this helper is
+    /// just for readability inside the storage-layer tests.
+    fn ids(hits: Vec<TestHit>) -> BTreeSet<TestId> {
+        hits.into_iter().map(|h| h.test_id).collect()
     }
 
     #[test]
@@ -745,6 +1084,7 @@ mod tests {
         let b_ranges = BTreeSet::from([rng("src/lib.rs", 50, 60)]);
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), a_ranges), (tid(BIN_A, "test_b"), b_ranges)],
         )?;
@@ -754,16 +1094,17 @@ mod tests {
         assert_eq!(db.collect_shas(FP_A)?, BTreeSet::from([SHA_A.to_string()]));
 
         // Hunk overlapping test_a's lib.rs range.
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?);
         assert_eq!(hits, BTreeSet::from([tid(BIN_A, "test_a")]));
 
         // Hunk overlapping test_b's lib.rs range.
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(55, 55)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(55, 55)])?);
         assert_eq!(hits, BTreeSet::from([tid(BIN_A, "test_b")]));
 
         // Multiple hunks in same file → union.
-        let hits =
-            db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18), hunk(55, 55)])?;
+        let hits = ids(
+            db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18), hunk(55, 55)])?,
+        );
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -785,6 +1126,7 @@ mod tests {
         // touches line 25 (the "struct field" edit zone).
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)])),
@@ -794,7 +1136,7 @@ mod tests {
 
         // No range overlaps line 25 → backstop fires → every test touching
         // lib.rs is selected.
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(25, 25)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(25, 25)])?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -802,12 +1144,12 @@ mod tests {
 
         // Backstop applies per-hunk: a body-edit hunk + a structural-edit
         // hunk in the same file still selects everyone.
-        let hits = db.tests_covering_ranges(
+        let hits = ids(db.tests_covering_ranges(
             FP_A,
             SHA_A,
             "src/lib.rs",
             &[hunk(15, 15), hunk(25, 25)],
-        )?;
+        )?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -827,24 +1169,16 @@ mod tests {
         let mappings = vec![
             (
                 tid(BIN_A, "test_a"),
-                BTreeSet::from([HitRange {
-                    file: Utf8PathBuf::from("src/lib.rs"),
-                    line_start: 1,
-                    line_end: u32::MAX,
-                }]),
+                BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
             ),
             (
                 tid(BIN_A, "test_b"),
-                BTreeSet::from([HitRange {
-                    file: Utf8PathBuf::from("src/lib.rs"),
-                    line_start: 1,
-                    line_end: u32::MAX,
-                }]),
+                BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
             ),
         ];
-        db.store_coverage(FP_A, SHA_A, &mappings)?;
+        db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
 
-        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
+        let hits = ids(db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -859,6 +1193,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 10)]))],
         )?;
@@ -867,7 +1202,7 @@ mod tests {
         assert_eq!(db.region_count(FP_B)?, 0);
         assert!(db
             .tests_covering_ranges(FP_B, SHA_A, "src/lib.rs", &[hunk(1, 5)])?
-            .is_empty());
+            .is_empty());  // Vec<TestHit>::is_empty()
         assert!(!db.file_tracked(FP_B, "src/lib.rs")?);
         assert!(db
             .all_tests_at_shas(FP_B, &BTreeSet::from([SHA_A.to_string()]))?
@@ -884,11 +1219,13 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
         )?;
         db.store_coverage(
             FP_B,
+            &comps_for(FP_B),
             SHA_B,
             &[(tid(BIN_A, "test_b"), BTreeSet::from([rng("src/other.rs", 10, 15)]))],
         )?;
@@ -896,6 +1233,7 @@ mod tests {
         // Rewriting FP_A leaves FP_B alone.
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/new.rs", 1, 1)]))],
         )?;
@@ -903,11 +1241,11 @@ mod tests {
         assert_eq!(db.test_count(FP_A)?, 1);
         assert_eq!(db.test_count(FP_B)?, 1);
         assert_eq!(
-            db.tests_covering_ranges(FP_B, SHA_B, "src/other.rs", &[hunk(10, 12)])?,
+            ids(db.tests_covering_ranges(FP_B, SHA_B, "src/other.rs", &[hunk(10, 12)])?),
             BTreeSet::from([tid(BIN_A, "test_b")])
         );
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/new.rs", &[hunk(1, 1)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/new.rs", &[hunk(1, 1)])?),
             BTreeSet::from([tid(BIN_A, "test_a")])
         );
         assert!(db
@@ -925,6 +1263,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "builds"), BTreeSet::from([rng("crate_a/tests/builds.rs", 1, 5)])),
@@ -933,9 +1272,9 @@ mod tests {
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 2);
-        let a = db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?;
+        let a = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(a, BTreeSet::from([tid(BIN_A, "builds")]));
-        let b = db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?;
+        let b = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(b, BTreeSet::from([tid(BIN_B, "builds")]));
         Ok(())
     }
@@ -947,8 +1286,8 @@ mod tests {
 
         let mappings =
             vec![(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
-        db.store_coverage(FP_A, SHA_A, &mappings)?;
-        db.store_coverage(FP_B, SHA_B, &mappings)?;
+        db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
+        db.store_coverage(FP_B, &comps_for(FP_B), SHA_B, &mappings)?;
         assert!(db.has_any_coverage()?);
 
         db.clear()?;
@@ -958,7 +1297,7 @@ mod tests {
         assert!(db.last_collected()?.is_none());
 
         // Still usable.
-        db.store_coverage(FP_A, SHA_A, &mappings)?;
+        db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
         assert_eq!(db.test_count(FP_A)?, 1);
         Ok(())
     }
@@ -972,7 +1311,7 @@ mod tests {
             vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         for fp in ["fp1", "fp2", "fp3", "fp4"] {
-            db.store_coverage(fp, SHA_A, &mappings)?;
+            db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
             db.conn.execute(
                 "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
                 rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
@@ -1075,6 +1414,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
@@ -1087,6 +1427,7 @@ mod tests {
         // Rerun only test_a, with new ranges anchored at SHA_B.
         db.update_coverage_for_tests(
             FP_A,
+            &comps_for(FP_A),
             SHA_B,
             &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 10, 20)]))],
         )?;
@@ -1099,7 +1440,7 @@ mod tests {
 
         // test_a is queryable at SHA_B with its new range.
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_B, "src/a.rs", &[hunk(15, 15)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_B, "src/a.rs", &[hunk(15, 15)])?),
             BTreeSet::from([tid(BIN_A, "test_a")]),
         );
         // …and gone from SHA_A: its old (1,5) row was deleted.
@@ -1109,11 +1450,11 @@ mod tests {
 
         // test_b/test_c untouched — still anchored at SHA_A.
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/b.rs", &[hunk(1, 5)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/b.rs", &[hunk(1, 5)])?),
             BTreeSet::from([tid(BIN_A, "test_b")]),
         );
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/c.rs", &[hunk(1, 5)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/c.rs", &[hunk(1, 5)])?),
             BTreeSet::from([tid(BIN_A, "test_c")]),
         );
 
@@ -1129,6 +1470,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
@@ -1145,7 +1487,7 @@ mod tests {
             .tests_covering_ranges(FP_A, SHA_A, "src/b.rs", &[hunk(1, 5)])?
             .is_empty());
         assert_eq!(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/a.rs", &[hunk(1, 5)])?,
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/a.rs", &[hunk(1, 5)])?),
             BTreeSet::from([tid(BIN_A, "test_a")]),
         );
         Ok(())
@@ -1160,6 +1502,7 @@ mod tests {
 
         db.store_coverage(
             FP_A,
+            &comps_for(FP_A),
             SHA_A,
             &[
                 (tid(BIN_A, "ta"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
@@ -1168,6 +1511,7 @@ mod tests {
         )?;
         db.update_coverage_for_tests(
             FP_A,
+            &comps_for(FP_A),
             SHA_B,
             &[(tid(BIN_A, "ta"), BTreeSet::from([rng("src/a.rs", 10, 20)]))],
         )?;
@@ -1194,6 +1538,356 @@ mod tests {
         assert_eq!(
             db.region_count_at_shas(FP_B, &BTreeSet::from([SHA_A.to_string()]))?,
             0,
+        );
+        Ok(())
+    }
+
+    /// Reads back the (label, hash) component rows for a fingerprint via
+    /// the same query the report builder will use, so we exercise the
+    /// SQL shape too.
+    fn read_components(db: &Db, fingerprint: &str) -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT label, content_hash FROM fingerprint_components \
+                 WHERE env_fingerprint = ?1 ORDER BY label",
+            )
+            .unwrap();
+        stmt.query_map([fingerprint], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn store_coverage_writes_components() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let comps = vec![
+            FingerprintComponent {
+                label: "cargo_lock".to_string(),
+                hash: "h-lock".to_string(),
+            },
+            FingerprintComponent {
+                label: "rustc".to_string(),
+                hash: "h-rustc".to_string(),
+            },
+        ];
+        db.store_coverage(
+            FP_A,
+            &comps,
+            SHA_A,
+            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+        )?;
+
+        assert_eq!(
+            read_components(&db, FP_A),
+            vec![
+                ("cargo_lock".to_string(), "h-lock".to_string()),
+                ("rustc".to_string(), "h-rustc".to_string()),
+            ],
+        );
+        Ok(())
+    }
+
+    /// Re-storing under the same fingerprint replaces — not duplicates —
+    /// the component rows.
+    #[test]
+    fn store_coverage_replaces_components_idempotently() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings =
+            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+
+        db.store_coverage(
+            FP_A,
+            &[FingerprintComponent {
+                label: "cargo_lock".to_string(),
+                hash: "first".to_string(),
+            }],
+            SHA_A,
+            &mappings,
+        )?;
+        db.store_coverage(
+            FP_A,
+            &[FingerprintComponent {
+                label: "cargo_lock".to_string(),
+                hash: "second".to_string(),
+            }],
+            SHA_A,
+            &mappings,
+        )?;
+
+        assert_eq!(
+            read_components(&db, FP_A),
+            vec![("cargo_lock".to_string(), "second".to_string())],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gc_evicts_components() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        let mappings =
+            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+
+        for fp in ["fp1", "fp2", "fp3", "fp4"] {
+            db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
+            db.conn.execute(
+                "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
+                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+            )?;
+        }
+        // Sanity: every fingerprint has a components row.
+        for fp in ["fp1", "fp2", "fp3", "fp4"] {
+            assert_eq!(read_components(&db, fp).len(), 1);
+        }
+
+        db.gc("fp4", 2)?;
+        // Evicted fingerprints' component rows must be gone too.
+        assert!(read_components(&db, "fp1").is_empty());
+        assert!(read_components(&db, "fp2").is_empty());
+        // Survivors retained.
+        assert_eq!(read_components(&db, "fp3").len(), 1);
+        assert_eq!(read_components(&db, "fp4").len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_wipes_components() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+        )?;
+        assert!(!read_components(&db, FP_A).is_empty());
+
+        db.clear()?;
+        assert!(read_components(&db, FP_A).is_empty());
+        Ok(())
+    }
+
+    /// A pre-components DB (test_regions populated, no fingerprint_components
+    /// table at all) must be reset on open. There's no way to retroactively
+    /// generate component hashes for the existing rows.
+    #[test]
+    fn migration_resets_pre_components_db() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        // Build the pre-components schema by hand: same shape as the
+        // current `test_regions`/`fingerprints`, no `fingerprint_components`.
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE test_regions (
+                    binary_id TEXT NOT NULL,
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    collect_sha TEXT NOT NULL,
+                    PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
+                );
+                INSERT INTO test_regions VALUES ('bin1', 't1', 'src/lib.rs', 1, 5, 'old_fp', 'sha');
+                CREATE TABLE fingerprints (
+                    fingerprint TEXT PRIMARY KEY,
+                    last_seen TEXT NOT NULL
+                );
+                INSERT INTO fingerprints VALUES ('old_fp', '2020-01-01T00:00:00Z');
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
+        assert_eq!(db.fingerprint_count()?, 0);
+        Ok(())
+    }
+
+    /// If `fingerprint_components` exists but has the wrong column shape,
+    /// drop it and reset coverage. Same destructive cutover as every other
+    /// shape mismatch.
+    #[test]
+    fn migration_resets_on_components_column_mismatch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE test_regions (
+                    binary_id TEXT NOT NULL,
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    collect_sha TEXT NOT NULL,
+                    PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
+                );
+                INSERT INTO test_regions VALUES ('bin1', 't1', 'src/lib.rs', 1, 5, 'fp', 'sha');
+                CREATE TABLE fingerprint_components (
+                    env_fingerprint TEXT NOT NULL,
+                    label_OLD TEXT NOT NULL,    -- wrong column name
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (env_fingerprint, label_OLD)
+                );
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
+        Ok(())
+    }
+
+    /// Mixed old/new binary use can leave `test_regions` rows referencing
+    /// fingerprints absent from `fingerprint_components`. The invariant
+    /// check catches that and resets.
+    #[test]
+    fn migration_resets_on_orphan_test_regions_rows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = db_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "\
+                CREATE TABLE test_regions (
+                    binary_id TEXT NOT NULL,
+                    test_name TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    env_fingerprint TEXT NOT NULL,
+                    collect_sha TEXT NOT NULL,
+                    PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
+                );
+                CREATE TABLE fingerprint_components (
+                    env_fingerprint TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY (env_fingerprint, label)
+                );
+                INSERT INTO test_regions VALUES ('bin1', 't1', 'src/lib.rs', 1, 5, 'orphan_fp', 'sha');
+                -- No matching fingerprint_components row for orphan_fp.
+                INSERT INTO fingerprint_components VALUES ('different_fp', 'cargo_lock', 'h');
+                ",
+            )?;
+        }
+
+        let db = Db::open(dir.path())?;
+        assert!(!db.has_any_coverage()?);
+        Ok(())
+    }
+
+    /// `tests_covering_ranges` returns one [`TestHit`] per (row, hunk)
+    /// match for the LineOverlap path; the hit's reason names the file,
+    /// the matched hunk, and the stored range.
+    #[test]
+    fn hits_classify_line_overlap() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)]))],
+        )?;
+
+        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].test_id, tid(BIN_A, "test_a"));
+        assert_eq!(hits[0].reason.kind, HitKind::LineOverlap);
+        assert_eq!(hits[0].reason.file, "src/lib.rs");
+        assert_eq!(hits[0].reason.collect_sha, SHA_A);
+        assert_eq!(hits[0].reason.matched_hunk, (15, 18));
+        assert_eq!(hits[0].reason.stored_range, Some((10, 20)));
+        Ok(())
+    }
+
+    /// A row matching the canonical `(1, CRATE_ROOT_SENTINEL_END)` shape
+    /// must classify as `CrateRootSentinel`, not `LineOverlap`.
+    #[test]
+    fn hits_classify_crate_root_sentinel() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
+            )],
+        )?;
+
+        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reason.kind, HitKind::CrateRootSentinel);
+        assert_eq!(hits[0].reason.stored_range, Some((1, CRATE_ROOT_SENTINEL_END)));
+        Ok(())
+    }
+
+    /// When no row overlaps the hunk, the structural-edit backstop fires:
+    /// emit one hit per unique test for the file (NOT once per row), with
+    /// `kind = StructuralBackstop` and `stored_range = None`.
+    #[test]
+    fn hits_classify_structural_backstop_dedupes_per_test() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+
+        // test_a has TWO rows in lib.rs (10-15 and 30-35); test_b has one
+        // row (50-55). A hunk at line 25 overlaps NONE of them, so the
+        // backstop fires. test_a must appear exactly once despite having
+        // multiple rows for the file.
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([
+                        rng("src/lib.rs", 10, 15),
+                        rng("src/lib.rs", 30, 35),
+                    ]),
+                ),
+                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/lib.rs", 50, 55)])),
+            ],
+        )?;
+
+        let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(25, 25)])?;
+        assert_eq!(hits.len(), 2, "one hit per unique test, not per row");
+        for hit in &hits {
+            assert_eq!(hit.reason.kind, HitKind::StructuralBackstop);
+            assert_eq!(hit.reason.stored_range, None);
+            assert_eq!(hit.reason.matched_hunk, (25, 25));
+        }
+        let unique: BTreeSet<TestId> = hits.iter().map(|h| h.test_id.clone()).collect();
+        assert_eq!(
+            unique,
+            BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
         );
         Ok(())
     }

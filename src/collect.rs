@@ -12,8 +12,9 @@
 //!    (`binary_id`): each test's sentinel set covers its own crate root,
 //!    its package's lib (for non-lib targets), and lib roots of workspace
 //!    packages this target transitively depends on. Stored as sentinel-range
-//!    rows `(line_start=1, line_end=i64::MAX)` so any hunk in one of those
-//!    files overlaps and re-selects the test.
+//!    rows via [`HitRange::sentinel`] (line 1 through
+//!    `CRATE_ROOT_SENTINEL_END`) so any hunk in one of those files
+//!    overlaps and re-selects the test.
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
 //!    and every testcase.
 //! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
@@ -165,14 +166,7 @@ pub fn collect(
         crate_root_sentinels
             .into_iter()
             .map(|(binary_id, paths)| {
-                let ranges = paths
-                    .into_iter()
-                    .map(|p| HitRange {
-                        file: p,
-                        line_start: 1,
-                        line_end: u32::MAX,
-                    })
-                    .collect();
+                let ranges = paths.into_iter().map(HitRange::sentinel).collect();
                 (binary_id, ranges)
             })
             .collect();
@@ -196,7 +190,8 @@ pub fn collect(
         listing.tests.len(),
         listing.binaries.len()
     );
-    let env_fingerprint = fingerprint::compute(&project)?;
+    let fingerprint = fingerprint::compute(&project)?;
+    let env_fingerprint = &fingerprint.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.
@@ -212,10 +207,10 @@ pub fn collect(
     // happens later in this function so the DB write surface stays in one
     // place.
     let diff_plan = if diff {
-        match plan_diff_collect(project_root, &db, &env_fingerprint, &listing)? {
+        match plan_diff_collect(project_root, &db, env_fingerprint, &listing)? {
             DiffOutcome::Plan(plan) => Some(plan),
             DiffOutcome::NothingToRecollect { listed } => {
-                let pruned = db.prune_missing_tests(&env_fingerprint, &listed)?;
+                let pruned = db.prune_missing_tests(env_fingerprint, &listed)?;
                 if pruned > 0 {
                     let s = if pruned == 1 { "" } else { "s" };
                     eprintln!("pruned {pruned} test{s} no longer present in nextest list");
@@ -278,7 +273,7 @@ pub fn collect(
     if total == 0 {
         let exit = handle_no_profraw_dirs(
             &mut db,
-            &env_fingerprint,
+            env_fingerprint,
             diff_plan.as_ref(),
             nextest_exit,
             &profraw_dir,
@@ -369,8 +364,13 @@ pub fn collect(
             "updating coverage for {} tests ({region_count} ranges)...",
             mappings.len()
         );
-        db.update_coverage_for_tests(&env_fingerprint, &collect_sha, &mappings)?;
-        let pruned = db.prune_missing_tests(&env_fingerprint, &plan.listed)?;
+        db.update_coverage_for_tests(
+            env_fingerprint,
+            &fingerprint.components,
+            &collect_sha,
+            &mappings,
+        )?;
+        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
         if pruned > 0 {
             let s = if pruned == 1 { "" } else { "s" };
             eprintln!("pruned {pruned} test{s} no longer present in nextest list");
@@ -380,10 +380,15 @@ pub fn collect(
             "storing coverage for {} tests ({region_count} ranges)...",
             mappings.len()
         );
-        db.store_coverage(&env_fingerprint, &collect_sha, &mappings)?;
+        db.store_coverage(
+            env_fingerprint,
+            &fingerprint.components,
+            &collect_sha,
+            &mappings,
+        )?;
     }
 
-    let evicted = db.gc(&env_fingerprint, FINGERPRINT_KEEP)?;
+    let evicted = db.gc(env_fingerprint, FINGERPRINT_KEEP)?;
     if evicted > 0 {
         let kept = db.fingerprint_count()?;
         let s = if evicted == 1 { "" } else { "s" };
@@ -505,7 +510,14 @@ fn plan_diff_collect(
         );
     }
 
-    let sel = selection::select_with_reach(project_root, db, env_fingerprint, listing, &reach)?;
+    let sel = selection::select_with_reach(
+        project_root,
+        db,
+        env_fingerprint,
+        listing,
+        &reach,
+        selection::DiagnosticDetail::Summary,
+    )?;
     let selected = sel.selected();
     if selected.is_empty() {
         return Ok(DiffOutcome::NothingToRecollect { listed: sel.listed });

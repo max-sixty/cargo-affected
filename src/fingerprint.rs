@@ -5,6 +5,12 @@
 //! version, and build-flag env vars. Stored alongside each `(test, file)`
 //! mapping so queries scoped to the current fingerprint naturally miss when
 //! any tracked input has changed — no explicit invalidation path needed.
+//!
+//! [`compute`] returns both the composite hex digest (for cache scoping) and
+//! per-component hashes (for diagnostic "which input changed?" reporting).
+//! Inputs are read once into memory and both digests are derived from the
+//! same byte buffers, so the composite and components cannot diverge mid-run
+//! if a file is being modified concurrently.
 
 use std::fmt::Write;
 use std::process::Command;
@@ -14,61 +20,121 @@ use sha2::{Digest, Sha256};
 
 use crate::project::ProjectRoot;
 
-/// Compute a hex-encoded SHA-256 fingerprint of the build environment.
+/// Composite fingerprint plus the per-component hashes that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Composite SHA-256 hex digest. The cache-scoping value used in the DB.
+    pub hex: String,
+    /// Per-component hashes in the same order they were folded into `hex`.
+    /// Used to answer "which input changed?" on a fingerprint mismatch.
+    pub components: Vec<FingerprintComponent>,
+}
+
+/// A single named input contributing to the composite fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintComponent {
+    /// Stable label (`cargo_lock`, `manifest:Cargo.toml`, `rustc`,
+    /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
+    pub label: String,
+    /// SHA-256 hex digest of this component's bytes alone.
+    pub hash: String,
+}
+
+/// Compute the composite fingerprint and per-component hashes of the build
+/// environment.
 ///
 /// Each input is hashed with a named prefix and a null separator so collisions
 /// across categories aren't possible (e.g. an env var containing "rustc:..."
 /// can't look like a rustc version).
-pub fn compute(project: &ProjectRoot) -> Result<String> {
-    let mut hasher = Sha256::new();
+///
+/// Inputs are read once into memory; the composite digest and per-component
+/// digests are computed from the same byte buffers. A file changing on disk
+/// after the read still produces a self-consistent `Fingerprint`.
+pub fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
+    let inputs = collect_inputs(project)?;
 
-    hash_file(
-        &mut hasher,
-        "cargo_lock",
-        &project.workspace_root.join("Cargo.lock"),
-    )?;
+    let mut hasher = Sha256::new();
+    let mut components = Vec::with_capacity(inputs.len());
+    for (label, bytes) in &inputs {
+        fold_into_composite(&mut hasher, label, bytes);
+        components.push(FingerprintComponent {
+            label: label.clone(),
+            hash: hash_one(bytes),
+        });
+    }
+
+    Ok(Fingerprint {
+        hex: hex(&hasher.finalize()),
+        components,
+    })
+}
+
+/// Read every fingerprint input into memory in the canonical order.
+///
+/// Order matters for the composite digest: changing the order would change
+/// the hex digest of an otherwise unchanged environment.
+fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut inputs: Vec<(String, Vec<u8>)> =
+        Vec::with_capacity(2 + project.manifest_paths.len() + 3);
+
+    inputs.push((
+        "cargo_lock".to_string(),
+        read_file_or_empty(&project.workspace_root.join("Cargo.lock"))?,
+    ));
 
     for manifest in &project.manifest_paths {
         let label = manifest
             .strip_prefix(&project.workspace_root)
             .unwrap_or(manifest)
             .to_string_lossy();
-        hash_file(&mut hasher, &format!("manifest:{label}"), manifest)?;
+        inputs.push((
+            format!("manifest:{label}"),
+            read_file_or_empty(manifest)?,
+        ));
     }
 
-    hash_named(&mut hasher, "rustc", &rustc_version_bytes()?);
-    hash_named(&mut hasher, "RUSTFLAGS", env_var("RUSTFLAGS").as_bytes());
-    hash_named(
-        &mut hasher,
-        "CARGO_BUILD_TARGET",
-        env_var("CARGO_BUILD_TARGET").as_bytes(),
-    );
+    inputs.push(("rustc".to_string(), rustc_version_bytes()?));
+    inputs.push((
+        "RUSTFLAGS".to_string(),
+        env_var("RUSTFLAGS").into_bytes(),
+    ));
+    inputs.push((
+        "CARGO_BUILD_TARGET".to_string(),
+        env_var("CARGO_BUILD_TARGET").into_bytes(),
+    ));
 
-    Ok(hex(&hasher.finalize()))
+    Ok(inputs)
 }
 
-/// Hash a category label and its bytes with a null separator.
-fn hash_named(hasher: &mut Sha256, label: &str, bytes: &[u8]) {
+/// Fold one labeled input into the composite hasher with the canonical
+/// `label : bytes \0` framing. Must match historical encoding so a stable
+/// environment produces a stable composite hex digest.
+fn fold_into_composite(hasher: &mut Sha256, label: &str, bytes: &[u8]) {
     hasher.update(label.as_bytes());
     hasher.update(b":");
     hasher.update(bytes);
     hasher.update(b"\0");
 }
 
-/// Hash a file's contents under a category label. Missing files hash as empty —
-/// their appearance/disappearance still changes the fingerprint via the label.
-/// Other I/O errors (permission denied, etc.) bubble up so we don't silently
-/// produce a fingerprint that matches a different state.
-fn hash_file(hasher: &mut Sha256, label: &str, path: &std::path::Path) -> Result<()> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context(format!("failed to read {}", path.display())))
-        }
-    };
-    hash_named(hasher, label, &bytes);
-    Ok(())
+/// SHA-256 hex of a single component's bytes, with no label/framing.
+/// Component hashes are independent; framing belongs only on the composite
+/// side where label collisions would matter.
+fn hash_one(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex(&hasher.finalize())
+}
+
+/// Read a file's bytes; treat NotFound as empty (the appearance/disappearance
+/// of the file still changes the composite digest via the label). Other I/O
+/// errors propagate so we don't silently produce a fingerprint that matches a
+/// different state.
+fn read_file_or_empty(path: &std::path::Path) -> Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("failed to read {}", path.display()))),
+    }
 }
 
 fn env_var(name: &str) -> String {
@@ -121,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn same_inputs_same_hash() -> Result<()> {
+    fn same_inputs_same_fingerprint() -> Result<()> {
         let _guard = env_lock();
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
@@ -132,12 +198,12 @@ mod tests {
         let a = compute(&project)?;
         let b = compute(&project)?;
         assert_eq!(a, b);
-        assert_eq!(a.len(), 64); // SHA-256 hex
+        assert_eq!(a.hex.len(), 64); // SHA-256 hex
         Ok(())
     }
 
     #[test]
-    fn cargo_lock_change_changes_hash() -> Result<()> {
+    fn cargo_lock_change_changes_hex() -> Result<()> {
         let _guard = env_lock();
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
@@ -148,12 +214,21 @@ mod tests {
         let a = compute(&project)?;
         std::fs::write(root.join("Cargo.lock"), b"v2")?;
         let b = compute(&project)?;
-        assert_ne!(a, b);
+        assert_ne!(a.hex, b.hex);
+        // Components diverge only in the cargo_lock entry; everything else is unchanged.
+        let differing: Vec<&str> = a
+            .components
+            .iter()
+            .zip(b.components.iter())
+            .filter(|(x, y)| x.hash != y.hash)
+            .map(|(x, _)| x.label.as_str())
+            .collect();
+        assert_eq!(differing, vec!["cargo_lock"]);
         Ok(())
     }
 
     #[test]
-    fn manifest_change_changes_hash() -> Result<()> {
+    fn manifest_change_changes_hex() -> Result<()> {
         let _guard = env_lock();
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
@@ -164,12 +239,12 @@ mod tests {
         let a = compute(&project)?;
         std::fs::write(&manifest, b"[package]\nname = \"b\"\n")?;
         let b = compute(&project)?;
-        assert_ne!(a, b);
+        assert_ne!(a.hex, b.hex);
         Ok(())
     }
 
     #[test]
-    fn rustflags_change_changes_hash() -> Result<()> {
+    fn rustflags_change_changes_hex() -> Result<()> {
         let _guard = env_lock();
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
@@ -185,7 +260,46 @@ mod tests {
             Some(v) => std::env::set_var("RUSTFLAGS", v),
             None => std::env::remove_var("RUSTFLAGS"),
         }
-        assert_ne!(a, b);
+        assert_ne!(a.hex, b.hex);
+        Ok(())
+    }
+
+    /// Components must enumerate every input that contributes to the hex
+    /// digest, in the canonical order. A consumer comparing per-component
+    /// hashes against a stored fingerprint relies on this set.
+    #[test]
+    fn components_cover_every_input() -> Result<()> {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("Cargo.lock"), b"lock")?;
+        std::fs::write(root.join("Cargo.toml"), b"[package]")?;
+        std::fs::create_dir_all(root.join("crates/foo"))?;
+        std::fs::write(root.join("crates/foo/Cargo.toml"), b"[package]\nname = \"foo\"")?;
+        let project = project_with(
+            root.clone(),
+            vec![
+                root.join("Cargo.toml"),
+                root.join("crates/foo/Cargo.toml"),
+            ],
+        );
+
+        let fp = compute(&project)?;
+        let labels: Vec<&str> = fp.components.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "cargo_lock",
+                "manifest:Cargo.toml",
+                "manifest:crates/foo/Cargo.toml",
+                "rustc",
+                "RUSTFLAGS",
+                "CARGO_BUILD_TARGET",
+            ],
+        );
+        for c in &fp.components {
+            assert_eq!(c.hash.len(), 64, "{} hash should be 64 hex chars", c.label);
+        }
         Ok(())
     }
 

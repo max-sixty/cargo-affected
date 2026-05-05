@@ -8,11 +8,14 @@ mod coverage;
 mod db;
 mod fingerprint;
 mod project;
+mod report;
 mod run;
 mod selection;
 #[cfg(unix)]
 mod shim;
 mod status;
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -63,6 +66,19 @@ enum Action {
         /// Run all tests, skipping coverage-based selection.
         #[arg(long)]
         all: bool,
+        /// Write a structured JSON diagnostic report to PATH after
+        /// selection but before invoking nextest. The report names
+        /// the cache status, which inputs differ from any cached
+        /// snapshot (on miss), and per-file/per-test selection
+        /// reasoning. See docs/report-json.md for the schema.
+        #[arg(long, value_name = "PATH")]
+        report_json: Option<PathBuf>,
+        /// Detail level for the report's selection section. `summary`
+        /// keeps per-file aggregate counts only (bounded);
+        /// `full` adds per-test reason vectors (can be megabytes on
+        /// large test suites).
+        #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
+        report_detail: selection::DiagnosticDetail,
         /// Extra args forwarded to `cargo nextest run`. Must be preceded by
         /// `--` (e.g. `cargo affected run -- --features foo`); otherwise
         /// clap rejects unknown flags rather than risk swallowing one of
@@ -74,7 +90,15 @@ enum Action {
         nextest_args: Vec<String>,
     },
     /// Show stored coverage data and what would run for current changes.
-    Status,
+    Status {
+        /// Write a structured JSON diagnostic report to PATH. See
+        /// docs/report-json.md for the schema.
+        #[arg(long, value_name = "PATH")]
+        report_json: Option<PathBuf>,
+        /// Detail level for the report's selection section.
+        #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
+        report_detail: selection::DiagnosticDetail,
+    },
     /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
 }
@@ -140,9 +164,23 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
             allow_dirty,
             nextest_args,
         } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
-        Action::Run { all, nextest_args } => run::run(all, verbose, &nextest_args),
-        Action::Status => {
-            status::status(verbose)?;
+        Action::Run {
+            all,
+            report_json,
+            report_detail,
+            nextest_args,
+        } => run::run(
+            all,
+            verbose,
+            report_json.as_deref(),
+            report_detail,
+            &nextest_args,
+        ),
+        Action::Status {
+            report_json,
+            report_detail,
+        } => {
+            status::status(verbose, report_json.as_deref(), report_detail)?;
             Ok(0)
         }
         Action::Clean => {
@@ -257,7 +295,7 @@ mod tests {
     fn known_run_flags_parse_before_double_dash() {
         // Subcommand-owned flags still parse normally before `--`.
         let cli = parse(&["run", "--all", "--", "--features", "foo"]);
-        let Action::Run { all, nextest_args } = cli.action else {
+        let Action::Run { all, nextest_args, .. } = cli.action else {
             panic!("expected Run");
         };
         assert!(all);
