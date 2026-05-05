@@ -216,8 +216,8 @@ fn insert_mappings(
                 test_id.binary_id,
                 test_id.test_name,
                 range.file.as_str(),
-                range.line_start as i64,
-                range.line_end as i64,
+                range.line_start,
+                range.line_end,
                 fingerprint,
                 collect_sha,
             ])?;
@@ -721,7 +721,7 @@ mod tests {
         TestId::new(binary_id, test_name)
     }
 
-    fn rng(file: &str, line_start: u32, line_end: u32) -> HitRange {
+    fn rng(file: &str, line_start: i64, line_end: i64) -> HitRange {
         HitRange {
             file: Utf8PathBuf::from(file),
             line_start,
@@ -827,19 +827,11 @@ mod tests {
         let mappings = vec![
             (
                 tid(BIN_A, "test_a"),
-                BTreeSet::from([HitRange {
-                    file: Utf8PathBuf::from("src/lib.rs"),
-                    line_start: 1,
-                    line_end: u32::MAX,
-                }]),
+                BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
             ),
             (
                 tid(BIN_A, "test_b"),
-                BTreeSet::from([HitRange {
-                    file: Utf8PathBuf::from("src/lib.rs"),
-                    line_start: 1,
-                    line_end: u32::MAX,
-                }]),
+                BTreeSet::from([HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"))]),
             ),
         ];
         db.store_coverage(FP_A, SHA_A, &mappings)?;

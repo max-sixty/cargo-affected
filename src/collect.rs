@@ -12,8 +12,9 @@
 //!    (`binary_id`): each test's sentinel set covers its own crate root,
 //!    its package's lib (for non-lib targets), and lib roots of workspace
 //!    packages this target transitively depends on. Stored as sentinel-range
-//!    rows `(line_start=1, line_end=i64::MAX)` so any hunk in one of those
-//!    files overlaps and re-selects the test.
+//!    rows via [`HitRange::sentinel`] (line 1 through
+//!    `CRATE_ROOT_SENTINEL_END`) so any hunk in one of those files
+//!    overlaps and re-selects the test.
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
 //!    and every testcase.
 //! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
@@ -165,14 +166,7 @@ pub fn collect(
         crate_root_sentinels
             .into_iter()
             .map(|(binary_id, paths)| {
-                let ranges = paths
-                    .into_iter()
-                    .map(|p| HitRange {
-                        file: p,
-                        line_start: 1,
-                        line_end: u32::MAX,
-                    })
-                    .collect();
+                let ranges = paths.into_iter().map(HitRange::sentinel).collect();
                 (binary_id, ranges)
             })
             .collect();

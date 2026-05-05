@@ -52,13 +52,21 @@ pub struct CoverageFunction {
     pub regions: Vec<CoverageRegion>,
 }
 
+/// Sentinel `line_end` value marking a row as a "crate-root sentinel" — a
+/// row that overlaps any hunk in the file by construction. Used to model
+/// implicit dependencies cargo's function-level coverage can't observe
+/// (e.g., `mod foo;` or `use ...;` in a crate root). Detection at query
+/// time relies on exact-value equality, so all sentinel-creators must use
+/// this constant via [`HitRange::sentinel`].
+pub const CRATE_ROOT_SENTINEL_END: i64 = i64::MAX;
+
 /// A region tuple as emitted by `llvm-cov export`. Only the leading six
 /// fields are used here; trailing fields (`expanded_file_id`, `kind`,
 /// optional extras for newer LLVM) are accepted but ignored.
 #[derive(Debug)]
 pub struct CoverageRegion {
-    pub line_start: u32,
-    pub line_end: u32,
+    pub line_start: i64,
+    pub line_end: i64,
     pub count: u64,
     pub file_id: usize,
 }
@@ -72,8 +80,8 @@ impl<'de> Deserialize<'de> for CoverageRegion {
                 .ok_or_else(|| serde::de::Error::custom(format!("region missing field {i}")))
         };
         Ok(CoverageRegion {
-            line_start: get_u64(0)? as u32,
-            line_end: get_u64(2)? as u32,
+            line_start: get_u64(0)? as i64,
+            line_end: get_u64(2)? as i64,
             count: get_u64(4)?,
             file_id: get_u64(5)? as usize,
         })
@@ -88,8 +96,22 @@ impl<'de> Deserialize<'de> for CoverageRegion {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HitRange {
     pub file: Utf8PathBuf,
-    pub line_start: u32,
-    pub line_end: u32,
+    pub line_start: i64,
+    pub line_end: i64,
+}
+
+impl HitRange {
+    /// Build a sentinel range for `file` — line 1 through
+    /// [`CRATE_ROOT_SENTINEL_END`]. Stored alongside real function ranges
+    /// to model an implicit "any hunk in this file selects this test" link
+    /// the function-level coverage can't observe directly.
+    pub fn sentinel(file: Utf8PathBuf) -> Self {
+        Self {
+            file,
+            line_start: 1,
+            line_end: CRATE_ROOT_SENTINEL_END,
+        }
+    }
 }
 
 /// Extract per-function hit line ranges from `llvm-cov export` JSON output.
@@ -108,7 +130,7 @@ pub fn extract_hit_ranges(json: &str, canonical_root: &Path) -> Result<BTreeSet<
     // majority span exactly one — a small Vec with linear scan beats a
     // HashMap for the typical n=1 case, and this runs across thousands of
     // functions per test.
-    let mut per_file: Vec<(usize, u32, u32)> = Vec::new();
+    let mut per_file: Vec<(usize, i64, i64)> = Vec::new();
     let mut ranges = BTreeSet::new();
     for data in &export.data {
         for func in &data.functions {
@@ -265,5 +287,13 @@ mod tests {
         );
         let ranges = extract_hit_ranges(&json, &canon).unwrap();
         assert_eq!(ranges.len(), 1);
+    }
+
+    #[test]
+    fn sentinel_uses_the_canonical_end_value() {
+        let r = HitRange::sentinel(Utf8PathBuf::from("src/lib.rs"));
+        assert_eq!(r.line_start, 1);
+        assert_eq!(r.line_end, CRATE_ROOT_SENTINEL_END);
+        assert_eq!(r.line_end, i64::MAX);
     }
 }
