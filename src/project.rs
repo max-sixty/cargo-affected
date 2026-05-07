@@ -983,7 +983,13 @@ mod tests {
     #[test]
     fn sentinels_per_target_with_path_dep_chain() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let root = dir.path().canonicalize()?;
+        // Use the same canonicalize the production path uses: bare
+        // canonicalize on Windows returns a `\\?\` verbatim path, which the
+        // production `crate_root_sentinels_by_binary_id` strips before
+        // calling strip_prefix — so the synthesized metadata src_paths must
+        // already be in the stripped form, otherwise strip_prefix sees one
+        // verbatim path and one plain path and silently rejects every target.
+        let root = canonicalize_no_verbatim(dir.path())?;
         let math_lib = root.join("math/src/lib.rs");
         let math_int = root.join("math/tests/integration.rs");
         let strings_lib = root.join("strings/src/lib.rs");
