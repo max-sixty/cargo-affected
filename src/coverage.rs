@@ -205,6 +205,11 @@ mod tests {
         let canon = root.canonicalize().unwrap();
         let abs_lib = root.join("src/lib.rs").canonicalize().unwrap();
         let abs_utils = root.join("src/utils.rs").canonicalize().unwrap();
+        // `serde_json::to_string` JSON-escapes the embedded path: on Windows
+        // a literal `C:\Users\…` would otherwise produce invalid `\U` escapes
+        // when interpolated into the JSON template via `format!`.
+        let abs_lib = serde_json::to_string(&abs_lib.display().to_string()).unwrap();
+        let abs_utils = serde_json::to_string(&abs_utils.display().to_string()).unwrap();
 
         // Two functions in lib.rs, one in utils.rs, plus a stdlib hit that
         // must be filtered out, plus an unhit function that must be ignored.
@@ -214,7 +219,7 @@ mod tests {
                 "functions": [
                     {{
                         "count": 1,
-                        "filenames": ["{abs_lib}"],
+                        "filenames": [{abs_lib}],
                         "regions": [
                             [10, 0, 12, 0, 5, 0, 0, 0],
                             [11, 0, 15, 0, 3, 0, 0, 0]
@@ -222,7 +227,7 @@ mod tests {
                     }},
                     {{
                         "count": 1,
-                        "filenames": ["{abs_lib}"],
+                        "filenames": [{abs_lib}],
                         "regions": [
                             [20, 0, 25, 0, 1, 0, 0, 0],
                             [22, 0, 23, 0, 0, 0, 0, 0]
@@ -230,12 +235,12 @@ mod tests {
                     }},
                     {{
                         "count": 1,
-                        "filenames": ["{abs_utils}"],
+                        "filenames": [{abs_utils}],
                         "regions": [[5, 0, 7, 0, 2, 0, 0, 0]]
                     }},
                     {{
                         "count": 0,
-                        "filenames": ["{abs_lib}"],
+                        "filenames": [{abs_lib}],
                         "regions": [[100, 0, 200, 0, 0, 0, 0, 0]]
                     }},
                     {{
@@ -246,8 +251,6 @@ mod tests {
                 ]
             }}]
         }}"#,
-            abs_lib = abs_lib.display(),
-            abs_utils = abs_utils.display(),
         );
 
         let ranges = extract_hit_ranges(&json, &canon).unwrap();
@@ -282,6 +285,9 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "").unwrap();
         let canon = root.canonicalize().unwrap();
         let abs = root.join("src/lib.rs").canonicalize().unwrap();
+        // JSON-escape the path so Windows backslashes don't form invalid
+        // `\U` / `\s` escapes when interpolated.
+        let abs = serde_json::to_string(&abs.display().to_string()).unwrap();
 
         // Same source extent emitted by two monomorphizations.
         let json = format!(
@@ -290,18 +296,17 @@ mod tests {
                 "functions": [
                     {{
                         "count": 1,
-                        "filenames": ["{abs}"],
+                        "filenames": [{abs}],
                         "regions": [[1, 0, 5, 0, 1, 0, 0, 0]]
                     }},
                     {{
                         "count": 1,
-                        "filenames": ["{abs}"],
+                        "filenames": [{abs}],
                         "regions": [[1, 0, 5, 0, 1, 0, 0, 0]]
                     }}
                 ]
             }}]
         }}"#,
-            abs = abs.display(),
         );
         let ranges = extract_hit_ranges(&json, &canon).unwrap();
         assert_eq!(ranges.len(), 1);

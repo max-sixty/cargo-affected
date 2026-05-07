@@ -688,7 +688,11 @@ mod tests {
     fn awkward_filename_round_trips() -> Result<()> {
         let dir = tempfile::tempdir()?;
         init_repo(dir.path())?;
-        let awkward = "a b — \"weird\".txt";
+        // Space + em-dash trigger git's `core.quotePath` machinery; the `-z`
+        // flag bypasses it so bytes come through verbatim. We deliberately
+        // avoid `"` (and the rest of `* ? < > |`) since Windows forbids
+        // those in filenames.
+        let awkward = "a b — weird-name.txt";
         std::fs::write(dir.path().join(awkward), b"x")?;
 
         let files = git_changed_files(dir.path())?;
