@@ -53,6 +53,33 @@ pub struct ProjectRoot {
     pub metadata: serde_json::Value,
 }
 
+/// `Path::canonicalize` that strips Windows verbatim/UNC prefixes so the
+/// result lines up with the path strings cargo metadata, llvm-cov, and git
+/// emit (none of which use the `\\?\` form). On Windows, `canonicalize`
+/// always returns a `\\?\C:\…` (or `\\?\UNC\server\share\…`) path, which
+/// would break every `Path::strip_prefix` we rely on for relative paths.
+/// On unix this is a plain canonicalize.
+///
+/// Mirrors the small subset of the `dunce` crate's logic we need; inlining
+/// it avoids the extra dependency for what amounts to a one-time prefix
+/// strip.
+pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
+    let canon = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest.to_string()));
+        }
+    }
+    Ok(canon)
+}
+
 /// Find the project root via `cargo metadata`.
 ///
 /// Uses `cargo metadata --no-deps --format-version=1` to reliably determine
@@ -131,10 +158,7 @@ impl ProjectRoot {
     pub fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
-        let root = self
-            .workspace_root
-            .canonicalize()
-            .context("failed to canonicalize project root")?;
+        let root = canonicalize_no_verbatim(&self.workspace_root)?;
 
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());

@@ -40,7 +40,9 @@ use anyhow::{bail, Context, Result};
 use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_head_sha, git_working_tree_dirty};
+use crate::project::{
+    canonicalize_no_verbatim, find_project_root, git_head_sha, git_working_tree_dirty,
+};
 use crate::selection;
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
@@ -63,9 +65,7 @@ pub fn collect(
     if verbose {
         eprintln!("project root: {}", project_root.display());
     }
-    let canonical_root = project_root
-        .canonicalize()
-        .context("failed to canonicalize project root")?;
+    let canonical_root = canonicalize_no_verbatim(project_root)?;
 
     // Refuse to collect on a dirty tree by default: ranges would be filed
     // under HEAD but reflect working-tree line numbers, knocking the DB out
