@@ -53,31 +53,29 @@ pub struct ProjectRoot {
     pub metadata: serde_json::Value,
 }
 
-/// `Path::canonicalize` that strips Windows verbatim/UNC prefixes so the
-/// result lines up with the path strings cargo metadata, llvm-cov, and git
-/// emit (none of which use the `\\?\` form). On Windows, `canonicalize`
-/// always returns a `\\?\C:\…` (or `\\?\UNC\server\share\…`) path, which
-/// would break every `Path::strip_prefix` we rely on for relative paths.
-/// On unix this is a plain canonicalize.
+/// `Path::canonicalize` adapted for cross-platform path-prefix arithmetic.
 ///
-/// Mirrors the small subset of the `dunce` crate's logic we need; inlining
-/// it avoids the extra dependency for what amounts to a one-time prefix
-/// strip.
+/// On unix this is `Path::canonicalize` — resolves symlinks so the result
+/// matches what rustc/llvm-cov embed in coverage maps (macOS tempdirs
+/// hide behind `/var → /private/var` and stripping the symlinked form
+/// against llvm-cov's resolved paths would silently fail).
+///
+/// On Windows it returns the path unchanged. `Path::canonicalize` there
+/// adds a `\\?\` verbatim prefix AND expands 8.3 short names
+/// (`RUNNER~1` → `runneradmin`), neither of which match cargo metadata's
+/// or llvm-cov's path forms — `strip_prefix` against the canonicalized
+/// root drops every match. Cargo's own tooling doesn't canonicalize, so
+/// the cargo-given path matches itself fine without help.
 pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
-    let canon = path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
     #[cfg(windows)]
     {
-        let s = canon.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            return Ok(PathBuf::from(format!(r"\\{rest}")));
-        }
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return Ok(PathBuf::from(rest.to_string()));
-        }
+        Ok(path.to_path_buf())
     }
-    Ok(canon)
+    #[cfg(not(windows))]
+    {
+        path.canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()))
+    }
 }
 
 /// Find the project root via `cargo metadata`.
@@ -158,7 +156,13 @@ impl ProjectRoot {
     pub fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
-        let root = canonicalize_no_verbatim(&self.workspace_root)?;
+        // No canonicalize: `workspace_root` and `target.src_path` both come
+        // from the same `cargo metadata` invocation and share whatever
+        // normalisation cargo applied. Calling `Path::canonicalize` here
+        // would diverge on Windows (verbatim `\\?\` prefix, 8.3 → long-name
+        // expansion of `RUNNER~1` → `runneradmin`) and the strip_prefix
+        // below would silently drop every target.
+        let root = &self.workspace_root;
 
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
@@ -181,7 +185,7 @@ impl ProjectRoot {
             };
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
-                    if let Some(parsed) = parse_target(target, &root) {
+                    if let Some(parsed) = parse_target(target, root) {
                         // Lib src_path is recorded separately so non-lib
                         // targets can pick it up via the "links to own lib"
                         // rule even if the lib isn't itself a test target.
