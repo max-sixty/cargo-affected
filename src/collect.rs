@@ -843,13 +843,26 @@ pub(crate) fn nextest_list(
 
 /// List subdirectories of `profraw_dir` that look like per-test output
 /// (contain a `meta` sidecar).
+///
+/// The shim writes per-test dirs at `profraw_dir/<binary_id>/<test_name>/`,
+/// so we walk two levels. Splitting binary_id and test_name into separate
+/// path components avoids the collision case where sanitization collapses
+/// `::` into `_` and two genuinely-distinct (binary_id, test_name) pairs
+/// produce the same single-level name.
 fn list_test_dirs(profraw_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
-    for entry in std::fs::read_dir(profraw_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && path.join("meta").exists() {
-            dirs.push(path);
+    for binary_entry in std::fs::read_dir(profraw_dir)? {
+        let binary_entry = binary_entry?;
+        let binary_path = binary_entry.path();
+        if !binary_path.is_dir() {
+            continue;
+        }
+        for test_entry in std::fs::read_dir(&binary_path)? {
+            let test_entry = test_entry?;
+            let test_path = test_entry.path();
+            if test_path.is_dir() && test_path.join("meta").exists() {
+                dirs.push(test_path);
+            }
         }
     }
     dirs.sort();

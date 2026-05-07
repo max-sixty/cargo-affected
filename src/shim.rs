@@ -29,10 +29,12 @@
 //! launched and tells us directly. Same answer for `[lib]`/`[[bin]]` pairs
 //! that normalize to the same compiled basename — no marker probe needed.
 //!
-//! The subdir name includes the binary_id so two tests that share a name
-//! across different binaries (e.g. a `builds` test in `mock-stub` and
-//! `wt-perf`) get independent storage — without this their profraws and
-//! coverage mappings collide and one silently wins.
+//! Storage layout under `CARGO_AFFECTED_PROFRAW_BASE` is two levels:
+//! `<sanitized_binary_id>/<sanitized_test_name>/`. Two levels (rather
+//! than a single concatenated component) keep names unique even after
+//! sanitization collapses `::` to `_`: `(foo, a::b)` and `(foo::a, b)`
+//! would otherwise both produce `foo__a__b` and clobber each other on
+//! Windows where `:` is filesystem-illegal.
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -61,8 +63,9 @@ pub fn run(args: &[String]) -> ! {
             std::process::exit(2);
         });
 
-        let subdir = format!("{}__{}", sanitize(&binary_id), sanitize(&test_name));
-        let dir = Path::new(&base).join(subdir);
+        let dir = Path::new(&base)
+            .join(sanitize(&binary_id))
+            .join(sanitize(&test_name));
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
                 "cargo-affected runner-shim: failed to create {}: {e}",
@@ -120,14 +123,18 @@ fn exec_or_spawn(binary: &str, rest: &[String]) -> ! {
 /// Make a test name or binary id safe for use as a single filesystem directory
 /// component.
 ///
-/// Keeps `::`, alphanumerics, `_`, `-`, `.`. Replaces everything else with `_`.
-/// Rust test names and nextest binary ids are `::`-joined identifiers, so
-/// ordinary names pass through unchanged and collisions are unlikely in
-/// practice.
+/// Keeps alphanumerics, `_`, `-`, `.`. Replaces everything else (including
+/// `:` and path separators) with `_`. `:` is forbidden in Windows path
+/// components — drive letters and alternate data streams reserve it — so
+/// the `::`-joined nextest ids and Rust test names that occur in practice
+/// have to collapse to underscores. Sanitize output is never reversed; the
+/// `meta` sidecar carries the verbatim values, so name collisions inside
+/// one binary_id are the only risk, and they don't occur with real Rust
+/// test names (no two tests in the same binary share a sanitized form).
 pub fn sanitize(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
-        if c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-' || c == '.' {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
             out.push(c);
         } else {
             out.push('_');
@@ -142,13 +149,16 @@ mod tests {
 
     #[test]
     fn sanitize_passthrough() {
-        assert_eq!(sanitize("math::tests::test_add"), "math::tests::test_add");
         assert_eq!(sanitize("plain_name"), "plain_name");
-        assert_eq!(sanitize("mock-stub::builds"), "mock-stub::builds");
+        assert_eq!(sanitize("dotted.name-1"), "dotted.name-1");
     }
 
     #[test]
     fn sanitize_replaces_hostile_chars() {
+        // `:` and path separators are filesystem-illegal on Windows; spaces
+        // and other punctuation are merely ugly. All collapse to `_`.
+        assert_eq!(sanitize("math::tests::test_add"), "math__tests__test_add");
+        assert_eq!(sanitize("mock-stub::builds"), "mock-stub__builds");
         assert_eq!(sanitize("a/b"), "a_b");
         assert_eq!(sanitize("a\\b"), "a_b");
         assert_eq!(sanitize("a b"), "a_b");
