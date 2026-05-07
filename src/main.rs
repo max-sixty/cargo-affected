@@ -11,7 +11,6 @@ mod project;
 mod report;
 mod run;
 mod selection;
-#[cfg(unix)]
 mod shim;
 mod status;
 
@@ -124,9 +123,6 @@ fn main() {
     // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
     // via CARGO_TARGET_<TRIPLE>_RUNNER. Dispatch before clap — its trailing args
     // include `--exact`/`--list`/etc. which clap would interpret if we let it.
-    // Unix-only — non-Unix targets fall through to clap and hit the platform
-    // check in `run_action`.
-    #[cfg(unix)]
     if argv.get(1).map(String::as_str) == Some("runner-shim") {
         shim::run(&argv[2..]);
     }
@@ -150,14 +146,6 @@ fn main() {
 }
 
 fn run_action(action: Action, verbose: bool) -> Result<i32> {
-    // The coverage pipeline relies on the unix-only runner shim (see `shim.rs`).
-    // `status` and `clean` don't spawn it, so leave them working everywhere.
-    #[cfg(not(unix))]
-    if matches!(action, Action::Collect { .. } | Action::Run { .. }) {
-        eprintln!("cargo-affected: mac & linux only at this stage — see README.");
-        return Ok(1);
-    }
-
     match action {
         Action::Collect {
             diff,

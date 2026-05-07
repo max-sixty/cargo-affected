@@ -114,6 +114,24 @@ impl HitRange {
     }
 }
 
+/// Convert a relative source path into a `Utf8PathBuf` whose string form uses
+/// forward slashes on every platform.
+///
+/// llvm-cov and cargo on Windows emit paths with `\` separators, while git
+/// diff always uses `/`. The DB stores file paths as opaque strings and
+/// looks them up by exact-match — so anything destined for `test_regions`
+/// must be normalised to git's separator or selection silently misses on
+/// Windows. Returns `None` if the path isn't valid UTF-8 (paths originating
+/// from cargo/llvm-cov already are, but the call shape is still fallible).
+pub fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
+    let utf8 = Utf8PathBuf::try_from(path.to_path_buf()).ok()?;
+    if cfg!(windows) && utf8.as_str().contains('\\') {
+        Some(Utf8PathBuf::from(utf8.as_str().replace('\\', "/")))
+    } else {
+        Some(utf8)
+    }
+}
+
 /// Extract per-function hit line ranges from `llvm-cov export` JSON output.
 ///
 /// `canonical_root` must already be canonicalized — this function is called
@@ -158,7 +176,7 @@ pub fn extract_hit_ranges(json: &str, canonical_root: &Path) -> Result<BTreeSet<
                 let Ok(rel) = path.strip_prefix(canonical_root) else {
                     continue;
                 };
-                let Ok(utf8) = Utf8PathBuf::try_from(rel.to_path_buf()) else {
+                let Some(utf8) = to_db_relative(rel) else {
                     continue;
                 };
                 ranges.insert(HitRange {

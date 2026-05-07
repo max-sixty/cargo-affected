@@ -114,10 +114,16 @@ pub fn replace_in_file(path: &Path, from: &str, to: &str) {
 
 /// Initialize a fresh git repo in `dir`, set local user identity (so commits
 /// don't depend on the host's global config), stage everything, and commit.
+///
+/// Disables `core.autocrlf` so line endings round-trip verbatim — Windows git
+/// defaults to `true`, which would silently rewrite `\n` to `\r\n` on
+/// checkout and quietly mismatch the byte-exact content tests then patch in
+/// via `replace_in_file`.
 pub fn init_git_with_initial_commit(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main"]);
     git(dir, &["config", "user.email", "test@example.com"]);
     git(dir, &["config", "user.name", "Test"]);
+    git(dir, &["config", "core.autocrlf", "false"]);
     git(dir, &["add", "."]);
     git(dir, &["commit", "-q", "-m", "initial"]);
 }

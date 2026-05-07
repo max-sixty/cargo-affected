@@ -12,8 +12,15 @@
 //! (nextest sets both for every per-test invocation since 0.9.116), points
 //! `LLVM_PROFILE_FILE` at a per-test subdirectory under
 //! `CARGO_AFFECTED_PROFRAW_BASE`, writes a sidecar `meta` file (test name +
-//! binary path + binary_id), then `exec`s the test binary. No other setup —
+//! binary path + binary_id), then runs the test binary. No other setup —
 //! nextest and cargo already provide the full test environment.
+//!
+//! On unix the shim `execvp`s the test binary so it inherits our PID and
+//! signal handling falls through naturally. Windows has no `exec`, so the
+//! shim spawns the binary as a child, waits, and propagates the child's
+//! exit code. Ctrl-C goes to the whole console process group on Windows,
+//! which means the child sees it directly — we just `wait()` and forward
+//! its exit status.
 //!
 //! Reading the binary_id straight from the env sidesteps the path-drift
 //! problem entirely: cargo's hash suffix can shift between collect's listing
@@ -26,9 +33,8 @@
 //! across different binaries (e.g. a `builds` test in `mock-stub` and
 //! `wt-perf`) get independent storage — without this their profraws and
 //! coverage mappings collide and one silently wins.
-//!
-//! Unix-only (uses `execvp`). Windows isn't supported.
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -74,12 +80,41 @@ pub fn run(args: &[String]) -> ! {
         std::env::set_var("LLVM_PROFILE_FILE", dir.join("%p-%m.profraw"));
     }
 
+    exec_or_spawn(binary, rest);
+}
+
+/// Hand off to the test binary. On unix this `execvp`s, replacing the
+/// current process so the child inherits our PID and signals fall through
+/// naturally. On Windows there's no `exec` — spawn-and-wait, propagating the
+/// child's exit code. Either way this never returns: the unix path replaces
+/// the process image, the Windows path always exits.
+#[cfg(unix)]
+fn exec_or_spawn(binary: &str, rest: &[String]) -> ! {
     let err = Command::new(binary).args(rest).exec();
     eprintln!(
         "cargo-affected runner-shim: exec {} failed: {err}",
         binary
     );
     std::process::exit(127);
+}
+
+#[cfg(not(unix))]
+fn exec_or_spawn(binary: &str, rest: &[String]) -> ! {
+    // Windows has no execvp — spawn the test binary as a child, wait, and
+    // forward its exit status. Ctrl-C is delivered to the whole console
+    // process group, so the child receives it directly; we just propagate
+    // whatever exit code it reports.
+    let status = match Command::new(binary).args(rest).status() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "cargo-affected runner-shim: spawn {} failed: {e}",
+                binary
+            );
+            std::process::exit(127);
+        }
+    };
+    std::process::exit(status.code().unwrap_or(127));
 }
 
 /// Make a test name or binary id safe for use as a single filesystem directory

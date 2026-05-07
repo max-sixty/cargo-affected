@@ -922,6 +922,10 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
 
 /// Find an LLVM tool by name.
 fn find_llvm_tool(name: &str) -> Result<PathBuf> {
+    // `EXE_SUFFIX` is `.exe` on Windows and empty elsewhere — `llvm-tools`
+    // ships as `llvm-cov.exe` / `llvm-profdata.exe` on `*-windows-msvc`, so
+    // probing the bare name finds nothing without it.
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(output) = Command::new("rustc").arg("--print").arg("sysroot").output() {
         if output.status.success() {
             let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -930,7 +934,7 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
                 .join("rustlib")
                 .join(current_target())
                 .join("bin")
-                .join(name);
+                .join(&exe_name);
             if tool_path.exists() {
                 return Ok(tool_path);
             }
@@ -947,9 +951,14 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
         }
     }
 
-    if let Ok(output) = Command::new("which").arg(name).output() {
+    // PATH lookup. `which` on unix, `where` on Windows — both print the
+    // resolved path on stdout. `where` may print multiple matches one per
+    // line; take the first.
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(output) = Command::new(which_cmd).arg(&exe_name).output() {
         if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let path = stdout.lines().next().unwrap_or("").trim().to_string();
             if !path.is_empty() {
                 return Ok(PathBuf::from(path));
             }

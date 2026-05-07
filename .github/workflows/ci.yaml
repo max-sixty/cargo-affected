@@ -1,8 +1,10 @@
 name: ci
 
 # Runner versions are pinned to avoid surprise breaking changes from -latest
-# migrations. cargo-affected's runner shim uses execvp and is Unix-only, so
-# Windows is intentionally absent from the matrix.
+# migrations. The matrix covers `x86_64-pc-windows-msvc` alongside Linux and
+# macOS — `x86_64-pc-windows-gnu` and `aarch64-pc-windows-msvc` are
+# documented as broken upstream (rust-lang/rust#111098, #150123) and are
+# excluded.
 
 on:
   push:
@@ -43,6 +45,8 @@ jobs:
             name: linux
           - os: macos-15
             name: macos
+          - os: windows-2022
+            name: windows
     name: test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
 

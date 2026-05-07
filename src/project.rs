@@ -7,6 +7,8 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
+use crate::coverage::to_db_relative;
+
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LineRange {
@@ -279,7 +281,7 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let name = target.get("name").and_then(|v| v.as_str())?.to_string();
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
-    let src_path = Utf8PathBuf::try_from(rel.to_path_buf()).ok()?;
+    let src_path = to_db_relative(rel)?;
     Some(TestTarget { name, kind, src_path })
 }
 
