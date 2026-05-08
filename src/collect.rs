@@ -40,7 +40,9 @@ use anyhow::{bail, Context, Result};
 use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
-use crate::project::{find_project_root, git_head_sha, git_working_tree_dirty};
+use crate::project::{
+    canonicalize_no_verbatim, find_project_root, git_head_sha, git_working_tree_dirty,
+};
 use crate::selection;
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
@@ -63,9 +65,7 @@ pub fn collect(
     if verbose {
         eprintln!("project root: {}", project_root.display());
     }
-    let canonical_root = project_root
-        .canonicalize()
-        .context("failed to canonicalize project root")?;
+    let canonical_root = canonicalize_no_verbatim(project_root)?;
 
     // Refuse to collect on a dirty tree by default: ranges would be filed
     // under HEAD but reflect working-tree line numbers, knocking the DB out
@@ -843,13 +843,26 @@ pub(crate) fn nextest_list(
 
 /// List subdirectories of `profraw_dir` that look like per-test output
 /// (contain a `meta` sidecar).
+///
+/// The shim writes per-test dirs at `profraw_dir/<binary_id>/<test_name>/`,
+/// so we walk two levels. Splitting binary_id and test_name into separate
+/// path components avoids the collision case where sanitization collapses
+/// `::` into `_` and two genuinely-distinct (binary_id, test_name) pairs
+/// produce the same single-level name.
 fn list_test_dirs(profraw_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
-    for entry in std::fs::read_dir(profraw_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && path.join("meta").exists() {
-            dirs.push(path);
+    for binary_entry in std::fs::read_dir(profraw_dir)? {
+        let binary_entry = binary_entry?;
+        let binary_path = binary_entry.path();
+        if !binary_path.is_dir() {
+            continue;
+        }
+        for test_entry in std::fs::read_dir(&binary_path)? {
+            let test_entry = test_entry?;
+            let test_path = test_entry.path();
+            if test_path.is_dir() && test_path.join("meta").exists() {
+                dirs.push(test_path);
+            }
         }
     }
     dirs.sort();
@@ -922,6 +935,10 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
 
 /// Find an LLVM tool by name.
 fn find_llvm_tool(name: &str) -> Result<PathBuf> {
+    // `EXE_SUFFIX` is `.exe` on Windows and empty elsewhere — `llvm-tools`
+    // ships as `llvm-cov.exe` / `llvm-profdata.exe` on `*-windows-msvc`, so
+    // probing the bare name finds nothing without it.
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(output) = Command::new("rustc").arg("--print").arg("sysroot").output() {
         if output.status.success() {
             let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -930,7 +947,7 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
                 .join("rustlib")
                 .join(current_target())
                 .join("bin")
-                .join(name);
+                .join(&exe_name);
             if tool_path.exists() {
                 return Ok(tool_path);
             }
@@ -947,9 +964,14 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
         }
     }
 
-    if let Ok(output) = Command::new("which").arg(name).output() {
+    // PATH lookup. `which` on unix, `where` on Windows — both print the
+    // resolved path on stdout. `where` may print multiple matches one per
+    // line; take the first.
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(output) = Command::new(which_cmd).arg(&exe_name).output() {
         if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let path = stdout.lines().next().unwrap_or("").trim().to_string();
             if !path.is_empty() {
                 return Ok(PathBuf::from(path));
             }

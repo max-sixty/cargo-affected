@@ -6,10 +6,17 @@ Like pytest-testmon for Rust. Maps each test to the source-line ranges it
 touches via LLVM coverage, then reruns only the tests whose ranges overlap
 `git diff` hunks.
 
-> **Status: extremely early.** Mac & linux only at this stage. The author is
+> **Status: extremely early.** Linux, macOS, and Windows MSVC
+> (`x86_64-pc-windows-msvc`) are supported. `x86_64-pc-windows-gnu` and
+> `aarch64-pc-windows-msvc` are intentionally excluded — coverage
+> instrumentation is broken upstream on those targets (see
+> [rust-lang/rust#111098][gnu-bug] and [#150123][arm-bug]). The author is
 > starting to use this in their own repos; others probably shouldn't yet.
 > The schema can change without migration, behavior may break, and there is
 > no support promise. CI should still run the full test suite.
+
+[gnu-bug]: https://github.com/rust-lang/rust/issues/111098
+[arm-bug]: https://github.com/rust-lang/rust/issues/150123
 
 ## Installation
 

@@ -7,6 +7,8 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
+use crate::coverage::to_db_relative;
+
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LineRange {
@@ -49,6 +51,31 @@ pub struct ProjectRoot {
     /// Raw `cargo metadata --no-deps` JSON. Parsed once at root detection so
     /// less-common lookups (test src paths) don't have to re-spawn cargo.
     pub metadata: serde_json::Value,
+}
+
+/// `Path::canonicalize` adapted for cross-platform path-prefix arithmetic.
+///
+/// On unix this is `Path::canonicalize` — resolves symlinks so the result
+/// matches what rustc/llvm-cov embed in coverage maps (macOS tempdirs
+/// hide behind `/var → /private/var` and stripping the symlinked form
+/// against llvm-cov's resolved paths would silently fail).
+///
+/// On Windows it returns the path unchanged. `Path::canonicalize` there
+/// adds a `\\?\` verbatim prefix AND expands 8.3 short names
+/// (`RUNNER~1` → `runneradmin`), neither of which match cargo metadata's
+/// or llvm-cov's path forms — `strip_prefix` against the canonicalized
+/// root drops every match. Cargo's own tooling doesn't canonicalize, so
+/// the cargo-given path matches itself fine without help.
+pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        Ok(path.to_path_buf())
+    }
+    #[cfg(not(windows))]
+    {
+        path.canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()))
+    }
 }
 
 /// Find the project root via `cargo metadata`.
@@ -129,10 +156,13 @@ impl ProjectRoot {
     pub fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
-        let root = self
-            .workspace_root
-            .canonicalize()
-            .context("failed to canonicalize project root")?;
+        // No canonicalize: `workspace_root` and `target.src_path` both come
+        // from the same `cargo metadata` invocation and share whatever
+        // normalisation cargo applied. Calling `Path::canonicalize` here
+        // would diverge on Windows (verbatim `\\?\` prefix, 8.3 → long-name
+        // expansion of `RUNNER~1` → `runneradmin`) and the strip_prefix
+        // below would silently drop every target.
+        let root = &self.workspace_root;
 
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
@@ -155,7 +185,7 @@ impl ProjectRoot {
             };
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
-                    if let Some(parsed) = parse_target(target, &root) {
+                    if let Some(parsed) = parse_target(target, root) {
                         // Lib src_path is recorded separately so non-lib
                         // targets can pick it up via the "links to own lib"
                         // rule even if the lib isn't itself a test target.
@@ -279,7 +309,7 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let name = target.get("name").and_then(|v| v.as_str())?.to_string();
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
-    let src_path = Utf8PathBuf::try_from(rel.to_path_buf()).ok()?;
+    let src_path = to_db_relative(rel)?;
     Some(TestTarget { name, kind, src_path })
 }
 
@@ -686,7 +716,11 @@ mod tests {
     fn awkward_filename_round_trips() -> Result<()> {
         let dir = tempfile::tempdir()?;
         init_repo(dir.path())?;
-        let awkward = "a b — \"weird\".txt";
+        // Space + em-dash trigger git's `core.quotePath` machinery; the `-z`
+        // flag bypasses it so bytes come through verbatim. We deliberately
+        // avoid `"` (and the rest of `* ? < > |`) since Windows forbids
+        // those in filenames.
+        let awkward = "a b — weird-name.txt";
         std::fs::write(dir.path().join(awkward), b"x")?;
 
         let files = git_changed_files(dir.path())?;
@@ -953,7 +987,13 @@ mod tests {
     #[test]
     fn sentinels_per_target_with_path_dep_chain() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let root = dir.path().canonicalize()?;
+        // Use the same canonicalize the production path uses: bare
+        // canonicalize on Windows returns a `\\?\` verbatim path, which the
+        // production `crate_root_sentinels_by_binary_id` strips before
+        // calling strip_prefix — so the synthesized metadata src_paths must
+        // already be in the stripped form, otherwise strip_prefix sees one
+        // verbatim path and one plain path and silently rejects every target.
+        let root = canonicalize_no_verbatim(dir.path())?;
         let math_lib = root.join("math/src/lib.rs");
         let math_int = root.join("math/tests/integration.rs");
         let strings_lib = root.join("strings/src/lib.rs");
