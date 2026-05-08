@@ -1,8 +1,8 @@
 //! Per-test coverage runner shim.
 //!
-//! Invoked by cargo/nextest through `CARGO_TARGET_<TRIPLE>_RUNNER`. Cargo sets
-//! that var to `<cargo-affected> runner-shim` and calls it with the test binary
-//! and its args:
+//! Invoked by cargo/nextest as the configured target runner. `collect` wires
+//! cargo via `--config target.<triple>.runner=["<cargo-affected>", "runner-shim"]`,
+//! so each test invocation arrives as:
 //!
 //! ```text
 //! cargo-affected runner-shim <test-binary> <test-args…>

@@ -121,8 +121,8 @@ fn main() {
     let mut argv: Vec<String> = std::env::args().collect();
 
     // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
-    // via CARGO_TARGET_<TRIPLE>_RUNNER. Dispatch before clap — its trailing args
-    // include `--exact`/`--list`/etc. which clap would interpret if we let it.
+    // via `--config target.<triple>.runner=…`. Dispatch before clap — its trailing
+    // args include `--exact`/`--list`/etc. which clap would interpret if we let it.
     if argv.get(1).map(String::as_str) == Some("runner-shim") {
         shim::run(&argv[2..]);
     }
