@@ -2,10 +2,17 @@
 //!
 //! Delegates build and test execution to `cargo nextest run`. We insert a
 //! small runner shim (`cargo-affected runner-shim`) via
-//! `CARGO_TARGET_<TRIPLE>_RUNNER` that points `LLVM_PROFILE_FILE` at a
-//! per-test subdirectory before `exec`ing the real test binary. After nextest
-//! finishes we walk those subdirectories, merge profraws, export coverage,
-//! and write per-(test, file) line ranges to SQLite.
+//! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at
+//! a per-test subdirectory before `exec`ing the real test binary. After
+//! nextest finishes we walk those subdirectories, merge profraws, export
+//! coverage, and write per-(test, file) line ranges to SQLite.
+//!
+//! We use the `--config` array form rather than the
+//! `CARGO_TARGET_<TRIPLE>_RUNNER` env var because cargo only
+//! whitespace-splits the env-var form — a path like
+//! `C:\Users\Joe Smith\…\cargo-affected.exe` (Windows) or
+//! `/Users/joe/Library/Application Support/…` (macOS) would be
+//! mis-tokenised. The TOML array preserves the path as one argv slot.
 //!
 //! Approach:
 //! 1. Read crate roots from `cargo metadata`, scoped per nextest target
@@ -18,10 +25,10 @@
 //! 2. `cargo nextest list --message-format json` to enumerate every binary
 //!    and every testcase.
 //! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
-//!    runner env set. The preceding `list` step built the binaries, so `run`
-//!    is a cache hit. nextest handles parallelism and progress. Each test
-//!    invocation gets its `binary_id` straight from `NEXTEST_BINARY_ID` —
-//!    the runner shim doesn't need to map paths.
+//!    runner wired in via `--config`. The preceding `list` step built the
+//!    binaries, so `run` is a cache hit. nextest handles parallelism and
+//!    progress. Each test invocation gets its `binary_id` straight from
+//!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
 //! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
 //!    git error surfaces before we spend time on coverage parsing.
 //! 5. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
@@ -88,11 +95,7 @@ pub fn collect(
     require_nextest(project_root)?;
     let self_path = std::env::current_exe().context("failed to resolve current executable")?;
     let target_triple = current_target();
-    let runner_env_name = format!(
-        "CARGO_TARGET_{}_RUNNER",
-        target_triple.to_uppercase().replace('-', "_")
-    );
-    let runner_env_value = format!("{} runner-shim", self_path.display());
+    let runner_config = format_runner_config(&target_triple, &self_path);
 
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
@@ -240,6 +243,8 @@ pub fn collect(
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
         .arg("run")
+        .arg("--config")
+        .arg(&runner_config)
         .arg("--target-dir")
         .arg(&build_dir)
         // `--no-tests=warn` so a filter that matches nothing real (every
@@ -250,7 +255,6 @@ pub fn collect(
         // live-vs-phantom split, not nextest's exit code.
         .arg("--no-tests=warn")
         .env("RUSTFLAGS", &rustflags)
-        .env(&runner_env_name, &runner_env_value)
         .env("CARGO_AFFECTED_PROFRAW_BASE", &profraw_dir)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
@@ -984,6 +988,22 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
     )
 }
 
+/// Build the value for `--config target.<triple>.runner=…` as a TOML
+/// array literal. The array form is required because cargo only
+/// whitespace-splits the legacy env-var form (`CARGO_TARGET_<TRIPLE>_RUNNER`),
+/// which silently breaks any binary path containing a space — common on
+/// Windows (`C:\Users\Joe Smith\…`) and macOS
+/// (`~/Library/Application Support/…`). Inside the array each element is a
+/// TOML basic string, so `\` and `"` need escaping; nothing else realistic
+/// in a filesystem path does.
+fn format_runner_config(target_triple: &str, self_path: &Path) -> String {
+    let escaped = self_path
+        .to_string_lossy()
+        .replace('\\', r"\\")
+        .replace('"', "\\\"");
+    format!(r#"target.{target_triple}.runner=["{escaped}", "runner-shim"]"#)
+}
+
 /// Get the current rustc target triple.
 fn current_target() -> String {
     Command::new("rustc")
@@ -1057,6 +1077,38 @@ mod tests {
                 "missing {n}"
             );
         }
+    }
+
+    #[test]
+    fn runner_config_uses_toml_array_form() {
+        let path = PathBuf::from("/usr/local/bin/cargo-affected");
+        assert_eq!(
+            format_runner_config("aarch64-apple-darwin", &path),
+            r#"target.aarch64-apple-darwin.runner=["/usr/local/bin/cargo-affected", "runner-shim"]"#,
+        );
+    }
+
+    /// Spaces in the binary path are why we use the array form — cargo's
+    /// `CARGO_TARGET_<TRIPLE>_RUNNER` env var only whitespace-splits, so a
+    /// path containing a space would be mis-tokenised.
+    #[test]
+    fn runner_config_preserves_spaces_in_path() {
+        let path = PathBuf::from("/Users/Joe Smith/.cargo/bin/cargo-affected");
+        assert_eq!(
+            format_runner_config("aarch64-apple-darwin", &path),
+            r#"target.aarch64-apple-darwin.runner=["/Users/Joe Smith/.cargo/bin/cargo-affected", "runner-shim"]"#,
+        );
+    }
+
+    /// Windows paths bring backslashes and (in pathological cases)
+    /// double-quotes; both need TOML basic-string escaping inside the array.
+    #[test]
+    fn runner_config_escapes_backslashes_and_quotes() {
+        let path = PathBuf::from(r#"C:\Users\Joe "Q" Smith\cargo-affected.exe"#);
+        assert_eq!(
+            format_runner_config("x86_64-pc-windows-msvc", &path),
+            r#"target.x86_64-pc-windows-msvc.runner=["C:\\Users\\Joe \"Q\" Smith\\cargo-affected.exe", "runner-shim"]"#,
+        );
     }
 
     #[test]
