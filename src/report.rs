@@ -594,33 +594,13 @@ fn build_stored_fingerprints(
     stored: Vec<StoredFingerprintSnapshot>,
     current: &[FingerprintComponent],
 ) -> Vec<StoredFingerprintEntry> {
-    let current_by_label: BTreeMap<&str, &str> =
-        current.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
-
     let mut entries: Vec<StoredFingerprintEntry> = stored
         .into_iter()
         .map(|snap| {
-            let stored_by_label: BTreeMap<&str, &str> = snap
-                .components
-                .iter()
-                .map(|c| (c.label.as_str(), c.hash.as_str()))
-                .collect();
-            // Diff in both directions: a label present in current but
-            // missing from stored counts as differing, and vice versa.
-            let mut differing: BTreeSet<String> = BTreeSet::new();
-            for (label, hash) in &current_by_label {
-                if stored_by_label.get(*label) != Some(hash) {
-                    differing.insert(label.to_string());
-                }
-            }
-            for label in stored_by_label.keys() {
-                if !current_by_label.contains_key(*label) {
-                    differing.insert(label.to_string());
-                }
-            }
+            let differing_labels = diff_labels(current, &snap.components);
             StoredFingerprintEntry {
-                diff_count: differing.len(),
-                differing_labels: differing.into_iter().collect(),
+                diff_count: differing_labels.len(),
+                differing_labels,
                 fingerprint: snap.fingerprint,
                 last_seen: snap.last_seen,
             }
@@ -635,6 +615,69 @@ fn build_stored_fingerprints(
             .then(b.last_seen.cmp(&a.last_seen))
     });
     entries
+}
+
+/// Sorted symmetric difference of `(label, hash)` pairs between two
+/// fingerprint component lists. Used by both the JSON report's per-stored
+/// `differing_labels` and the human-facing cache-miss explanation. A label
+/// present in one side but missing from the other counts as differing.
+fn diff_labels(
+    current: &[FingerprintComponent],
+    stored: &[FingerprintComponent],
+) -> Vec<String> {
+    let current_by_label: BTreeMap<&str, &str> =
+        current.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
+    let stored_by_label: BTreeMap<&str, &str> =
+        stored.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
+    let mut differing: BTreeSet<String> = BTreeSet::new();
+    for (label, hash) in &current_by_label {
+        if stored_by_label.get(*label) != Some(hash) {
+            differing.insert((*label).to_string());
+        }
+    }
+    for label in stored_by_label.keys() {
+        if !current_by_label.contains_key(*label) {
+            differing.insert((*label).to_string());
+        }
+    }
+    differing.into_iter().collect()
+}
+
+/// Differing component labels for the *closest* stored fingerprint —
+/// the one whose component set differs from `current` in the fewest
+/// labels. Returns an empty vec if `stored` is empty (no fingerprints to
+/// compare against — i.e. `MissNoCoverage`, not `MissFingerprint`).
+///
+/// Powers the human-facing cache-miss line in `run` / `status` so the
+/// user sees *which* build input changed without parsing the JSON
+/// report. Reuses [`diff_labels`] verbatim — no host-OS-specific logic;
+/// the rustc host triple is just one of the labels that can appear.
+pub fn closest_stored_diff_labels(
+    current: &[FingerprintComponent],
+    stored: &[StoredFingerprintSnapshot],
+) -> Vec<String> {
+    stored
+        .iter()
+        .map(|snap| diff_labels(current, &snap.components))
+        .min_by_key(Vec::len)
+        .unwrap_or_default()
+}
+
+/// Format the parenthetical body of a fingerprint-miss message, listing
+/// the labels that differ from the closest stored fingerprint. Empty
+/// `labels` yields an empty string so callers can concatenate
+/// unconditionally; the leading space is part of the returned text so
+/// the slot reads cleanly inside a sentence ("for the current
+/// environment{clause} — running …").
+pub fn fingerprint_miss_clause(labels: &[String]) -> String {
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (differs from closest stored fingerprint in: {})",
+            labels.join(", ")
+        )
+    }
 }
 
 fn build_collect_shas(shas: Vec<CollectShaSnapshot>) -> Vec<CollectShaEntry> {
@@ -796,6 +839,42 @@ mod tests {
             entries[0].differing_labels,
             vec!["cargo_lock", "manifest:Cargo.toml"],
         );
+    }
+
+    /// `closest_stored_diff_labels` picks the stored fingerprint with the
+    /// smallest symmetric diff against current, regardless of input order.
+    /// Empty stored set → empty labels (drives the message branch in
+    /// `run`/`status` that falls back to the no-coverage phrasing).
+    #[test]
+    fn closest_stored_diff_labels_picks_min_diff() {
+        let current = vec![
+            fp_component("rustc", "host-A"),
+            fp_component("CARGO_BUILD_TARGET", "tgt-A"),
+        ];
+        let stored = vec![
+            // 2 labels differ
+            StoredFingerprintSnapshot {
+                fingerprint: "far".to_string(),
+                last_seen: "2026-01-01T00:00:00Z".to_string(),
+                components: vec![
+                    fp_component("rustc", "host-X"),
+                    fp_component("CARGO_BUILD_TARGET", "tgt-X"),
+                ],
+            },
+            // 1 label differs — should win
+            StoredFingerprintSnapshot {
+                fingerprint: "close".to_string(),
+                last_seen: "2026-04-01T00:00:00Z".to_string(),
+                components: vec![
+                    fp_component("rustc", "host-X"),
+                    fp_component("CARGO_BUILD_TARGET", "tgt-A"),
+                ],
+            },
+        ];
+        let labels = closest_stored_diff_labels(&current, &stored);
+        assert_eq!(labels, vec!["rustc"]);
+
+        assert!(closest_stored_diff_labels(&current, &[]).is_empty());
     }
 
     /// Closest stored fingerprint comes first; ties broken by `last_seen` desc.

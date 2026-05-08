@@ -767,6 +767,10 @@ impl Db {
     }
 
     /// Whether the DB holds any coverage data at all (any fingerprint).
+    /// Test-only: production code distinguishes `MissNoCoverage` from
+    /// `MissFingerprint` via [`Db::stored_fingerprint_snapshots`], which
+    /// lets the same query also drive the components-diff diagnostic.
+    #[cfg(test)]
     pub fn has_any_coverage(&self) -> Result<bool> {
         let count: i64 = self
             .conn
