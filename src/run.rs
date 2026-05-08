@@ -90,11 +90,23 @@ pub fn run(
     };
 
     if db.test_count(&fingerprint.hex)? == 0 {
-        let status = if db.has_any_coverage()? {
+        // Reuse pre-fetched snapshots when --report-json forced the read;
+        // otherwise fetch on demand for the human-facing diff line. Either
+        // way the cache-miss path is about to invoke nextest, so the cost
+        // is in the noise.
+        let stored = if stored.is_empty() {
+            db.stored_fingerprint_snapshots()?
+        } else {
+            stored
+        };
+        let status = if !stored.is_empty() {
+            let snapshots = report::snapshots_from(stored.clone());
+            let differing =
+                report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
             eprintln!(
-                "note: no coverage data for the current environment \
-                 (Cargo.lock, Cargo.toml, rustc version, or build flags changed) — \
-                 running all tests; run `cargo affected collect` to refresh"
+                "note: no coverage data for the current environment{} — \
+                 running all tests; run `cargo affected collect` to refresh",
+                report::fingerprint_miss_clause(&differing),
             );
             CacheStatus::MissFingerprint
         } else {
