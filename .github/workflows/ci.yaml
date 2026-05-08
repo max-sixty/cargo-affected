@@ -66,5 +66,5 @@ jobs:
     - name: 💰 Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: 🧪 Unit tests
+    - name: 🧪 Tests
       run: cargo test
