@@ -127,6 +127,19 @@ fn main() {
         shim::run(&argv[2..]);
     }
 
+    // Stop NEXTEST_BINARY_ID / NEXTEST_TEST_NAME from leaking into our inner
+    // `cargo nextest run`. When cargo-affected itself runs as a test under an
+    // outer nextest (e.g. our functional suite via `cargo nextest run`), the
+    // outer process passes both vars through. nextest sets them per-test for
+    // real test invocations but not for discovery passes (`--list`,
+    // `--list --ignored`); during those passes the runner-shim would
+    // otherwise see the inherited outer values, mistake the discovery probe
+    // for a real test invocation, and write a bogus per-test profraw dir
+    // tagged with the outer functional test's id. The shim itself still
+    // reads them — we cleared them after the shim dispatch above.
+    std::env::remove_var("NEXTEST_BINARY_ID");
+    std::env::remove_var("NEXTEST_TEST_NAME");
+
     // Cargo invokes us as `cargo-affected affected <args>`; strip the redundant
     // slot so clap sees a flat command rather than needing a wrapper subcommand.
     if argv.get(1).map(String::as_str) == Some("affected") {
