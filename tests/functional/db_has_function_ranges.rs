@@ -11,7 +11,7 @@
 //! over-selection rather than a hard error. This scenario asserts the
 //! invariant directly.
 //!
-//! Definition of `CRATE_ROOT_SENTINEL_END` lives at `src/coverage.rs:62`. It's
+//! Definition of `CRATE_ROOT_SENTINEL_END` lives in `src/coverage.rs`. It's
 //! `pub`, but `cargo-affected` ships only a `[[bin]]` target with no library,
 //! so we hard-code `i64::MAX` here.
 
