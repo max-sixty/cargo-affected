@@ -24,6 +24,7 @@ the functional test suite.
 - `selection.rs` — Shared between `run`, `status`, and `collect --diff`. Owns reachability classification (`check_shas_reachable`), per-sha diff collection (`changed_ranges_per_sha`), the divergence notice, and the affected + new + listed selection itself.
 - `run.rs` — `collect_shas` → reachability → per-sha `git diff -U0` → selection → `nextest run -E <filter>`. Widens to all tests only when every sha is diverged.
 - `status.rs` — Dry-run variant of `run`.
+- `report.rs` — Structured JSON diagnostic report (`--report-json`) for `run` / `status`. Versioned `SCHEMA_VERSION` (currently 1). Also powers the human-facing cache-miss line that names the fingerprint components differing from the closest stored snapshot.
 
 ## Principles
 
