@@ -183,11 +183,16 @@ pub fn collect(
     // List first. Gives us the stable (package, target, kind) → binary_id map
     // we'll use to disambiguate same-basename binaries (e.g. two crates with
     // their own `tests/builds.rs`). The list step builds with the same
-    // RUSTFLAGS; the subsequent run is a cache hit. Fingerprint is taken now
-    // so Cargo.lock is in its final state — status/run will compare against
-    // that same state.
+    // RUSTFLAGS and build flags as the run below, so the subsequent run is a
+    // cache hit. Fingerprint is taken now so Cargo.lock is in its final
+    // state — status/run will compare against that same state.
     eprintln!("listing tests with cargo nextest list...");
-    let listing = nextest_list(project_root, Some(&rustflags), Some(&build_dir))?;
+    let listing = nextest_list(
+        project_root,
+        Some(&rustflags),
+        Some(&build_dir),
+        &cargo_build_args(nextest_args),
+    )?;
     eprintln!(
         "found {} tests across {} binaries",
         listing.tests.len(),
@@ -803,10 +808,109 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
     Ok(path)
 }
 
+/// Boolean cargo build flags accepted by both `cargo nextest list` and
+/// `cargo nextest run` — no value token follows.
+const BUILD_FLAGS_BARE: &[&str] = &[
+    "--workspace",
+    "--all",
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--all-features",
+    "--no-default-features",
+    "--release",
+    "-r",
+    "--frozen",
+    "--locked",
+    "--offline",
+    "--ignore-rust-version",
+    "--future-incompat-report",
+    "--unit-graph",
+];
+
+/// Long cargo build flags that consume a value — `--flag value` or the
+/// joined `--flag=value`.
+///
+/// `--target-dir` is deliberately absent: it changes only where artifacts
+/// land, not which tests exist, and `collect` already passes its own
+/// `--target-dir` to `nextest_list` — forwarding a second one would make
+/// `cargo nextest list` reject the duplicate.
+const BUILD_FLAGS_VALUED: &[&str] = &[
+    "--package",
+    "--exclude",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "--features",
+    "--cargo-profile",
+    "--target",
+    "--manifest-path",
+    "--build-jobs",
+    "--config",
+];
+
+/// Short cargo build flags that consume a value — `-p mycrate` or the
+/// joined `-pmycrate`.
+const BUILD_FLAGS_SHORT_VALUED: &[&str] = &["-p", "-F", "-Z"];
+
+/// Extract the cargo *build* flags from the post-`--` passthrough so the
+/// `cargo nextest list` used for new-test detection builds the same test set
+/// as the eventual `cargo nextest run`.
+///
+/// `list` and `run` share cargo's build options (`--features`, `-p`,
+/// `--release`, …) but `run` adds runner/reporter options (`--retries`,
+/// `--no-fail-fast`, `--no-tests`, …) that `list` rejects outright.
+/// Forwarding the whole passthrough to `list` would break on any of those;
+/// forwarding nothing lists a feature-less build while `run` builds with the
+/// user's features, so "listed minus DB = new" compares two different test
+/// sets. Hence an allowlist of the build flags — anything else (run-only
+/// flags, test-name filters, positionals) is dropped: it either doesn't
+/// affect which test binaries get built or `list` wouldn't accept it.
+pub(crate) fn cargo_build_args(nextest_args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = nextest_args.iter();
+    while let Some(arg) = iter.next() {
+        let name = arg.split('=').next().unwrap_or(arg);
+        if BUILD_FLAGS_BARE.contains(&name) {
+            out.push(arg.clone());
+        } else if BUILD_FLAGS_VALUED.contains(&name) {
+            out.push(arg.clone());
+            // `--flag value` carries the value in the next token;
+            // `--flag=value` carries it inline.
+            if !arg.contains('=') {
+                if let Some(value) = iter.next() {
+                    out.push(value.clone());
+                }
+            }
+        } else if BUILD_FLAGS_SHORT_VALUED.contains(&arg.as_str()) {
+            out.push(arg.clone());
+            if let Some(value) = iter.next() {
+                out.push(value.clone());
+            }
+        } else if BUILD_FLAGS_SHORT_VALUED.iter().any(|s| arg.starts_with(*s)) {
+            // Joined short form: `-pmycrate`, `-Ffeature`.
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
-/// pair, plus per-binary metadata.
+/// pair, the subset that is ignored, plus per-binary metadata.
 pub(crate) struct Listing {
+    /// Every testcase nextest enumerated, ignored or not. The complete set —
+    /// `collect --diff` prunes DB rows against it, so a merely-ignored test
+    /// must stay in here or its rows would be dropped.
     pub(crate) tests: Vec<TestId>,
+    /// Subset of `tests` that nextest reports as `#[ignore]`d on this
+    /// platform (covers conditional `#[cfg_attr(.., ignore)]` too). These
+    /// are skipped by `cargo nextest run`, so they never gain coverage;
+    /// new-test detection must exclude them or they read as "new" forever.
+    pub(crate) ignored: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
@@ -828,10 +932,17 @@ pub(crate) struct BinaryEntry {
 /// directory so build-script profraws land alongside cargo's debug/ tree
 /// rather than in the project root. Only collect passes this — run/status
 /// reuse the user's default target/.
+///
+/// `build_args` are the cargo build flags (`--features`, `-p`, …) extracted
+/// from the post-`--` passthrough by [`cargo_build_args`]. They must match
+/// the build config of the subsequent `cargo nextest run`, or the listing
+/// enumerates a different test set than the run builds and new-test
+/// detection ("listed minus DB") becomes unsound.
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
     build_dir: Option<&Path>,
+    build_args: &[String],
 ) -> Result<Listing> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
@@ -848,6 +959,9 @@ pub(crate) fn nextest_list(
         cmd.arg("--target-dir").arg(dir);
         cmd.env("LLVM_PROFILE_FILE", dir.join("build-%p-%m.profraw"));
     }
+    for a in build_args {
+        cmd.arg(a);
+    }
     let output = cmd
         .spawn()
         .context("failed to spawn cargo nextest list")?
@@ -863,6 +977,7 @@ pub(crate) fn nextest_list(
         serde_json::from_str(stdout).context("failed to parse nextest list JSON")?;
 
     let mut tests = BTreeSet::new();
+    let mut ignored = BTreeSet::new();
     let mut binaries = Vec::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
@@ -877,13 +992,22 @@ pub(crate) fn nextest_list(
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
             };
-            for case in cases.keys() {
-                tests.insert(TestId::new(binary_id.clone(), case.clone()));
+            for (name, case) in cases {
+                let test_id = TestId::new(binary_id.clone(), name.clone());
+                let is_ignored = case
+                    .get("ignored")
+                    .and_then(|v| v.as_bool())
+                    .context("nextest list testcase missing `ignored` flag")?;
+                if is_ignored {
+                    ignored.insert(test_id.clone());
+                }
+                tests.insert(test_id);
             }
         }
     }
     Ok(Listing {
         tests: tests.into_iter().collect(),
+        ignored,
         binaries,
     })
 }
@@ -1086,6 +1210,55 @@ mod tests {
              (binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y))) | \
              (binary_id(=wt-perf::builds) & (test(=builds)))",
         );
+    }
+
+    #[test]
+    fn cargo_build_args_keeps_build_flags_drops_run_only() {
+        let args: Vec<String> = [
+            "--features",
+            "shell-integration-tests",
+            "--no-fail-fast",
+            "--retries",
+            "2",
+            "--release",
+            "--no-tests=warn",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // `--features <value>` and `--release` survive; the run-only flags —
+        // and `--retries`'s separate value token — are dropped.
+        assert_eq!(
+            cargo_build_args(&args),
+            vec!["--features", "shell-integration-tests", "--release"],
+        );
+    }
+
+    #[test]
+    fn cargo_build_args_handles_joined_and_short_forms() {
+        let args: Vec<String> = [
+            "--features=a,b",
+            "-p",
+            "mycrate",
+            "-r",
+            "--max-fail=3",
+            "some_test_filter",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // `--flag=value`, `-p <value>`, and the `-r` short flag are build
+        // args; `--max-fail=3` is run-only and the bare positional filter is
+        // neither — both dropped.
+        assert_eq!(
+            cargo_build_args(&args),
+            vec!["--features=a,b", "-p", "mycrate", "-r"],
+        );
+    }
+
+    #[test]
+    fn cargo_build_args_empty() {
+        assert!(cargo_build_args(&[]).is_empty());
     }
 
     /// Regression for the Windows command-line overflow: a large affected set
