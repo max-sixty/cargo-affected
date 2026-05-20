@@ -93,7 +93,7 @@ checksum = "e629a66d692cb9ff1a1c664e41771b3dcaf961985a9774c0eb0bd1b51cf60a48"
 
 [[package]]
 name = "cargo-affected"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "camino",
