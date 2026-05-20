@@ -174,6 +174,56 @@ fn newly_ignored_test_excluded_from_affected() {
     );
 }
 
+/// `cargo affected run -- <substring>` forwards `<substring>` as a positional
+/// test-name filter to `cargo nextest run`. New-test detection runs a separate
+/// `cargo nextest list` whose build args came from a build-flag *allowlist*
+/// that dropped the positional. A new test absent from the DB but not matching
+/// `<substring>` was therefore still flagged `(new)`, landed in the generated
+/// default-filter handed to `nextest run`, then failed to intersect the
+/// positional filter — `nextest run` exited 4 (`no tests to run`) once that
+/// new test was the only selected entry.
+#[test]
+fn run_with_positional_filter_excludes_unmatching_new_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_pos_filter_new");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Add a new test that doesn't match the positional filter we'll run with.
+    // `test_brand_new` has no `add` substring, so the positional filter will
+    // exclude it; if new-test detection still flags it `new`, the selection
+    // collapses to a single test the positional filter doesn't admit.
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("tests/integration_new.rs"),
+        "#[test]\nfn test_brand_new() {\n    assert_eq!(1 + 1, 2);\n}\n",
+    )
+    .unwrap();
+
+    let run = cargo_affected(dir, &["affected", "run", "-v", "--", "add"]);
+    assert!(
+        run.status.success(),
+        "run with a positional filter that excludes the new test must exit 0, \
+         got status={:?} stderr=\n{}\nstdout=\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout),
+    );
+    let combined = combined_output(&run);
+    assert!(
+        !combined.contains("test_brand_new"),
+        "the new test must not appear in the selection when the positional \
+         filter excludes it, got:\n{combined}",
+    );
+}
+
 /// Single-crate, single-test project: one `add` function and one `test_add`
 /// covering it. Used as the canonical "the only affected test got ignored"
 /// case where the selection collapses to empty.
