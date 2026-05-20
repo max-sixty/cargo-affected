@@ -27,6 +27,9 @@ use crate::project::{git_changed_line_ranges, relation_to_head, LineRange, ShaRe
 /// Result of the selection computation.
 pub(crate) struct Selection {
     /// Known tests selected by line-range overlap with the changed hunks.
+    /// Excludes `#[ignore]`d tests: their coverage rows can persist from
+    /// an earlier (non-ignored) collect, but `nextest run` would skip them
+    /// — same all-ignored-selection rationale as [`new_tests`].
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
@@ -286,11 +289,12 @@ pub(crate) fn select_with_precomputed_ranges(
 /// - `stranded_tests = listed ∩ (all_db_tests - reachable_known_tests)`
 ///   (in DB but only at currently-missing shas).
 ///
-/// `#[ignore]`d tests are dropped before that split: `nextest run` skips
-/// them, so they never produce coverage — flagging them `new`/`stranded`
-/// would re-select them on every run only for the run to skip them again,
-/// and a selection of nothing but ignored tests makes `nextest run` exit
-/// non-zero.
+/// `#[ignore]`d tests are dropped from all three sets: `nextest run` skips
+/// them, so a selection of nothing but ignored tests makes `nextest run` exit
+/// non-zero. New/stranded would re-select an ignored test on every run only
+/// for it to be skipped again; `affected` would re-select a test whose
+/// coverage rows survived from a previous (non-ignored) collect after a hunk
+/// happens to overlap them.
 ///
 /// Both `new` and `stranded` get rerun (and re-anchored, in `collect
 /// --diff`'s case); the split exists so the JSON report can tell them
@@ -351,6 +355,16 @@ pub(crate) fn compute(
             let hits =
                 db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
+                if listing.ignored.contains(&hit.test_id) {
+                    // Coverage rows from a previous (non-ignored) collect
+                    // can survive into a state where the test is now
+                    // `#[ignore]`d (the `--diff` prune deliberately keeps
+                    // them — see `diff_collect_keeps_ignored_test_rows`).
+                    // Selecting it anyway produces the same all-ignored
+                    // → nextest exit 4 we filter against above for
+                    // new/stranded.
+                    continue;
+                }
                 affected.insert(hit.test_id.clone());
                 let kind = hit.reason.kind;
                 let entry = strongest_per_file_test

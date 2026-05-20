@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use crate::{
-    cargo_affected, combined_output, init_git_with_initial_commit, replace_in_file,
+    cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file,
     write_two_module_project,
 };
 
@@ -110,6 +110,102 @@ fn ignored_test_not_perpetually_new() {
         combined.contains("test_ignored (new)"),
         "a test that stops being ignored must be picked up as new, got:\n{combined}"
     );
+}
+
+/// Coverage rows from an earlier non-ignored collect survive into a state
+/// where the test is now `#[ignore]`d — `--diff`'s prune deliberately keeps
+/// them so the rows remain available if the test is un-ignored later. A
+/// later edit to a line that test covered would otherwise pull it into
+/// `affected` and produce the same all-ignored selection that makes
+/// `nextest run` exit non-zero. The `affected` loop must filter the
+/// `listing.ignored` set just like the new/stranded split does.
+#[test]
+fn newly_ignored_test_excluded_from_affected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_single_test_project(dir, "sample_newly_ignored_affected");
+    init_git_with_initial_commit(dir);
+
+    // Collect while test_add runs normally — coverage rows for `add` get
+    // anchored at HEAD.
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Mark test_add `#[ignore]` AND modify add()'s body. The diff hunk on
+    // add() overlaps test_add's coverage rows; before the fix, that pulled
+    // test_add into `affected`. Since test_add is the only test, the
+    // selection then becomes {test_add} — all ignored — and nextest exits 4.
+    replace_in_file(
+        &dir.join("src/lib.rs"),
+        "    #[test]\n    fn test_add()",
+        "    #[test]\n    #[ignore]\n    fn test_add()",
+    );
+    replace_in_file(&dir.join("src/lib.rs"), "a + b", "a + b + 0");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "ignore + edit add"]);
+
+    // status: the only test is now ignored, so the selection must be empty.
+    let status = cargo_affected(dir, &["affected", "status", "-v"]);
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr),
+    );
+    let combined = combined_output(&status);
+    assert!(
+        !combined.contains("test_add"),
+        "newly-ignored test_add must not be selected, got:\n{combined}",
+    );
+
+    // run: with the only-affected test now ignored, run must exit 0 via the
+    // empty-selection short-circuit — not propagate nextest exit 4.
+    let run = cargo_affected(dir, &["affected", "run"]);
+    assert!(
+        run.status.success(),
+        "run with only a newly-ignored affected test must exit 0 (no \
+         nextest invocation), got status={:?} stderr=\n{}\nstdout=\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout),
+    );
+}
+
+/// Single-crate, single-test project: one `add` function and one `test_add`
+/// covering it. Used as the canonical "the only affected test got ignored"
+/// case where the selection collapses to empty.
+fn write_single_test_project(dir: &Path, crate_name: &str) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add() {
+        assert_eq!(add(1, 2), 3);
+    }
+}
+"#,
+    )
+    .unwrap();
 }
 
 /// `cargo affected run` listed tests with no extra features while running
