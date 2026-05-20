@@ -31,6 +31,8 @@ pub(crate) struct Selection {
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
     /// `collect`. Always selected because we have no coverage data.
+    /// Excludes `#[ignore]`d tests: `nextest run` skips them, so they
+    /// never gain coverage and would otherwise read as "new" on every run.
     pub(crate) new_tests: BTreeSet<TestId>,
     /// Tests present in the nextest listing AND in the DB, but only
     /// anchored at currently-missing collect_shas. Functionally identical
@@ -284,6 +286,12 @@ pub(crate) fn select_with_precomputed_ranges(
 /// - `stranded_tests = listed ∩ (all_db_tests - reachable_known_tests)`
 ///   (in DB but only at currently-missing shas).
 ///
+/// `#[ignore]`d tests are dropped before that split: `nextest run` skips
+/// them, so they never produce coverage — flagging them `new`/`stranded`
+/// would re-select them on every run only for the run to skip them again,
+/// and a selection of nothing but ignored tests makes `nextest run` exit
+/// non-zero.
+///
 /// Both `new` and `stranded` get rerun (and re-anchored, in `collect
 /// --diff`'s case); the split exists so the JSON report can tell them
 /// apart.
@@ -309,6 +317,12 @@ pub(crate) fn compute(
     let mut new_tests = BTreeSet::new();
     let mut stranded_tests = BTreeSet::new();
     for t in &listed {
+        if listing.ignored.contains(t) {
+            // Skipped by `nextest run`, so it never gains coverage — must
+            // not be treated as a new/stranded test to rerun. Stays in
+            // `listed` (above) so `collect --diff`'s prune keeps its rows.
+            continue;
+        }
         if reachable_known.contains(t) {
             continue;
         }

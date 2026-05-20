@@ -28,7 +28,8 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::collect::{
-    nextest_filter_expr, nextest_list, require_nextest, write_nextest_config,
+    cargo_build_args, nextest_filter_expr, nextest_list, require_nextest,
+    write_nextest_config,
 };
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint::{self, Fingerprint};
@@ -180,7 +181,10 @@ pub fn run(
     }
 
     eprintln!("checking for new tests...");
-    let listing = nextest_list(project_root, None, None)?;
+    // List with the same cargo build flags `run_tests` hands to `nextest
+    // run`, so new-test detection compares against the test set the run
+    // actually builds — not a feature-less one.
+    let listing = nextest_list(project_root, None, None, &cargo_build_args(nextest_args))?;
     // Compute per-sha hunks once; selection consumes them and so does
     // the report builder if --report-json is set. The previous code
     // ran `git diff -U0 <sha>` twice per reachable sha on the report
