@@ -27,7 +27,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::collect::{nextest_filter_exprs, nextest_list, require_nextest};
+use crate::collect::{
+    nextest_filter_expr, nextest_list, require_nextest, write_nextest_config,
+};
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint::{self, Fingerprint};
 use crate::project::{find_project_root, git_changed_files, ShaRelation};
@@ -305,9 +307,14 @@ fn write_full_suite(
 }
 
 /// Run tests via `cargo nextest run`. `tests == None` runs all tests;
-/// `Some(tests)` filters to the given set via one or more nextest `-E`
-/// filterset arguments (split to stay under the OS argv-string limit).
-/// Returns nextest's exit code so callers can propagate it to CI.
+/// `Some(tests)` filters to the given set by handing nextest a generated
+/// config file whose `default-filter` names exactly those tests (see
+/// [`write_nextest_config`]). Returns nextest's exit code so callers can
+/// propagate it to CI.
+///
+/// The filterset lives in a file rather than an inline `-E` argument so an
+/// arbitrarily large affected set can't overflow the OS command-line limit
+/// — Windows' ~32 KB `CreateProcess` cap raised `os error 206` here.
 ///
 /// `nextest_args` reach nextest verbatim — this is deliberate for the
 /// failure-handling flags (`--no-fail-fast`, `--max-fail=N`, `--retries`):
@@ -321,15 +328,18 @@ fn run_tests(
 ) -> Result<i32> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest").arg("run");
-    match tests {
+    let filter_config = match tests {
         Some(ts) => {
             eprintln!("running {} tests with nextest", ts.len());
-            for expr in nextest_filter_exprs(ts) {
-                cmd.arg("-E").arg(expr);
-            }
+            let config = write_nextest_config(project_root, &nextest_filter_expr(ts))?;
+            cmd.arg("--config-file").arg(&config);
+            Some(config)
         }
-        None => eprintln!("running all tests with nextest"),
-    }
+        None => {
+            eprintln!("running all tests with nextest");
+            None
+        }
+    };
     for a in nextest_args {
         cmd.arg(a);
     }
@@ -337,6 +347,10 @@ fn run_tests(
         .current_dir(project_root)
         .status()
         .context("failed to run cargo nextest")?;
+    if let Some(config) = &filter_config {
+        // Best-effort cleanup; a stale file in gitignored target/ is harmless.
+        let _ = std::fs::remove_file(config);
+    }
     Ok(status.code().unwrap_or(1))
 }
 
