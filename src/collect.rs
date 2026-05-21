@@ -183,11 +183,16 @@ pub fn collect(
     // List first. Gives us the stable (package, target, kind) → binary_id map
     // we'll use to disambiguate same-basename binaries (e.g. two crates with
     // their own `tests/builds.rs`). The list step builds with the same
-    // RUSTFLAGS; the subsequent run is a cache hit. Fingerprint is taken now
-    // so Cargo.lock is in its final state — status/run will compare against
-    // that same state.
+    // RUSTFLAGS and build flags as the run below, so the subsequent run is a
+    // cache hit. Fingerprint is taken now so Cargo.lock is in its final
+    // state — status/run will compare against that same state.
     eprintln!("listing tests with cargo nextest list...");
-    let listing = nextest_list(project_root, Some(&rustflags), Some(&build_dir))?;
+    let listing = nextest_list(
+        project_root,
+        Some(&rustflags),
+        Some(&build_dir),
+        &cargo_build_args(nextest_args),
+    )?;
     eprintln!(
         "found {} tests across {} binaries",
         listing.tests.len(),
@@ -259,11 +264,14 @@ pub fn collect(
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
-    if let Some(plan) = &diff_plan {
-        for expr in plan.filter_exprs() {
-            cmd.arg("-E").arg(expr);
+    let filter_config = match &diff_plan {
+        Some(plan) => {
+            let config = write_nextest_config(project_root, &plan.filter_expr())?;
+            cmd.arg("--config-file").arg(&config);
+            Some(config)
         }
-    }
+        None => None,
+    };
     for a in nextest_args {
         cmd.arg(a);
     }
@@ -271,6 +279,10 @@ pub fn collect(
         .status()
         .context("failed to run cargo nextest run")?;
     let nextest_exit = status.code().unwrap_or(1);
+    if let Some(config) = &filter_config {
+        // Best-effort cleanup; a stale file in gitignored target/ is harmless.
+        let _ = std::fs::remove_file(config);
+    }
 
     let test_dirs = list_test_dirs(&profraw_dir)?;
     let total = test_dirs.len();
@@ -441,12 +453,11 @@ struct DiffPlan {
 }
 
 impl DiffPlan {
-    /// Nextest `-E` filterset expressions matching every selected test,
-    /// including phantoms — nextest will silently match nothing for those.
-    /// Multiple chunks when the test set is large enough to risk `E2BIG`.
-    fn filter_exprs(&self) -> Vec<String> {
+    /// Nextest filterset expression matching every selected test, including
+    /// phantoms — nextest will silently match nothing for those.
+    fn filter_expr(&self) -> String {
         let v: Vec<TestId> = self.selected.iter().cloned().collect();
-        nextest_filter_exprs(&v)
+        nextest_filter_expr(&v)
     }
 
     /// Selected tests that nextest can actually run (those present in the
@@ -705,65 +716,201 @@ fn extract_one(
     }
 }
 
-/// Build nextest `-E` filterset expressions matching exactly the given tests,
-/// grouped by `binary_id`. Each returned chunk is a complete expression of the
-/// form `(binary_id(=X) & (test(=a) | test(=b)))`; nextest ORs multiple `-E`
-/// flags together.
+/// Build a single nextest filterset expression matching exactly the given
+/// tests, grouped by `binary_id`. The result has the form
+/// `(binary_id(=X) & (test(=a) | test(=b))) | (binary_id(=Y) & (test(=c)))`.
+/// Empty input yields `none()` — a valid filterset that matches nothing.
 ///
 /// `binary_id()` (not `binary()`) is the right predicate: the latter matches
 /// the short binary name (e.g. `builds`) and so doesn't disambiguate
 /// same-named binaries across workspace crates.
 ///
-/// The split exists because Linux's `MAX_ARG_STRLEN` caps a single argv string
-/// at ~128 KB. A workspace with ~1900 selected tests overflows that as one
-/// expression and `execve` fails with `E2BIG`. We emit one chunk per binary,
-/// further splitting a binary's tests across chunks when its predicate alone
-/// would exceed `FILTER_EXPR_MAX_BYTES`.
-pub(crate) fn nextest_filter_exprs(tests: &[TestId]) -> Vec<String> {
-    /// Cap per `-E` argument; conservative versus the 128 KB OS limit so the
-    /// command line as a whole stays comfortably under it.
-    const FILTER_EXPR_MAX_BYTES: usize = 60_000;
-    let mut by_binary: std::collections::BTreeMap<&str, Vec<&str>> =
-        std::collections::BTreeMap::new();
+/// The expression can be arbitrarily long — it reaches nextest as a
+/// `default-filter` in a config file (see [`write_nextest_config`]), never as
+/// an inline command-line argument, so no OS argv-length limit applies.
+pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
+    if tests.is_empty() {
+        return "none()".to_string();
+    }
+    let mut by_binary: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for t in tests {
         by_binary
             .entry(t.binary_id.as_str())
             .or_default()
             .push(t.test_name.as_str());
     }
-    let mut exprs: Vec<String> = Vec::new();
-    for (binary_id, names) in by_binary {
-        let wrapper = format!("(binary_id(={binary_id}) & ())");
-        let inner_budget = FILTER_EXPR_MAX_BYTES.saturating_sub(wrapper.len());
-        let mut inner = String::new();
-        let flush = |inner: &mut String, exprs: &mut Vec<String>| {
-            if !inner.is_empty() {
-                exprs.push(format!("(binary_id(={binary_id}) & ({inner}))"));
-                inner.clear();
-            }
-        };
-        for n in &names {
-            let item_len = "test(=)".len() + n.len();
-            let sep_len = if inner.is_empty() { 0 } else { " | ".len() };
-            if !inner.is_empty() && inner.len() + sep_len + item_len > inner_budget {
-                flush(&mut inner, &mut exprs);
-            }
-            if !inner.is_empty() {
-                inner.push_str(" | ");
-            }
-            inner.push_str("test(=");
-            inner.push_str(n);
-            inner.push(')');
+    by_binary
+        .into_iter()
+        .map(|(binary_id, names)| {
+            let inner = names
+                .iter()
+                .map(|n| format!("test(={n})"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("(binary_id(={binary_id}) & ({inner}))")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Write the nextest config file that pins the run to `filter_expr`, and
+/// return its absolute path for passing to nextest via `--config-file`.
+///
+/// The affected-test selection reaches nextest as a `default-filter` inside a
+/// config file rather than as inline `-E` arguments. A large affected set
+/// built an `-E` argument list megabytes long, which overflowed Windows'
+/// ~32 KB `CreateProcess` command-line limit (`os error 206`). A config file
+/// has no such limit: the command line stays a fixed `--config-file <path>`
+/// no matter how many tests are selected.
+///
+/// `--config-file` replaces nextest's repo-config slot
+/// (`<workspace>/.config/nextest.toml`), so the project's own config — if any
+/// — is merged in: every key it sets is preserved and only
+/// `[profile.default].default-filter` is touched, keeping the project's
+/// profiles, setup-scripts, timeouts and JUnit settings intact. When the
+/// project already sets `default-filter`, the selection is intersected with
+/// it so the effective set matches the old inline-`-E` behavior (`-E` was
+/// likewise intersected with the default filter).
+pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Result<PathBuf> {
+    let project_config = project_root.join(".config").join("nextest.toml");
+    let existing = match std::fs::read_to_string(&project_config) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to read {}", project_config.display()))
         }
-        flush(&mut inner, &mut exprs);
+    };
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("failed to parse {}", project_config.display()))?;
+
+    let filter = match doc
+        .get("profile")
+        .and_then(|p| p.get("default"))
+        .and_then(|d| d.get("default-filter"))
+        .and_then(|v| v.as_str())
+    {
+        Some(existing) => format!("({filter_expr}) & ({existing})"),
+        None => filter_expr.to_string(),
+    };
+    doc["profile"]["default"]["default-filter"] = toml_edit::value(filter);
+
+    let dir = affected_dir(project_root);
+    std::fs::create_dir_all(&dir).context("failed to create target/affected dir")?;
+    // PID-suffixed so two concurrent `cargo affected` runs can't overwrite
+    // each other's selection between writing the file and nextest reading it
+    // — the same reasoning as the `profraw-<pid>` staging dir. The caller
+    // removes it once nextest exits.
+    let path = dir.join(format!("nextest-config-{}.toml", std::process::id()));
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Boolean cargo build flags accepted by both `cargo nextest list` and
+/// `cargo nextest run` — no value token follows.
+const BUILD_FLAGS_BARE: &[&str] = &[
+    "--workspace",
+    "--all",
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--all-features",
+    "--no-default-features",
+    "--release",
+    "-r",
+    "--frozen",
+    "--locked",
+    "--offline",
+    "--ignore-rust-version",
+    "--future-incompat-report",
+    "--unit-graph",
+];
+
+/// Long cargo build flags that consume a value — `--flag value` or the
+/// joined `--flag=value`.
+///
+/// `--target-dir` is deliberately absent: it changes only where artifacts
+/// land, not which tests exist, and `collect` already passes its own
+/// `--target-dir` to `nextest_list` — forwarding a second one would make
+/// `cargo nextest list` reject the duplicate.
+const BUILD_FLAGS_VALUED: &[&str] = &[
+    "--package",
+    "--exclude",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "--features",
+    "--cargo-profile",
+    "--target",
+    "--manifest-path",
+    "--build-jobs",
+    "--config",
+];
+
+/// Short cargo build flags that consume a value — `-p mycrate` or the
+/// joined `-pmycrate`.
+const BUILD_FLAGS_SHORT_VALUED: &[&str] = &["-p", "-F", "-Z"];
+
+/// Extract the cargo *build* flags from the post-`--` passthrough so the
+/// `cargo nextest list` used for new-test detection builds the same test set
+/// as the eventual `cargo nextest run`.
+///
+/// `list` and `run` share cargo's build options (`--features`, `-p`,
+/// `--release`, …) but `run` adds runner/reporter options (`--retries`,
+/// `--no-fail-fast`, `--no-tests`, …) that `list` rejects outright.
+/// Forwarding the whole passthrough to `list` would break on any of those;
+/// forwarding nothing lists a feature-less build while `run` builds with the
+/// user's features, so "listed minus DB = new" compares two different test
+/// sets. Hence an allowlist of the build flags — anything else (run-only
+/// flags, test-name filters, positionals) is dropped: it either doesn't
+/// affect which test binaries get built or `list` wouldn't accept it.
+pub(crate) fn cargo_build_args(nextest_args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = nextest_args.iter();
+    while let Some(arg) = iter.next() {
+        let name = arg.split('=').next().unwrap_or(arg);
+        if BUILD_FLAGS_BARE.contains(&name) {
+            out.push(arg.clone());
+        } else if BUILD_FLAGS_VALUED.contains(&name) {
+            out.push(arg.clone());
+            // `--flag value` carries the value in the next token;
+            // `--flag=value` carries it inline.
+            if !arg.contains('=') {
+                if let Some(value) = iter.next() {
+                    out.push(value.clone());
+                }
+            }
+        } else if BUILD_FLAGS_SHORT_VALUED.contains(&arg.as_str()) {
+            out.push(arg.clone());
+            if let Some(value) = iter.next() {
+                out.push(value.clone());
+            }
+        } else if BUILD_FLAGS_SHORT_VALUED.iter().any(|s| arg.starts_with(*s)) {
+            // Joined short form: `-pmycrate`, `-Ffeature`.
+            out.push(arg.clone());
+        }
     }
-    exprs
+    out
 }
 
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
-/// pair, plus per-binary metadata.
+/// pair, the subset that is ignored, plus per-binary metadata.
 pub(crate) struct Listing {
+    /// Every testcase nextest enumerated, ignored or not. The complete set —
+    /// `collect --diff` prunes DB rows against it, so a merely-ignored test
+    /// must stay in here or its rows would be dropped.
     pub(crate) tests: Vec<TestId>,
+    /// Subset of `tests` that nextest reports as `#[ignore]`d on this
+    /// platform (covers conditional `#[cfg_attr(.., ignore)]` too). These
+    /// are skipped by `cargo nextest run`, so they never gain coverage;
+    /// new-test detection must exclude them or they read as "new" forever.
+    pub(crate) ignored: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
@@ -785,10 +932,17 @@ pub(crate) struct BinaryEntry {
 /// directory so build-script profraws land alongside cargo's debug/ tree
 /// rather than in the project root. Only collect passes this — run/status
 /// reuse the user's default target/.
+///
+/// `build_args` are the cargo build flags (`--features`, `-p`, …) extracted
+/// from the post-`--` passthrough by [`cargo_build_args`]. They must match
+/// the build config of the subsequent `cargo nextest run`, or the listing
+/// enumerates a different test set than the run builds and new-test
+/// detection ("listed minus DB") becomes unsound.
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
     build_dir: Option<&Path>,
+    build_args: &[String],
 ) -> Result<Listing> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
@@ -805,6 +959,9 @@ pub(crate) fn nextest_list(
         cmd.arg("--target-dir").arg(dir);
         cmd.env("LLVM_PROFILE_FILE", dir.join("build-%p-%m.profraw"));
     }
+    for a in build_args {
+        cmd.arg(a);
+    }
     let output = cmd
         .spawn()
         .context("failed to spawn cargo nextest list")?
@@ -820,6 +977,7 @@ pub(crate) fn nextest_list(
         serde_json::from_str(stdout).context("failed to parse nextest list JSON")?;
 
     let mut tests = BTreeSet::new();
+    let mut ignored = BTreeSet::new();
     let mut binaries = Vec::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
@@ -834,13 +992,22 @@ pub(crate) fn nextest_list(
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
             };
-            for case in cases.keys() {
-                tests.insert(TestId::new(binary_id.clone(), case.clone()));
+            for (name, case) in cases {
+                let test_id = TestId::new(binary_id.clone(), name.clone());
+                let is_ignored = case
+                    .get("ignored")
+                    .and_then(|v| v.as_bool())
+                    .context("nextest list testcase missing `ignored` flag")?;
+                if is_ignored {
+                    ignored.insert(test_id.clone());
+                }
+                tests.insert(test_id);
             }
         }
     }
     Ok(Listing {
         tests: tests.into_iter().collect(),
+        ignored,
         binaries,
     })
 }
@@ -1025,58 +1192,198 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filter_exprs_empty() {
-        assert!(nextest_filter_exprs(&[]).is_empty());
+    fn filter_expr_empty_matches_nothing() {
+        assert_eq!(nextest_filter_expr(&[]), "none()");
     }
 
     #[test]
-    fn filter_exprs_one_per_binary() {
+    fn filter_expr_groups_by_binary() {
         let tests = vec![
             TestId::new("mock-stub::builds", "builds"),
             TestId::new("wt-perf::builds", "builds"),
             TestId::new("worktrunk", "utils::tests::test_x"),
             TestId::new("worktrunk", "utils::tests::test_y"),
         ];
-        let exprs = nextest_filter_exprs(&tests);
         assert_eq!(
-            exprs,
-            vec![
-                "(binary_id(=mock-stub::builds) & (test(=builds)))".to_string(),
-                "(binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y)))".to_string(),
-                "(binary_id(=wt-perf::builds) & (test(=builds)))".to_string(),
-            ]
+            nextest_filter_expr(&tests),
+            "(binary_id(=mock-stub::builds) & (test(=builds))) | \
+             (binary_id(=worktrunk) & (test(=utils::tests::test_x) | test(=utils::tests::test_y))) | \
+             (binary_id(=wt-perf::builds) & (test(=builds)))",
         );
     }
 
-    /// Regression: ~1900 tests in one binary used to produce a single 80+ KB
-    /// `-E` argument and `execve` failed with `Argument list too long (E2BIG)`.
-    /// Each chunk must stay under ~60 KB and round-trip the full set.
     #[test]
-    fn filter_exprs_chunks_oversized_binary() {
-        let names: Vec<String> = (0..2000).map(|i| format!("really_long_test_name_for_chunking_check_{i}")).collect();
-        let tests: Vec<TestId> = names
-            .iter()
-            .map(|n| TestId::new("worktrunk", n))
+    fn cargo_build_args_keeps_build_flags_drops_run_only() {
+        let args: Vec<String> = [
+            "--features",
+            "shell-integration-tests",
+            "--no-fail-fast",
+            "--retries",
+            "2",
+            "--release",
+            "--no-tests=warn",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // `--features <value>` and `--release` survive; the run-only flags —
+        // and `--retries`'s separate value token — are dropped.
+        assert_eq!(
+            cargo_build_args(&args),
+            vec!["--features", "shell-integration-tests", "--release"],
+        );
+    }
+
+    #[test]
+    fn cargo_build_args_handles_joined_and_short_forms() {
+        let args: Vec<String> = [
+            "--features=a,b",
+            "-p",
+            "mycrate",
+            "-r",
+            "--max-fail=3",
+            "some_test_filter",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // `--flag=value`, `-p <value>`, and the `-r` short flag are build
+        // args; `--max-fail=3` is run-only and the bare positional filter is
+        // neither — both dropped.
+        assert_eq!(
+            cargo_build_args(&args),
+            vec!["--features=a,b", "-p", "mycrate", "-r"],
+        );
+    }
+
+    #[test]
+    fn cargo_build_args_empty() {
+        assert!(cargo_build_args(&[]).is_empty());
+    }
+
+    /// Regression for the Windows command-line overflow: a large affected set
+    /// produced an `-E` argument list that blew past Windows' ~32 KB
+    /// `CreateProcess` limit (`os error 206`). The selection now travels in a
+    /// config file, so the filterset can be arbitrarily large while the
+    /// command line stays a fixed `--config-file <path>`.
+    #[test]
+    fn large_selection_travels_in_config_file_not_argv() {
+        let names: Vec<String> = (0..3000)
+            .map(|i| format!("really_long_test_name_for_overflow_check_{i}"))
             .collect();
-        let exprs = nextest_filter_exprs(&tests);
-        assert!(exprs.len() > 1, "expected chunking, got {} chunk(s)", exprs.len());
-        for expr in &exprs {
-            assert!(
-                expr.len() < 65_000,
-                "chunk too large: {} bytes",
-                expr.len()
-            );
-            assert!(expr.starts_with("(binary_id(=worktrunk) & ("));
-            assert!(expr.ends_with("))"));
-        }
-        // Every test name appears exactly once across all chunks.
-        let combined = exprs.join(" | ");
+        let tests: Vec<TestId> = names.iter().map(|n| TestId::new("worktrunk", n)).collect();
+        let expr = nextest_filter_expr(&tests);
+        // The filterset itself dwarfs Windows' 32 KB command-line limit...
+        assert!(
+            expr.len() > 32 * 1024,
+            "expected a large filterset, got {} bytes",
+            expr.len()
+        );
+        // ...but it reaches nextest through a config file. The only thing
+        // that lands on the command line is `--config-file <path>`, whose
+        // length is bounded by the path, not the test count.
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_nextest_config(dir.path(), &expr).unwrap();
+        assert!(config.starts_with(dir.path()));
+        let written = std::fs::read_to_string(&config).unwrap();
         for n in &names {
-            assert!(
-                combined.contains(&format!("test(={n})")),
-                "missing {n}"
-            );
+            assert!(written.contains(&format!("test(={n})")), "missing {n}");
         }
+    }
+
+    /// `write_nextest_config` overrides only `default-filter`; every other
+    /// setting in the project's own `.config/nextest.toml` is carried through
+    /// so its profiles, setup-scripts and timeouts still apply. The fixture
+    /// mirrors the shape of a real consumer's config — top-level
+    /// `experimental`, setup scripts, and an array-of-tables script binding —
+    /// since `--config-file` replacing the repo config slot would otherwise
+    /// silently drop all of it.
+    #[test]
+    fn write_nextest_config_preserves_project_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("nextest.toml"),
+            "experimental = [\"setup-scripts\"]\n\
+             \n\
+             [profile.default]\n\
+             slow-timeout = \"60s\"\n\
+             \n\
+             [profile.ci]\n\
+             retries = 2\n\
+             \n\
+             [scripts.setup.build-bins]\n\
+             command = [\"bash\", \"-c\", \"true\"]\n\
+             \n\
+             [[profile.default.scripts]]\n\
+             filter = \"binary(integration)\"\n\
+             setup = \"build-bins\"\n",
+        )
+        .unwrap();
+        let config = write_nextest_config(dir.path(), "binary_id(=x) & test(=y)").unwrap();
+        let doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        // Our selection landed under [profile.default].
+        assert_eq!(
+            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            "binary_id(=x) & test(=y)",
+        );
+        // The project's own settings survived untouched.
+        assert_eq!(doc["experimental"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            doc["profile"]["default"]["slow-timeout"].as_str().unwrap(),
+            "60s",
+        );
+        assert_eq!(doc["profile"]["ci"]["retries"].as_integer().unwrap(), 2);
+        assert!(doc["scripts"]["setup"]["build-bins"]["command"].is_array());
+        assert_eq!(
+            doc["profile"]["default"]["scripts"].as_array_of_tables().unwrap().len(),
+            1,
+        );
+    }
+
+    /// A project that already sets `default-filter` keeps it: the selection
+    /// is intersected with it, matching the old inline-`-E` behavior (`-E`
+    /// was intersected with the default filter).
+    #[test]
+    fn write_nextest_config_intersects_existing_default_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("nextest.toml"),
+            "[profile.default]\ndefault-filter = \"not test(slow)\"\n",
+        )
+        .unwrap();
+        let config = write_nextest_config(dir.path(), "test(=y)").unwrap();
+        let doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            "(test(=y)) & (not test(slow))",
+        );
+    }
+
+    /// With no project config, a fresh one is generated carrying just the
+    /// selection. The filename carries the process id so concurrent
+    /// invocations write to distinct files.
+    #[test]
+    fn write_nextest_config_without_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_nextest_config(dir.path(), "test(=solo)").unwrap();
+        assert!(config
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&std::process::id().to_string()));
+        let doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            "test(=solo)",
+        );
     }
 
     #[test]

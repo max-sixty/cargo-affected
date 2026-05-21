@@ -175,7 +175,9 @@ pub fn status(
 
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");
-    let listing = nextest_list(project_root, None, None)?;
+    // `status` takes no passthrough args, so there are no build flags to
+    // thread through — list the default build.
+    let listing = nextest_list(project_root, None, None, &[])?;
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
     let sel = selection::select_with_precomputed_ranges(
         &db,
