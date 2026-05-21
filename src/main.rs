@@ -121,11 +121,24 @@ fn main() {
     let mut argv: Vec<String> = std::env::args().collect();
 
     // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
-    // via CARGO_TARGET_<TRIPLE>_RUNNER. Dispatch before clap — its trailing args
-    // include `--exact`/`--list`/etc. which clap would interpret if we let it.
+    // via `--config target.<triple>.runner=…`. Dispatch before clap — its trailing
+    // args include `--exact`/`--list`/etc. which clap would interpret if we let it.
     if argv.get(1).map(String::as_str) == Some("runner-shim") {
         shim::run(&argv[2..]);
     }
+
+    // Stop NEXTEST_BINARY_ID / NEXTEST_TEST_NAME from leaking into our inner
+    // `cargo nextest run`. When cargo-affected itself runs as a test under an
+    // outer nextest (e.g. our functional suite via `cargo nextest run`), the
+    // outer process passes both vars through. nextest sets them per-test for
+    // real test invocations but not for discovery passes (`--list`,
+    // `--list --ignored`); during those passes the runner-shim would
+    // otherwise see the inherited outer values, mistake the discovery probe
+    // for a real test invocation, and write a bogus per-test profraw dir
+    // tagged with the outer functional test's id. The shim itself still
+    // reads them — we cleared them after the shim dispatch above.
+    std::env::remove_var("NEXTEST_BINARY_ID");
+    std::env::remove_var("NEXTEST_TEST_NAME");
 
     // Cargo invokes us as `cargo-affected affected <args>`; strip the redundant
     // slot so clap sees a flat command rather than needing a wrapper subcommand.

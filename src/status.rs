@@ -73,14 +73,26 @@ pub fn status(
     let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
 
     if known_count == 0 {
-        let (status, reason) = if db.has_any_coverage()? {
+        // Fetch stored snapshots on demand for the diff line if --report-json
+        // didn't already force the read; cheap relative to the rest of status.
+        let stored = if stored.is_empty() {
+            db.stored_fingerprint_snapshots()?
+        } else {
+            stored
+        };
+        let (status, reason) = if !stored.is_empty() {
+            let snapshots = report::snapshots_from(stored.clone());
+            let differing =
+                report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
             (
                 CacheStatus::MissFingerprint,
-                "no coverage data for the current environment \
-                 (Cargo.lock, Cargo.toml, rustc version, or build flags changed since last collect)",
+                format!(
+                    "no coverage data for the current environment{}",
+                    report::fingerprint_miss_clause(&differing),
+                ),
             )
         } else {
-            (CacheStatus::MissNoCoverage, "no coverage data yet")
+            (CacheStatus::MissNoCoverage, "no coverage data yet".to_string())
         };
         println!(
             "coverage database: {}\n\
@@ -163,7 +175,9 @@ pub fn status(
 
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");
-    let listing = nextest_list(project_root, None, None)?;
+    // `status` takes no passthrough args, so there are no build flags to
+    // thread through — list the default build.
+    let listing = nextest_list(project_root, None, None, &[])?;
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
     let sel = selection::select_with_precomputed_ranges(
         &db,

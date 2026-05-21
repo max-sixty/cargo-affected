@@ -53,7 +53,11 @@ the last collect adds to the diff and broadens selection.
 When the coverage cache can't anchor a precise selection — no coverage yet,
 environment fingerprint changed, every recorded `collect_sha` missing from
 the repo (rebased and pruned, garbage-collected, beyond a shallow boundary) —
-`run` emits a stderr notice and runs every test. A `collect_sha` that is
+`run` emits a stderr notice naming which fingerprint components differ and
+runs every test. Common fingerprint changes: a workspace `Cargo.toml` /
+`Cargo.lock` edit, a new rustc version, or a DB collected on a different
+host OS — `rustc -vV` records the host triple, so a Linux-collected DB
+cache-misses on macOS or Windows (and vice versa). A `collect_sha` that is
 *present* in the repo but not on `HEAD`'s lineage (siblings, post-`reset`
 orphans, the CI PR-vs-main-tip shape) is still usable: `git diff <sha>
 HEAD` resolves either way and stored ranges live in the sha's coordinate

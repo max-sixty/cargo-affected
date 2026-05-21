@@ -43,11 +43,20 @@ fn cargo_toml_change_invalidates_fingerprint() {
     );
     let stdout = String::from_utf8_lossy(&status.stdout);
 
-    // status.rs prints this exact phrase when has_any_coverage() == true but
-    // count == 0 for the current fingerprint.
+    // status.rs prints this phrase when the fingerprints table is non-empty
+    // but no rows match the current fingerprint, and names which components
+    // differ from the closest stored snapshot.
     assert!(
         stdout.contains("no coverage data for the current environment"),
         "expected fingerprint-mismatch message, got:\n{stdout}"
+    );
+    // Bumping the package version mutates the package's Cargo.toml, which is
+    // hashed under the `manifest:` label. The closest-stored diff should
+    // surface that label so the user knows what changed.
+    assert!(
+        stdout.contains("differs from closest stored fingerprint in:")
+            && stdout.contains("manifest:"),
+        "expected components-diff explanation naming the manifest label, got:\n{stdout}"
     );
     assert!(
         stdout.contains("cargo affected collect"),
