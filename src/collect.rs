@@ -406,8 +406,12 @@ pub fn collect(
         // Main scope thread: wait for nextest, then signal the watcher to
         // drain. The scope's implicit join waits for the watcher and
         // workers to finish processing whatever's still in flight.
-        let status = child.wait().context("failed to wait for nextest")?;
+        // Store the flag before propagating any wait() error — otherwise
+        // `?` would skip it, the watcher would keep polling forever, and
+        // the scope's implicit join would deadlock.
+        let wait_result = child.wait();
         nextest_running.store(false, Ordering::Release);
+        let status = wait_result.context("failed to wait for nextest")?;
         Ok(status.code().unwrap_or(1))
     })?;
 
