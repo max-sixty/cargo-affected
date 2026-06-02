@@ -31,16 +31,22 @@
 //!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
 //! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
 //!    git error surfaces before we spend time on coverage parsing.
-//! 5. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
-//!    merge with `llvm-profdata`, export with `llvm-cov`, parse hit ranges.
-//!    Parallelized across workers.
+//! 5. **In parallel** with nextest: a watcher thread polls the per-test
+//!    profraw dirs and dispatches each finished test's bundle to a worker
+//!    pool that merges with `llvm-profdata`, exports with `llvm-cov`,
+//!    parses hit ranges, and **deletes the per-test dir as soon as the
+//!    bundle has been consumed**. Peak disk usage becomes
+//!    O(num_workers × per-test bundle size) instead of O(whole-suite size).
+//!    See [`WatchState`] for the size-stability heuristic that detects
+//!    "this test's process has exited" without modifying the shim.
 //! 6. Store mappings + collect_sha in the DB keyed by (binary_id, test_name).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -275,18 +281,151 @@ pub fn collect(
     for a in nextest_args {
         cmd.arg(a);
     }
-    let status = cmd
-        .status()
-        .context("failed to run cargo nextest run")?;
-    let nextest_exit = status.code().unwrap_or(1);
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Approximate denominator for the per-test progress line. Ignored tests
+    // don't fire the runner shim, so they never show up as profraw dirs;
+    // subtract them so `[n/total]` doesn't undercount by them. With --diff,
+    // restrict to the live (non-phantom) subset of the selection.
+    let intended_total = match &diff_plan {
+        Some(plan) => plan.live_selected_count(),
+        None => listing.tests.len().saturating_sub(listing.ignored.len()),
+    };
+    eprintln!(
+        "extracting coverage with {num_workers} workers (streaming as tests finish)..."
+    );
+
+    let work = WorkQueue::default();
+    let progress: Mutex<usize> = Mutex::new(0);
+    let mappings: Mutex<Vec<(TestId, BTreeSet<HitRange>)>> = Mutex::new(Vec::new());
+    let extract_errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    let mut child = cmd.spawn().context("failed to spawn cargo nextest run")?;
+    let nextest_running = AtomicBool::new(true);
+
+    let nextest_exit: i32 = std::thread::scope(|s| -> Result<i32> {
+        // Watcher: polls the profraw dir and dispatches per-test bundles to
+        // workers as soon as they look complete. Lives on its own thread so
+        // extraction overlaps nextest's run instead of waiting until it's
+        // over.
+        s.spawn(|| {
+            let mut state = WatchState::default();
+            loop {
+                let nextest_done = !nextest_running.load(Ordering::Acquire);
+                match state.poll(&profraw_dir, nextest_done) {
+                    Ok(ready) => {
+                        for dir in ready {
+                            work.push(dir);
+                        }
+                    }
+                    Err(e) => {
+                        extract_errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("profraw watcher: {e:#}"));
+                    }
+                }
+                if nextest_done {
+                    // Final pass already happened above (the `nextest_done`
+                    // arg to `poll` disables the size-stability hold-back).
+                    // Nothing more will appear on disk.
+                    break;
+                }
+                std::thread::sleep(WATCH_POLL_INTERVAL);
+            }
+            work.mark_done();
+        });
+
+        // Worker pool: drains `work`, extracts, and deletes each per-test
+        // dir as soon as its bundle has been consumed. That delete is the
+        // whole point of the streaming pipeline — peak retention drops
+        // from O(whole suite) to O(num_workers × per-test).
+        for _ in 0..num_workers {
+            s.spawn(|| {
+                while let Some(dir) = work.pop_blocking() {
+                    let t0 = Instant::now();
+                    let outcome =
+                        extract_one(&dir, &llvm_profdata, &llvm_cov, &canonical_root);
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let mut guard = progress.lock().unwrap();
+                    *guard += 1;
+                    let n = *guard;
+                    drop(guard);
+                    match outcome {
+                        Ok(ExtractOutcome::Collected {
+                            test_id,
+                            mut ranges,
+                        }) => {
+                            let Some(pkg_ranges) =
+                                crate_root_ranges_by_binary_id.get(&test_id.binary_id)
+                            else {
+                                eprintln!(
+                                    "[{n}/{intended_total}] {}::{}: ERROR \
+                                     (binary_id is not a known workspace target)",
+                                    test_id.binary_id, test_id.test_name
+                                );
+                                extract_errors.lock().unwrap().push(format!(
+                                    "binary_id {:?} is not a known workspace target",
+                                    test_id.binary_id
+                                ));
+                                drop_per_test_dir(&dir);
+                                continue;
+                            };
+                            ranges.extend(pkg_ranges.iter().cloned());
+                            eprintln!(
+                                "[{n}/{intended_total}] {}::{}: {} ranges ({elapsed:.1}s)",
+                                test_id.binary_id,
+                                test_id.test_name,
+                                ranges.len()
+                            );
+                            mappings.lock().unwrap().push((test_id, ranges));
+                        }
+                        Ok(ExtractOutcome::Skipped { test_id, reason }) => {
+                            eprintln!(
+                                "[{n}/{intended_total}] {}::{}: SKIP ({reason})",
+                                test_id.binary_id, test_id.test_name
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[{n}/{intended_total}] {}: ERROR ({e:#})",
+                                dir.display()
+                            );
+                        }
+                    }
+                    // Free the bundle whatever the outcome — the streaming
+                    // pipeline exists specifically to keep peak retention
+                    // bounded, and the per-test dir is no longer needed
+                    // once we've logged either way.
+                    drop_per_test_dir(&dir);
+                }
+            });
+        }
+
+        // Main scope thread: wait for nextest, then signal the watcher to
+        // drain. The scope's implicit join waits for the watcher and
+        // workers to finish processing whatever's still in flight.
+        let status = child.wait().context("failed to wait for nextest")?;
+        nextest_running.store(false, Ordering::Release);
+        Ok(status.code().unwrap_or(1))
+    })?;
+
     if let Some(config) = &filter_config {
         // Best-effort cleanup; a stale file in gitignored target/ is harmless.
         let _ = std::fs::remove_file(config);
     }
 
-    let test_dirs = list_test_dirs(&profraw_dir)?;
-    let total = test_dirs.len();
-    if total == 0 {
+    let extract_errors = extract_errors.into_inner().unwrap();
+    if !extract_errors.is_empty() {
+        bail!(
+            "coverage extraction failed:\n  {}",
+            extract_errors.join("\n  ")
+        );
+    }
+
+    let processed = *progress.lock().unwrap();
+    if processed == 0 {
         let exit = handle_no_profraw_dirs(
             &mut db,
             env_fingerprint,
@@ -296,78 +435,6 @@ pub fn collect(
         )?;
         remove_profraw_dir(&profraw_dir)?;
         return Ok(exit);
-    }
-
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    eprintln!("extracting coverage for {total} tests with {num_workers} workers...");
-
-    let progress: Mutex<usize> = Mutex::new(0);
-    let work: Mutex<VecDeque<(usize, PathBuf)>> =
-        Mutex::new(test_dirs.into_iter().enumerate().collect());
-    let mappings: Mutex<Vec<(TestId, BTreeSet<HitRange>)>> = Mutex::new(Vec::new());
-    let extract_errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    std::thread::scope(|s| {
-        for _ in 0..num_workers {
-            s.spawn(|| loop {
-                let Some((_idx, dir)) = work.lock().unwrap().pop_front() else {
-                    break;
-                };
-                let t0 = Instant::now();
-                let outcome = extract_one(&dir, &llvm_profdata, &llvm_cov, &canonical_root);
-                let elapsed = t0.elapsed().as_secs_f64();
-                let mut guard = progress.lock().unwrap();
-                *guard += 1;
-                let n = *guard;
-                match outcome {
-                    Ok(ExtractOutcome::Collected { test_id, mut ranges }) => {
-                        let Some(pkg_ranges) =
-                            crate_root_ranges_by_binary_id.get(&test_id.binary_id)
-                        else {
-                            eprintln!(
-                                "[{n}/{total}] {}::{}: ERROR (binary_id is not a known \
-                                 workspace target)",
-                                test_id.binary_id, test_id.test_name
-                            );
-                            drop(guard);
-                            extract_errors.lock().unwrap().push(format!(
-                                "binary_id {:?} is not a known workspace target",
-                                test_id.binary_id
-                            ));
-                            continue;
-                        };
-                        ranges.extend(pkg_ranges.iter().cloned());
-                        eprintln!(
-                            "[{n}/{total}] {}::{}: {} ranges ({elapsed:.1}s)",
-                            test_id.binary_id,
-                            test_id.test_name,
-                            ranges.len()
-                        );
-                        drop(guard);
-                        mappings.lock().unwrap().push((test_id, ranges));
-                    }
-                    Ok(ExtractOutcome::Skipped { test_id, reason }) => {
-                        eprintln!(
-                            "[{n}/{total}] {}::{}: SKIP ({reason})",
-                            test_id.binary_id, test_id.test_name
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[{n}/{total}] {}: ERROR ({e:#})",
-                            dir.display()
-                        );
-                    }
-                }
-            });
-        }
-    });
-
-    let extract_errors = extract_errors.into_inner().unwrap();
-    if !extract_errors.is_empty() {
-        bail!("coverage extraction failed:\n  {}", extract_errors.join("\n  "));
     }
 
     let mappings = mappings.into_inner().unwrap();
@@ -421,19 +488,147 @@ pub fn collect(
     Ok(nextest_exit)
 }
 
-/// Drop the per-collect profraw directory. The raw profile bundles inside
-/// (~10 GB on a workspace this size) feed only the in-process `llvm-profdata`
-/// → `llvm-cov` extraction; once the resulting hit-ranges land in
-/// `coverage.db` they have no further use, and leaving them on disk wastes
-/// space locally and overflows the GitHub Actions repo cache cap in CI.
-/// Only called from the success paths — failed collects keep their bundles
-/// for debugging.
+/// Drop the per-collect profraw directory. By this point the streaming
+/// extraction in `collect` has already removed each per-test bundle as the
+/// worker pool finished with it (see [`drop_per_test_dir`]); what remains
+/// here is the bookkeeping shell — empty per-binary parent dirs, the
+/// occasional leftover from an error path. Only called from the success
+/// paths — failed collects keep whatever's still on disk for debugging.
 fn remove_profraw_dir(profraw_dir: &Path) -> Result<()> {
     if !profraw_dir.exists() {
         return Ok(());
     }
     std::fs::remove_dir_all(profraw_dir)
         .with_context(|| format!("failed to remove profraw dir {}", profraw_dir.display()))
+}
+
+/// Best-effort delete of one per-test bundle once its coverage has been
+/// extracted. Errors are intentionally swallowed: a leftover here at worst
+/// costs a bit of disk that `remove_profraw_dir` will sweep at end-of-run
+/// anyway, and bubbling the error up would prevent the worker from
+/// continuing.
+fn drop_per_test_dir(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// How often the watcher revisits the profraw tree. Short enough that even
+/// fast tests get dispatched within ~200 ms of the LLVM runtime closing
+/// their profraw, long enough to be invisible against test runtime.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Tracks which per-test directories the watcher has already handed off,
+/// and the prior total profraw size for dirs that may still be writing.
+///
+/// The stability heuristic: a per-test bundle is "complete" when at least
+/// one `.profraw` file is present AND the sum of profraw sizes is non-zero
+/// and unchanged across two consecutive polls. LLVM's profile runtime
+/// writes each `.profraw` in a single `fopen`/`write`/`fclose` at process
+/// exit, so size stability is a reliable proxy for "the test process has
+/// exited and the runtime flushed its buffer." Polling at
+/// [`WATCH_POLL_INTERVAL`] caps the per-test detection latency at ~2 ×
+/// that interval.
+///
+/// After nextest has exited (the `final_pass` flag on [`Self::poll`]) every
+/// remaining dir is dispatched unconditionally — at that point all test
+/// processes are reaped and no more writes can land.
+#[derive(Default)]
+struct WatchState {
+    /// Per-test dirs already pushed onto the work queue. Sticky so we never
+    /// dispatch the same bundle twice.
+    dispatched: BTreeSet<PathBuf>,
+    /// Last total profraw size observed for dirs that have at least one
+    /// `.profraw` but haven't yet seen two consecutive equal-size polls.
+    pending_size: BTreeMap<PathBuf, u64>,
+}
+
+impl WatchState {
+    fn poll(&mut self, profraw_dir: &Path, final_pass: bool) -> Result<Vec<PathBuf>> {
+        if !profraw_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let dirs = list_test_dirs(profraw_dir)?;
+        let mut ready = Vec::new();
+        for dir in dirs {
+            if self.dispatched.contains(&dir) {
+                continue;
+            }
+            let profraws = list_profraw_files(&dir)?;
+            let total: u64 = profraws
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                .sum();
+
+            if final_pass {
+                // nextest is gone; whatever's on disk is final. Dispatch
+                // even if there's no profraw — `extract_one` will record
+                // it as a Skipped("no profraw generated") so the user
+                // sees it in the log instead of it silently vanishing.
+                self.dispatched.insert(dir.clone());
+                self.pending_size.remove(&dir);
+                ready.push(dir);
+                continue;
+            }
+
+            if profraws.is_empty() || total == 0 {
+                // Test still running, or runtime hasn't flushed yet.
+                continue;
+            }
+            match self.pending_size.get(&dir).copied() {
+                Some(prev) if prev == total => {
+                    self.dispatched.insert(dir.clone());
+                    self.pending_size.remove(&dir);
+                    ready.push(dir);
+                }
+                _ => {
+                    self.pending_size.insert(dir, total);
+                }
+            }
+        }
+        Ok(ready)
+    }
+}
+
+/// Blocking SPMC work queue used to hand per-test profraw dirs from the
+/// watcher to the extraction workers. The watcher pushes and eventually
+/// calls [`Self::mark_done`]; workers loop on [`Self::pop_blocking`] and
+/// see `None` once the queue is drained AND `done` is set.
+#[derive(Default)]
+struct WorkQueue {
+    inner: Mutex<WorkQueueInner>,
+    cond: Condvar,
+}
+
+#[derive(Default)]
+struct WorkQueueInner {
+    queue: VecDeque<PathBuf>,
+    done: bool,
+}
+
+impl WorkQueue {
+    fn push(&self, dir: PathBuf) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue.push_back(dir);
+        self.cond.notify_one();
+    }
+
+    fn pop_blocking(&self) -> Option<PathBuf> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if let Some(dir) = inner.queue.pop_front() {
+                return Some(dir);
+            }
+            if inner.done {
+                return None;
+            }
+            inner = self.cond.wait(inner).unwrap();
+        }
+    }
+
+    fn mark_done(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.done = true;
+        self.cond.notify_all();
+    }
 }
 
 /// Plan for the rerun side of `collect --diff`: which tests to invoke
@@ -1433,5 +1628,142 @@ mod tests {
         // Unparseable: conservative — treat as too old.
         assert!(!nextest_version_at_least("garbage", "0.9.116"));
         assert!(!nextest_version_at_least("", "0.9.116"));
+    }
+
+    /// Lay out a per-test profraw dir under the watcher's tree root the same
+    /// way the shim does: `<root>/<binary_id>/<test_name>/`, with a `meta`
+    /// sidecar and the named `.profraw` file pre-sized to `profraw_size`.
+    fn make_test_dir(
+        root: &Path,
+        binary_id: &str,
+        test_name: &str,
+        profraw_size: usize,
+    ) -> PathBuf {
+        let dir = root.join(binary_id).join(test_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta"), format!("{test_name}\nbin\n{binary_id}\n")).unwrap();
+        if profraw_size > 0 {
+            std::fs::write(dir.join("1-1.profraw"), vec![0u8; profraw_size]).unwrap();
+        }
+        dir
+    }
+
+    /// Single dispatch: a dir that has shown the same non-zero profraw size
+    /// across two consecutive polls is ready. One poll alone isn't enough —
+    /// the LLVM runtime could still be mid-write the first time we see the
+    /// file.
+    #[test]
+    fn watch_state_dispatches_after_two_stable_polls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = make_test_dir(root, "crate-a", "test_a", 64);
+
+        let mut state = WatchState::default();
+
+        // First poll: profraw is there but we haven't seen the size before;
+        // hold back to confirm it isn't still growing.
+        let first = state.poll(root, false).unwrap();
+        assert!(first.is_empty(), "first poll should hold back: {first:?}");
+
+        // Second poll with the same size: dispatch.
+        let second = state.poll(root, false).unwrap();
+        assert_eq!(second, vec![dir.clone()]);
+
+        // Third poll: nothing new, and we don't redispatch the same dir.
+        let third = state.poll(root, false).unwrap();
+        assert!(third.is_empty(), "should not redispatch: {third:?}");
+    }
+
+    /// A dir with no `.profraw` yet (test still running, or runtime hasn't
+    /// flushed) is skipped while nextest is alive. The size-stability rule
+    /// also rejects a zero-byte profraw — LLVM writes the buffer in one
+    /// shot, so zero bytes means we caught it between `fopen` and the first
+    /// `write`.
+    #[test]
+    fn watch_state_holds_back_until_profraw_has_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let no_profraw = make_test_dir(root, "crate-a", "test_running", 0);
+        let zero_byte = make_test_dir(root, "crate-a", "test_zero", 0);
+        std::fs::write(zero_byte.join("1-1.profraw"), b"").unwrap();
+
+        let mut state = WatchState::default();
+        for _ in 0..3 {
+            assert!(state.poll(root, false).unwrap().is_empty());
+        }
+        assert!(!state.dispatched.contains(&no_profraw));
+        assert!(!state.dispatched.contains(&zero_byte));
+    }
+
+    /// The final pass — invoked once nextest has exited — dispatches every
+    /// remaining dir unconditionally, including ones with no `.profraw` and
+    /// ones we'd been holding back. By then no more writes can land, so
+    /// "still growing" is no longer a possibility, and we want even the
+    /// failure shapes (`Skipped("no profraw generated")`) to surface in the
+    /// per-test log.
+    #[test]
+    fn watch_state_final_pass_drains_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let with_profraw = make_test_dir(root, "crate-a", "test_a", 64);
+        let no_profraw = make_test_dir(root, "crate-a", "test_b", 0);
+
+        let mut state = WatchState::default();
+        // One pre-final poll registers a pending size for the live dir but
+        // doesn't dispatch yet.
+        assert!(state.poll(root, false).unwrap().is_empty());
+
+        let final_ready = state.poll(root, true).unwrap();
+        let ready_set: BTreeSet<_> = final_ready.into_iter().collect();
+        assert_eq!(
+            ready_set,
+            BTreeSet::from([with_profraw, no_profraw]),
+        );
+    }
+
+    /// Once a dir has been dispatched (e.g. by the streaming pass), the
+    /// final pass must NOT redispatch it — otherwise workers would
+    /// double-process the bundle.
+    #[test]
+    fn watch_state_does_not_redispatch_on_final_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = make_test_dir(root, "crate-a", "test_a", 64);
+
+        let mut state = WatchState::default();
+        assert!(state.poll(root, false).unwrap().is_empty());
+        assert_eq!(state.poll(root, false).unwrap(), vec![dir.clone()]);
+        // Streaming worker would have removed the dir at this point.
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let final_ready = state.poll(root, true).unwrap();
+        assert!(final_ready.is_empty(), "redispatched: {final_ready:?}");
+    }
+
+    /// The work queue is single-producer / multi-consumer with a `done`
+    /// sentinel. Workers block while the queue is empty, wake on push, and
+    /// see `None` once the watcher marks done AND the queue is drained.
+    #[test]
+    fn work_queue_blocks_then_drains_on_done() {
+        use std::sync::Arc;
+        let q = Arc::new(WorkQueue::default());
+
+        let q_pop = Arc::clone(&q);
+        let handle = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while let Some(p) = q_pop.pop_blocking() {
+                got.push(p);
+            }
+            got
+        });
+
+        q.push(PathBuf::from("a"));
+        q.push(PathBuf::from("b"));
+        // The consumer may have woken between pushes — either way both items
+        // are in the worker's `got` once it's seen `done` and the queue is
+        // empty.
+        q.mark_done();
+        let drained = handle.join().unwrap();
+        assert_eq!(drained, vec![PathBuf::from("a"), PathBuf::from("b")]);
     }
 }
