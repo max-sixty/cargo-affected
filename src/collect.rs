@@ -58,7 +58,7 @@ use crate::project::{
     canonicalize_no_verbatim, find_project_root, git_head_sha, git_working_tree_dirty,
 };
 use crate::selection;
-use crate::shim::{TestOutcome, TestResult};
+use crate::shim::{self, TestOutcome, TestResult};
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
 ///
@@ -150,8 +150,9 @@ pub fn collect(
     // Profraw bundles and the per-test result files the shim writes both live
     // under target/affected/ alongside the DB, each PID-suffixed so concurrent
     // `collect` invocations don't wipe each other's staging.
-    let profraw_dir = affected_dir(project_root).join(format!("profraw-{}", std::process::id()));
-    let results_dir = affected_dir(project_root).join(format!("results-{}", std::process::id()));
+    let pid = std::process::id();
+    let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
+    let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
     for dir in [&profraw_dir, &results_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
@@ -258,7 +259,6 @@ pub fn collect(
     // — same convention cargo-llvm-cov uses, which lets nextest setup-scripts
     // that build helper binaries match the runner's target-dir without
     // having to know cargo-affected's specific layout.
-    eprintln!("running tests with cargo nextest run...");
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
         .arg("run")
@@ -276,12 +276,13 @@ pub fn collect(
         .env("RUSTFLAGS", &rustflags)
         // The runner shim extracts each test's coverage in-process and writes
         // a result file; it needs the staging locations, the LLVM tools, and
-        // the canonical root (for path-relative range filtering).
-        .env("CARGO_AFFECTED_PROFRAW_BASE", &profraw_dir)
-        .env("CARGO_AFFECTED_RESULTS_DIR", &results_dir)
-        .env("CARGO_AFFECTED_LLVM_PROFDATA", &llvm_profdata)
-        .env("CARGO_AFFECTED_LLVM_COV", &llvm_cov)
-        .env("CARGO_AFFECTED_CANONICAL_ROOT", &canonical_root)
+        // the canonical root (for path-relative range filtering). Names are
+        // shared constants so the setter here can't drift from the reader.
+        .env(shim::ENV_PROFRAW_BASE, &profraw_dir)
+        .env(shim::ENV_RESULTS_DIR, &results_dir)
+        .env(shim::ENV_LLVM_PROFDATA, &llvm_profdata)
+        .env(shim::ENV_LLVM_COV, &llvm_cov)
+        .env(shim::ENV_CANONICAL_ROOT, &canonical_root)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -358,6 +359,21 @@ pub fn collect(
         let s = if skipped == 1 { "" } else { "s" };
         eprintln!("{skipped} test{s} produced no coverage");
     }
+    // Every test that ran produced no usable coverage. A real test always
+    // covers at least its own crate-root sentinels, so an empty mapping here
+    // means extraction failed across the board — instrumentation never engaged
+    // (no profraw), or the llvm tools failed on every binary — rather than a
+    // legitimately empty suite, which `handle_no_results` already handled
+    // above. Bail instead of storing nothing, which for a full collect would
+    // `DELETE` and wipe the prior coverage.
+    if mappings.is_empty() {
+        bail!(
+            "nextest ran but coverage extraction yielded no ranges for any of \
+             the {skipped} completed test{} (see the skip reasons above) — \
+             refusing to overwrite stored coverage",
+            if skipped == 1 { "" } else { "s" },
+        );
+    }
 
     let total_elapsed = total_start.elapsed();
     let region_count: usize = mappings.iter().map(|(_, r)| r.len()).sum();
@@ -408,6 +424,12 @@ pub fn collect(
     Ok(nextest_exit)
 }
 
+/// Per-collect staging-dir name prefixes under `target/affected/`, each
+/// suffixed with the collect's PID. Shared between the create site, the
+/// success-path teardown, and the `clean` sweep so the three can't drift.
+const PROFRAW_DIR_PREFIX: &str = "profraw-";
+const RESULTS_DIR_PREFIX: &str = "results-";
+
 /// Drop the per-collect profraw and results staging directories. The shim has
 /// already removed each per-test profraw bundle as it finished; what remains
 /// here is the bookkeeping shell — empty per-binary parent dirs and the small
@@ -423,10 +445,49 @@ fn remove_staging_dirs(profraw_dir: &Path, results_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove every leftover `profraw-*` / `results-*` staging dir under
+/// `target/affected/`. A successful `collect` removes its own, but a crashed
+/// or cancelled run — or a shim SIGKILL'd mid-extraction before its own
+/// cleanup — can orphan bundles (potentially the multi-GB profraw set this
+/// design exists to bound). `clean` reclaims them. Returns the count removed.
+///
+/// Only invoked from `clean` (an explicit, destructive user command), never at
+/// collect startup: the PID suffix lets concurrent collects coexist, and a
+/// blind sweep would delete a sibling collect's live staging.
+pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
+    let dir = affected_dir(project_root);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&dir).context("scanning target/affected")? {
+        let path = entry?.path();
+        let is_staging = path.is_dir()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| {
+                    n.starts_with(PROFRAW_DIR_PREFIX) || n.starts_with(RESULTS_DIR_PREFIX)
+                });
+        if is_staging {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Read every per-test [`TestResult`] the shim wrote under `results_dir`. The
 /// layout mirrors the profraw tree — `<binary_id>/<test_name>.json` — so two
 /// levels of walking find them all. Sorted by `(binary_id, test_name)` so the
 /// skip log and stored rows come out in a stable order.
+///
+/// An unreadable or unparseable result file is skipped with a warning, not a
+/// hard error: the shim writes atomically (`.tmp` + rename), so a torn file
+/// shouldn't occur, but if one does (e.g. the shim was SIGKILL'd at just the
+/// wrong moment, or the disk filled), losing one test's coverage — it
+/// re-selects next `--diff` — beats discarding every other test's.
 fn read_results(results_dir: &Path) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
     if !results_dir.exists() {
@@ -440,11 +501,16 @@ fn read_results(results_dir: &Path) -> Result<Vec<TestResult>> {
         for file_entry in std::fs::read_dir(&binary_path)? {
             let path = file_entry?.path();
             if path.extension().is_some_and(|e| e == "json") {
-                let raw = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading result {}", path.display()))?;
-                let result: TestResult = serde_json::from_str(&raw)
-                    .with_context(|| format!("parsing result {}", path.display()))?;
-                results.push(result);
+                match std::fs::read_to_string(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|raw| Ok(serde_json::from_str::<TestResult>(&raw)?))
+                {
+                    Ok(result) => results.push(result),
+                    Err(e) => eprintln!(
+                        "warning: ignoring unreadable coverage result {}: {e:#}",
+                        path.display()
+                    ),
+                }
             }
         }
     }
@@ -1305,5 +1371,49 @@ mod tests {
         // Unparseable: conservative — treat as too old.
         assert!(!nextest_version_at_least("garbage", "0.9.116"));
         assert!(!nextest_version_at_least("", "0.9.116"));
+    }
+
+    /// A torn/garbage result file is skipped, not fatal: one bad file must not
+    /// discard the coverage of every other test in the run. `.tmp` siblings
+    /// (an interrupted atomic write) are ignored entirely.
+    #[test]
+    fn read_results_skips_unreadable_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let results = tmp.path();
+        let dir = results.join("crate-a");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = TestResult {
+            binary_id: "crate-a".into(),
+            test_name: "t_ok".into(),
+            outcome: TestOutcome::Skipped { reason: "x".into() },
+        };
+        std::fs::write(dir.join("t_ok.json"), serde_json::to_vec(&good).unwrap()).unwrap();
+        std::fs::write(dir.join("t_torn.json"), b"{ not valid json").unwrap();
+        std::fs::write(dir.join("t_partial.json.tmp"), b"{").unwrap();
+
+        let got = read_results(results).unwrap();
+        assert_eq!(got.len(), 1, "only the parseable result survives");
+        assert_eq!(got[0].test_name, "t_ok");
+    }
+
+    /// `clean` removes leftover `profraw-*`/`results-*` staging dirs but leaves
+    /// everything else under target/affected/ (the DB, the build dir) alone.
+    #[test]
+    fn clean_staging_dirs_removes_only_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let affected = root.join("target").join("affected");
+        std::fs::create_dir_all(affected.join("profraw-123")).unwrap();
+        std::fs::create_dir_all(affected.join("results-456")).unwrap();
+        std::fs::create_dir_all(affected.join("build")).unwrap();
+        std::fs::write(affected.join("coverage.db"), b"db").unwrap();
+
+        let removed = clean_staging_dirs(root).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!affected.join("profraw-123").exists());
+        assert!(!affected.join("results-456").exists());
+        assert!(affected.join("build").exists(), "build dir preserved");
+        assert!(affected.join("coverage.db").exists(), "DB preserved");
     }
 }

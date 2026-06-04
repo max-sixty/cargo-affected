@@ -51,6 +51,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::coverage::{self, HitRange};
 
+/// Environment-variable contract between `collect` (which sets all of these on
+/// the `cargo nextest run` command) and the shim (which reads them). Shared
+/// constants so a rename can't silently desync the two sides into a runtime
+/// `exit(2)`. The shim requires all of them whenever nextest sets
+/// `NEXTEST_BINARY_ID` (i.e. for a real per-test invocation).
+pub(crate) const ENV_PROFRAW_BASE: &str = "CARGO_AFFECTED_PROFRAW_BASE";
+pub(crate) const ENV_RESULTS_DIR: &str = "CARGO_AFFECTED_RESULTS_DIR";
+pub(crate) const ENV_LLVM_PROFDATA: &str = "CARGO_AFFECTED_LLVM_PROFDATA";
+pub(crate) const ENV_LLVM_COV: &str = "CARGO_AFFECTED_LLVM_COV";
+pub(crate) const ENV_CANONICAL_ROOT: &str = "CARGO_AFFECTED_CANONICAL_ROOT";
+
 /// Per-test coverage result the shim writes and `collect` reads back. Carries
 /// the verbatim `(binary_id, test_name)` so `collect` doesn't have to invert
 /// [`sanitize`] from the filesystem path.
@@ -64,8 +75,10 @@ pub(crate) struct TestResult {
 /// Outcome of extracting one test's coverage. `Skipped` covers every soft
 /// failure (no profraw, a failed llvm-tool invocation, a parse error): the
 /// test simply gains no coverage this round and gets re-selected on the next
-/// `--diff`. `collect` resolves the LLVM tool paths up front, so a tool that
-/// can't run at all is caught before any test starts, not here.
+/// `--diff`. A *systematic* failure (e.g. a present-but-unrunnable llvm tool)
+/// turns every test into `Skipped`; `collect` catches that case — zero tests
+/// collected — and bails rather than storing (and, for a full collect,
+/// wiping) coverage. See the empty-`mappings` guard in `collect`.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum TestOutcome {
     Collected { ranges: BTreeSet<HitRange> },
@@ -144,8 +157,8 @@ fn run_test(binary: &str, rest: &[String]) -> i32 {
 }
 
 /// Coverage tool paths and output locations `collect` hands the shim via the
-/// environment. Present together or not at all: `collect` sets all four
-/// whenever it sets `CARGO_AFFECTED_PROFRAW_BASE`.
+/// environment (see the `ENV_*` constants). Present together or not at all:
+/// `collect` sets every one whenever it sets [`ENV_PROFRAW_BASE`].
 struct CoverageEnv {
     profraw_base: PathBuf,
     results_dir: PathBuf,
@@ -168,11 +181,11 @@ impl CoverageEnv {
                 })
         };
         Self {
-            profraw_base: var("CARGO_AFFECTED_PROFRAW_BASE"),
-            results_dir: var("CARGO_AFFECTED_RESULTS_DIR"),
-            llvm_profdata: var("CARGO_AFFECTED_LLVM_PROFDATA"),
-            llvm_cov: var("CARGO_AFFECTED_LLVM_COV"),
-            canonical_root: var("CARGO_AFFECTED_CANONICAL_ROOT"),
+            profraw_base: var(ENV_PROFRAW_BASE),
+            results_dir: var(ENV_RESULTS_DIR),
+            llvm_profdata: var(ENV_LLVM_PROFDATA),
+            llvm_cov: var(ENV_LLVM_COV),
+            canonical_root: var(ENV_CANONICAL_ROOT),
         }
     }
 }
@@ -258,11 +271,20 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
 }
 
 /// Write the per-test result to `<results_dir>/<binary_id>/<test_name>.json`.
+///
+/// Written atomically — to a `.tmp` sibling, then renamed — so the reader
+/// (`collect::read_results`) only ever sees a complete file. Extraction runs
+/// inside nextest's per-test timeout budget, so the shim can be SIGKILL'd
+/// mid-write; a half-written `.json` would otherwise make the reader's parse
+/// fail and abort the whole collect. A killed write instead leaves only a
+/// `.tmp` file, which the reader ignores.
+///
 /// Best-effort: a failure here costs this test one collect (it's re-selected
 /// next `--diff`), so we warn rather than abort the test.
 fn write_result(results_dir: &Path, binary_id: &str, test_name: &str, outcome: TestOutcome) {
     let dir = results_dir.join(sanitize(binary_id));
     let path = dir.join(format!("{}.json", sanitize(test_name)));
+    let tmp = path.with_extension("json.tmp");
     let result = TestResult {
         binary_id: binary_id.to_string(),
         test_name: test_name.to_string(),
@@ -270,7 +292,8 @@ fn write_result(results_dir: &Path, binary_id: &str, test_name: &str, outcome: T
     };
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(&path, serde_json::to_vec(&result)?)
+        std::fs::write(&tmp, serde_json::to_vec(&result)?)?;
+        std::fs::rename(&tmp, &path)
     };
     if let Err(e) = write() {
         eprintln!(
