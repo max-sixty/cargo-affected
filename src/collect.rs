@@ -3,9 +3,12 @@
 //! Delegates build and test execution to `cargo nextest run`. We insert a
 //! small runner shim (`cargo-affected runner-shim`) via
 //! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at
-//! a per-test subdirectory before `exec`ing the real test binary. After
-//! nextest finishes we walk those subdirectories, merge profraws, export
-//! coverage, and write per-(test, file) line ranges to SQLite.
+//! a per-test subdirectory, then spawns and waits for the real test binary
+//! and extracts that test's coverage in-process — merging profraws,
+//! exporting with `llvm-cov`, and writing a small per-test result file —
+//! before exiting. After nextest finishes we read those result files and
+//! write per-(test, file) line ranges to SQLite. See the Approach section
+//! below and [`crate::shim`] for the in-shim extraction details.
 //!
 //! We use the `--config` array form rather than the
 //! `CARGO_TARGET_<TRIPLE>_RUNNER` env var because cargo only
