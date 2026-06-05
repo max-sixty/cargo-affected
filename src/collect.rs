@@ -31,26 +31,34 @@
 //!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
 //! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
 //!    git error surfaces before we spend time on coverage parsing.
-//! 5. Post-run: for each subdir of profraw_base, read the `meta` sidecar,
-//!    merge with `llvm-profdata`, export with `llvm-cov`, parse hit ranges.
-//!    Parallelized across workers.
-//! 6. Store mappings + collect_sha in the DB keyed by (binary_id, test_name).
+//! 5. **Inside the runner shim**: each test's shim (`cargo-affected
+//!    runner-shim`) spawns the test binary, waits for it, then merges its
+//!    profraw with `llvm-profdata`, exports with `llvm-cov`, parses hit
+//!    ranges, writes a small per-test result file under
+//!    `CARGO_AFFECTED_RESULTS_DIR`, and **deletes the per-test profraw dir
+//!    before exiting**. Extraction runs in the process that ran the test, so
+//!    peak disk usage is bounded by nextest's own concurrency
+//!    (O(test-threads × per-test bundle) instead of O(whole-suite)) with no
+//!    external watcher or completion heuristic — the completion signal is the
+//!    test process exiting. See [`crate::shim`].
+//! 6. After nextest exits, read the per-test result files and store mappings
+//!    + collect_sha in the DB keyed by (binary_id, test_name).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
-use crate::coverage::{self, HitRange};
+use crate::coverage::HitRange;
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{
     canonicalize_no_verbatim, find_project_root, git_head_sha, git_working_tree_dirty,
 };
 use crate::selection;
+use crate::shim::{self, TestOutcome, TestResult};
 
 /// Entry point for `cargo affected collect`. Returns nextest's exit code.
 ///
@@ -139,13 +147,20 @@ pub fn collect(
         }
     }
 
-    // Profraw files live under target/affected/ alongside the DB. PID suffix
-    // so concurrent `collect` invocations don't wipe each other's files.
-    let profraw_dir = affected_dir(project_root).join(format!("profraw-{}", std::process::id()));
-    if profraw_dir.exists() {
-        std::fs::remove_dir_all(&profraw_dir).context("failed to clean profraw dir")?;
+    // Profraw bundles and the per-test result files the shim writes both live
+    // under target/affected/ alongside the DB, each PID-suffixed so concurrent
+    // `collect` invocations don't wipe each other's staging.
+    let pid = std::process::id();
+    let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
+    let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
+    for dir in [&profraw_dir, &results_dir] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)
+                .with_context(|| format!("failed to clean {}", dir.display()))?;
+        }
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
     }
-    std::fs::create_dir_all(&profraw_dir).context("failed to create profraw dir")?;
 
     // Per-target sentinel set keyed by nextest's `binary_id`. Each test's
     // sentinel ranges cover its own crate root, its package's lib (if it's
@@ -244,7 +259,6 @@ pub fn collect(
     // — same convention cargo-llvm-cov uses, which lets nextest setup-scripts
     // that build helper binaries match the runner's target-dir without
     // having to know cargo-affected's specific layout.
-    eprintln!("running tests with cargo nextest run...");
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
         .arg("run")
@@ -256,11 +270,19 @@ pub fn collect(
         // selected test absent from the listing — common in `--diff` after
         // renames/deletions) doesn't make nextest exit non-zero. We
         // discriminate the legitimate "all phantoms" case from a build
-        // failure in `handle_no_profraw_dirs` using the diff plan's
-        // live-vs-phantom split, not nextest's exit code.
+        // failure in `handle_no_results` using the diff plan's live-vs-phantom
+        // split, not nextest's exit code.
         .arg("--no-tests=warn")
         .env("RUSTFLAGS", &rustflags)
-        .env("CARGO_AFFECTED_PROFRAW_BASE", &profraw_dir)
+        // The runner shim extracts each test's coverage in-process and writes
+        // a result file; it needs the staging locations, the LLVM tools, and
+        // the canonical root (for path-relative range filtering). Names are
+        // shared constants so the setter here can't drift from the reader.
+        .env(shim::ENV_PROFRAW_BASE, &profraw_dir)
+        .env(shim::ENV_RESULTS_DIR, &results_dir)
+        .env(shim::ENV_LLVM_PROFDATA, &llvm_profdata)
+        .env(shim::ENV_LLVM_COV, &llvm_cov)
+        .env(shim::ENV_CANONICAL_ROOT, &canonical_root)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -275,102 +297,83 @@ pub fn collect(
     for a in nextest_args {
         cmd.arg(a);
     }
-    let status = cmd
-        .status()
-        .context("failed to run cargo nextest run")?;
+    eprintln!("running tests (each extracts its own coverage as it finishes)...");
+    let status = cmd.status().context("failed to run cargo nextest run")?;
     let nextest_exit = status.code().unwrap_or(1);
+
     if let Some(config) = &filter_config {
         // Best-effort cleanup; a stale file in gitignored target/ is harmless.
         let _ = std::fs::remove_file(config);
     }
 
-    let test_dirs = list_test_dirs(&profraw_dir)?;
-    let total = test_dirs.len();
-    if total == 0 {
-        let exit = handle_no_profraw_dirs(
+    // The shim already merged/exported/parsed each test's profraw and deleted
+    // the bundle; here we just read back the small result files it left.
+    let results = read_results(&results_dir)?;
+    if results.is_empty() {
+        let exit = handle_no_results(
             &mut db,
             env_fingerprint,
             diff_plan.as_ref(),
             nextest_exit,
-            &profraw_dir,
+            &results_dir,
         )?;
-        remove_profraw_dir(&profraw_dir)?;
+        remove_staging_dirs(&profraw_dir, &results_dir)?;
         return Ok(exit);
     }
 
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    eprintln!("extracting coverage for {total} tests with {num_workers} workers...");
-
-    let progress: Mutex<usize> = Mutex::new(0);
-    let work: Mutex<VecDeque<(usize, PathBuf)>> =
-        Mutex::new(test_dirs.into_iter().enumerate().collect());
-    let mappings: Mutex<Vec<(TestId, BTreeSet<HitRange>)>> = Mutex::new(Vec::new());
-    let extract_errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    std::thread::scope(|s| {
-        for _ in 0..num_workers {
-            s.spawn(|| loop {
-                let Some((_idx, dir)) = work.lock().unwrap().pop_front() else {
-                    break;
+    // Fold each test's crate-root sentinels into its ranges. An unknown
+    // binary_id means `cargo metadata` and the nextest listing diverged — a
+    // real invariant break — so surface it rather than dropping coverage.
+    let mut mappings: Vec<(TestId, BTreeSet<HitRange>)> = Vec::new();
+    let mut unknown_binaries: BTreeSet<String> = BTreeSet::new();
+    let mut skipped = 0usize;
+    for result in results {
+        match result.outcome {
+            TestOutcome::Collected { mut ranges } => {
+                let test_id = TestId::new(result.binary_id, result.test_name);
+                let Some(pkg_ranges) = crate_root_ranges_by_binary_id.get(&test_id.binary_id)
+                else {
+                    unknown_binaries.insert(test_id.binary_id);
+                    continue;
                 };
-                let t0 = Instant::now();
-                let outcome = extract_one(&dir, &llvm_profdata, &llvm_cov, &canonical_root);
-                let elapsed = t0.elapsed().as_secs_f64();
-                let mut guard = progress.lock().unwrap();
-                *guard += 1;
-                let n = *guard;
-                match outcome {
-                    Ok(ExtractOutcome::Collected { test_id, mut ranges }) => {
-                        let Some(pkg_ranges) =
-                            crate_root_ranges_by_binary_id.get(&test_id.binary_id)
-                        else {
-                            eprintln!(
-                                "[{n}/{total}] {}::{}: ERROR (binary_id is not a known \
-                                 workspace target)",
-                                test_id.binary_id, test_id.test_name
-                            );
-                            drop(guard);
-                            extract_errors.lock().unwrap().push(format!(
-                                "binary_id {:?} is not a known workspace target",
-                                test_id.binary_id
-                            ));
-                            continue;
-                        };
-                        ranges.extend(pkg_ranges.iter().cloned());
-                        eprintln!(
-                            "[{n}/{total}] {}::{}: {} ranges ({elapsed:.1}s)",
-                            test_id.binary_id,
-                            test_id.test_name,
-                            ranges.len()
-                        );
-                        drop(guard);
-                        mappings.lock().unwrap().push((test_id, ranges));
-                    }
-                    Ok(ExtractOutcome::Skipped { test_id, reason }) => {
-                        eprintln!(
-                            "[{n}/{total}] {}::{}: SKIP ({reason})",
-                            test_id.binary_id, test_id.test_name
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[{n}/{total}] {}: ERROR ({e:#})",
-                            dir.display()
-                        );
-                    }
-                }
-            });
+                ranges.extend(pkg_ranges.iter().cloned());
+                mappings.push((test_id, ranges));
+            }
+            TestOutcome::Skipped { reason } => {
+                skipped += 1;
+                eprintln!(
+                    "  skipped {}::{}: {reason}",
+                    result.binary_id, result.test_name
+                );
+            }
         }
-    });
-
-    let extract_errors = extract_errors.into_inner().unwrap();
-    if !extract_errors.is_empty() {
-        bail!("coverage extraction failed:\n  {}", extract_errors.join("\n  "));
     }
-
-    let mappings = mappings.into_inner().unwrap();
+    if !unknown_binaries.is_empty() {
+        bail!(
+            "coverage results reference binary_ids absent from the workspace \
+             (metadata/listing divergence): {}",
+            unknown_binaries.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if skipped > 0 {
+        let s = if skipped == 1 { "" } else { "s" };
+        eprintln!("{skipped} test{s} produced no coverage");
+    }
+    // Every test that ran produced no usable coverage. A real test always
+    // covers at least its own crate-root sentinels, so an empty mapping here
+    // means extraction failed across the board — instrumentation never engaged
+    // (no profraw), or the llvm tools failed on every binary — rather than a
+    // legitimately empty suite, which `handle_no_results` already handled
+    // above. Bail instead of storing nothing, which for a full collect would
+    // `DELETE` and wipe the prior coverage.
+    if mappings.is_empty() {
+        bail!(
+            "nextest ran but coverage extraction yielded no ranges for any of \
+             the {skipped} completed test{} (see the skip reasons above) — \
+             refusing to overwrite stored coverage",
+            if skipped == 1 { "" } else { "s" },
+        );
+    }
 
     let total_elapsed = total_start.elapsed();
     let region_count: usize = mappings.iter().map(|(_, r)| r.len()).sum();
@@ -417,23 +420,102 @@ pub fn collect(
         region_count,
         total_elapsed.as_secs_f64(),
     );
-    remove_profraw_dir(&profraw_dir)?;
+    remove_staging_dirs(&profraw_dir, &results_dir)?;
     Ok(nextest_exit)
 }
 
-/// Drop the per-collect profraw directory. The raw profile bundles inside
-/// (~10 GB on a workspace this size) feed only the in-process `llvm-profdata`
-/// → `llvm-cov` extraction; once the resulting hit-ranges land in
-/// `coverage.db` they have no further use, and leaving them on disk wastes
-/// space locally and overflows the GitHub Actions repo cache cap in CI.
-/// Only called from the success paths — failed collects keep their bundles
-/// for debugging.
-fn remove_profraw_dir(profraw_dir: &Path) -> Result<()> {
-    if !profraw_dir.exists() {
-        return Ok(());
+/// Per-collect staging-dir name prefixes under `target/affected/`, each
+/// suffixed with the collect's PID. Shared between the create site, the
+/// success-path teardown, and the `clean` sweep so the three can't drift.
+const PROFRAW_DIR_PREFIX: &str = "profraw-";
+const RESULTS_DIR_PREFIX: &str = "results-";
+
+/// Drop the per-collect profraw and results staging directories. The shim has
+/// already removed each per-test profraw bundle as it finished; what remains
+/// here is the bookkeeping shell — empty per-binary parent dirs and the small
+/// result files we just consumed. Only called from the success paths — failed
+/// collects keep whatever's still on disk for debugging.
+fn remove_staging_dirs(profraw_dir: &Path, results_dir: &Path) -> Result<()> {
+    for dir in [profraw_dir, results_dir] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)
+                .with_context(|| format!("failed to remove {}", dir.display()))?;
+        }
     }
-    std::fs::remove_dir_all(profraw_dir)
-        .with_context(|| format!("failed to remove profraw dir {}", profraw_dir.display()))
+    Ok(())
+}
+
+/// Remove every leftover `profraw-*` / `results-*` staging dir under
+/// `target/affected/`. A successful `collect` removes its own, but a crashed
+/// or cancelled run — or a shim SIGKILL'd mid-extraction before its own
+/// cleanup — can orphan bundles (potentially the multi-GB profraw set this
+/// design exists to bound). `clean` reclaims them. Returns the count removed.
+///
+/// Only invoked from `clean` (an explicit, destructive user command), never at
+/// collect startup: the PID suffix lets concurrent collects coexist, and a
+/// blind sweep would delete a sibling collect's live staging.
+pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
+    let dir = affected_dir(project_root);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&dir).context("scanning target/affected")? {
+        let path = entry?.path();
+        let is_staging = path.is_dir()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| {
+                    n.starts_with(PROFRAW_DIR_PREFIX) || n.starts_with(RESULTS_DIR_PREFIX)
+                });
+        if is_staging {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Read every per-test [`TestResult`] the shim wrote under `results_dir`. The
+/// layout mirrors the profraw tree — `<binary_id>/<test_name>.json` — so two
+/// levels of walking find them all. Sorted by `(binary_id, test_name)` so the
+/// skip log and stored rows come out in a stable order.
+///
+/// An unreadable or unparseable result file is skipped with a warning, not a
+/// hard error: the shim writes atomically (`.tmp` + rename), so a torn file
+/// shouldn't occur, but if one does (e.g. the shim was SIGKILL'd at just the
+/// wrong moment, or the disk filled), losing one test's coverage — it
+/// re-selects next `--diff` — beats discarding every other test's.
+fn read_results(results_dir: &Path) -> Result<Vec<TestResult>> {
+    let mut results = Vec::new();
+    if !results_dir.exists() {
+        return Ok(results);
+    }
+    for binary_entry in std::fs::read_dir(results_dir).context("scanning results dir")? {
+        let binary_path = binary_entry?.path();
+        if !binary_path.is_dir() {
+            continue;
+        }
+        for file_entry in std::fs::read_dir(&binary_path)? {
+            let path = file_entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                match std::fs::read_to_string(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|raw| Ok(serde_json::from_str::<TestResult>(&raw)?))
+                {
+                    Ok(result) => results.push(result),
+                    Err(e) => eprintln!(
+                        "warning: ignoring unreadable coverage result {}: {e:#}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+    }
+    results.sort_by(|a, b| (&a.binary_id, &a.test_name).cmp(&(&b.binary_id, &b.test_name)));
+    Ok(results)
 }
 
 /// Plan for the rerun side of `collect --diff`: which tests to invoke
@@ -444,7 +526,7 @@ struct DiffPlan {
     /// tests in the DB whose stored ranges overlap diff hunks but that no
     /// longer appear in the current nextest listing (renamed/deleted
     /// between collects). nextest filters those out at runtime; the
-    /// `total == 0` recovery path uses the live/phantom split to tell
+    /// no-results recovery path uses the live/phantom split to tell
     /// "filter matched nothing real" apart from "runner shim failed".
     selected: BTreeSet<TestId>,
     /// Every test currently in `nextest list`. Drives prune (rows for
@@ -462,7 +544,7 @@ impl DiffPlan {
 
     /// Selected tests that nextest can actually run (those present in the
     /// current listing). Used to distinguish the all-phantoms case from a
-    /// runner-shim failure when extraction yields no profraw dirs.
+    /// runner-shim failure when extraction yields no results.
     fn live_selected_count(&self) -> usize {
         self.selected.iter().filter(|t| self.listed.contains(t)).count()
     }
@@ -545,9 +627,9 @@ fn plan_diff_collect(
     }))
 }
 
-/// Recovery for the case where nextest run produced no per-test profraw
-/// directories. Discriminates three buckets so the user gets an actionable
-/// message instead of a generic "no profraws" line:
+/// Recovery for the case where nextest run produced no per-test coverage
+/// results. Discriminates three buckets so the user gets an actionable
+/// message instead of a generic "no results" line:
 ///
 /// - **Build or test failure** (nextest exited non-zero) — bail and let
 ///   nextest's own output explain. We pass `--no-tests=warn` to nextest so
@@ -555,38 +637,37 @@ fn plan_diff_collect(
 /// - **All-phantom selection** (`--diff` mode, every selected test absent
 ///   from the current listing) — expected when tests were renamed/deleted
 ///   between collects. Prune the stale rows and exit 0.
-/// - **Runner shim didn't fire** (live tests should have run but no
-///   per-test dirs appeared) — bail with a diagnostic pointing at the
-///   shim. This is the case where nextest claims success but our
-///   instrumentation never engaged.
-fn handle_no_profraw_dirs(
+/// - **Runner shim didn't fire** (live tests should have run but no results
+///   appeared) — bail with a diagnostic pointing at the shim. This is the
+///   case where nextest claims success but our instrumentation never engaged.
+fn handle_no_results(
     db: &mut Db,
     env_fingerprint: &str,
     diff_plan: Option<&DiffPlan>,
     nextest_exit: i32,
-    profraw_dir: &Path,
+    results_dir: &Path,
 ) -> Result<i32> {
     if nextest_exit != 0 {
         bail!(
-            "nextest exited with code {nextest_exit} and produced no per-test \
-             profraw directories under {} — build or test failure (see nextest \
-             output above)",
-            profraw_dir.display(),
+            "nextest exited with code {nextest_exit} and produced no coverage \
+             results under {} — build or test failure (see nextest output \
+             above)",
+            results_dir.display(),
         );
     }
 
     if let Some(plan) = diff_plan {
         let live = plan.live_selected_count();
         if live > 0 {
-            // nextest exited 0 with live tests in the filter, but no
-            // per-test dirs appeared — those should each have one. The
-            // runner shim must have failed to fire.
+            // nextest exited 0 with live tests in the filter, but none wrote a
+            // result — each should have. The runner shim must have failed to
+            // fire.
             bail!(
                 "nextest exited 0 but {live} of {} selected tests should have \
-                 been instrumented — no per-test profraw directories appeared \
-                 under {}; the runner shim may have failed to fire",
+                 been instrumented — no coverage results appeared under {}; \
+                 the runner shim may have failed to fire",
                 plan.selected.len(),
-                profraw_dir.display(),
+                results_dir.display(),
             );
         }
         eprintln!(
@@ -601,119 +682,17 @@ fn handle_no_profraw_dirs(
         return Ok(0);
     }
 
-    // Full collect with no profraws and no diff plan: either the project
-    // has no tests at all (nextest's `--no-tests=warn` lets us distinguish
-    // this from a hard failure) or the shim never fired. We can't tell
-    // apart from here without re-listing, so default to the more likely
-    // explanation in this codepath — empty suite — and surface a hint.
+    // Full collect with no results and no diff plan: either the project has no
+    // tests at all (nextest's `--no-tests=warn` lets us distinguish this from
+    // a hard failure) or the shim never fired. We can't tell apart from here
+    // without re-listing, so default to the more likely explanation in this
+    // codepath — empty suite — and surface a hint.
     eprintln!(
-        "no per-test profraw directories under {} — \
-         project may have no tests, or the runner shim may have failed to fire",
-        profraw_dir.display(),
+        "no coverage results under {} — project may have no tests, or the \
+         runner shim may have failed to fire",
+        results_dir.display(),
     );
     Ok(0)
-}
-
-/// Outcome of coverage extraction for a single per-test directory.
-enum ExtractOutcome {
-    Collected {
-        test_id: TestId,
-        ranges: BTreeSet<HitRange>,
-    },
-    Skipped {
-        test_id: TestId,
-        reason: String,
-    },
-}
-
-/// Merge profraws in `dir` and export coverage.
-///
-/// Reads the `meta` sidecar the shim wrote (test name + binary path +
-/// binary_id) so we know exactly which binary to pass to `llvm-cov export`
-/// and how to store the result in the DB.
-fn extract_one(
-    dir: &Path,
-    llvm_profdata: &Path,
-    llvm_cov: &Path,
-    canonical_root: &Path,
-) -> Result<ExtractOutcome> {
-    let meta = std::fs::read_to_string(dir.join("meta"))
-        .with_context(|| format!("reading sidecar {}/meta", dir.display()))?;
-    let mut lines = meta.lines();
-    let test_name = lines
-        .next()
-        .context("empty meta sidecar")?
-        .to_string();
-    let binary = lines
-        .next()
-        .context("meta sidecar missing binary path")?
-        .to_string();
-    let binary_id = lines
-        .next()
-        .context("meta sidecar missing binary_id")?
-        .to_string();
-    let test_id = TestId::new(binary_id, test_name);
-    let binary = PathBuf::from(binary);
-
-    let profraw_files = list_profraw_files(dir)?;
-    if profraw_files.is_empty() {
-        return Ok(ExtractOutcome::Skipped {
-            test_id,
-            reason: "no profraw generated".into(),
-        });
-    }
-
-    let profdata_path = dir.join("coverage.profdata");
-    let mut merge_cmd = Command::new(llvm_profdata);
-    merge_cmd.arg("merge").arg("--sparse");
-    for f in &profraw_files {
-        merge_cmd.arg(f);
-    }
-    merge_cmd.arg("-o").arg(&profdata_path);
-    let merge_output = merge_cmd
-        .output()
-        .context("failed to run llvm-profdata merge")?;
-    if !merge_output.status.success() {
-        return Ok(ExtractOutcome::Skipped {
-            test_id,
-            reason: format!(
-                "llvm-profdata merge failed: {}",
-                String::from_utf8_lossy(&merge_output.stderr).trim()
-            ),
-        });
-    }
-
-    // POSIX ERE — no negative lookahead, so we enumerate prefixes to drop.
-    // The filter shrinks `files[]` (1234 → 113 on a worktrunk-scale test) but
-    // doesn't shrink `functions[]`, which is the bulk of the JSON. We still
-    // re-filter in coverage.rs via `strip_prefix(project_root)` — this regex
-    // is the cheap pre-filter, project-root strip is the authoritative gate.
-    let export_output = Command::new(llvm_cov)
-        .arg("export")
-        .arg("--format=text")
-        .arg(format!("--instr-profile={}", profdata_path.display()))
-        .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
-        .arg(&binary)
-        .output()
-        .context("failed to run llvm-cov export")?;
-    if !export_output.status.success() {
-        return Ok(ExtractOutcome::Skipped {
-            test_id,
-            reason: format!(
-                "llvm-cov export failed: {}",
-                String::from_utf8_lossy(&export_output.stderr).trim()
-            ),
-        });
-    }
-
-    let json = String::from_utf8_lossy(&export_output.stdout);
-    match coverage::extract_hit_ranges(&json, canonical_root) {
-        Ok(ranges) => Ok(ExtractOutcome::Collected { test_id, ranges }),
-        Err(e) => Ok(ExtractOutcome::Skipped {
-            test_id,
-            reason: format!("parse error: {e}"),
-        }),
-    }
 }
 
 /// Build a single nextest filterset expression matching exactly the given
@@ -1010,47 +989,6 @@ pub(crate) fn nextest_list(
         ignored,
         binaries,
     })
-}
-
-/// List subdirectories of `profraw_dir` that look like per-test output
-/// (contain a `meta` sidecar).
-///
-/// The shim writes per-test dirs at `profraw_dir/<binary_id>/<test_name>/`,
-/// so we walk two levels. Splitting binary_id and test_name into separate
-/// path components avoids the collision case where sanitization collapses
-/// `::` into `_` and two genuinely-distinct (binary_id, test_name) pairs
-/// produce the same single-level name.
-fn list_test_dirs(profraw_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut dirs = Vec::new();
-    for binary_entry in std::fs::read_dir(profraw_dir)? {
-        let binary_entry = binary_entry?;
-        let binary_path = binary_entry.path();
-        if !binary_path.is_dir() {
-            continue;
-        }
-        for test_entry in std::fs::read_dir(&binary_path)? {
-            let test_entry = test_entry?;
-            let test_path = test_entry.path();
-            if test_path.is_dir() && test_path.join("meta").exists() {
-                dirs.push(test_path);
-            }
-        }
-    }
-    dirs.sort();
-    Ok(dirs)
-}
-
-/// List all .profraw files in the given directory.
-fn list_profraw_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "profraw") {
-            files.push(path);
-        }
-    }
-    Ok(files)
 }
 
 /// Ensure `cargo nextest` is available and recent enough that it sets
@@ -1433,5 +1371,49 @@ mod tests {
         // Unparseable: conservative — treat as too old.
         assert!(!nextest_version_at_least("garbage", "0.9.116"));
         assert!(!nextest_version_at_least("", "0.9.116"));
+    }
+
+    /// A torn/garbage result file is skipped, not fatal: one bad file must not
+    /// discard the coverage of every other test in the run. `.tmp` siblings
+    /// (an interrupted atomic write) are ignored entirely.
+    #[test]
+    fn read_results_skips_unreadable_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let results = tmp.path();
+        let dir = results.join("crate-a");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = TestResult {
+            binary_id: "crate-a".into(),
+            test_name: "t_ok".into(),
+            outcome: TestOutcome::Skipped { reason: "x".into() },
+        };
+        std::fs::write(dir.join("t_ok.json"), serde_json::to_vec(&good).unwrap()).unwrap();
+        std::fs::write(dir.join("t_torn.json"), b"{ not valid json").unwrap();
+        std::fs::write(dir.join("t_partial.json.tmp"), b"{").unwrap();
+
+        let got = read_results(results).unwrap();
+        assert_eq!(got.len(), 1, "only the parseable result survives");
+        assert_eq!(got[0].test_name, "t_ok");
+    }
+
+    /// `clean` removes leftover `profraw-*`/`results-*` staging dirs but leaves
+    /// everything else under target/affected/ (the DB, the build dir) alone.
+    #[test]
+    fn clean_staging_dirs_removes_only_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let affected = root.join("target").join("affected");
+        std::fs::create_dir_all(affected.join("profraw-123")).unwrap();
+        std::fs::create_dir_all(affected.join("results-456")).unwrap();
+        std::fs::create_dir_all(affected.join("build")).unwrap();
+        std::fs::write(affected.join("coverage.db"), b"db").unwrap();
+
+        let removed = clean_staging_dirs(root).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!affected.join("profraw-123").exists());
+        assert!(!affected.join("results-456").exists());
+        assert!(affected.join("build").exists(), "build dir preserved");
+        assert!(affected.join("coverage.db").exists(), "DB preserved");
     }
 }

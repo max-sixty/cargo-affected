@@ -73,12 +73,13 @@ fn collect_leaves_no_profraw_outside_target() {
     );
 }
 
-/// A successful collect must drop the per-PID `target/affected/profraw-*/`
-/// staging dir. The bundles in there feed the in-process llvm-cov extraction
-/// once and have no further use; on a real workspace they run to ~10+ GB,
-/// blowing the GitHub Actions cache cap when archived.
+/// A successful collect must drop both per-PID staging dirs under
+/// `target/affected/`: `profraw-*/` (the per-test profile bundles, ~10+ GB on
+/// a real workspace) and `results-*/` (the per-test result files the shim
+/// writes). Each shim deletes its own profraw bundle as it finishes; `collect`
+/// sweeps the empty shells and the consumed result files at the end.
 #[test]
-fn collect_removes_profraw_staging_dir_on_success() {
+fn collect_removes_staging_dirs_on_success() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_two_module_project(dir, "sample_profraw_cleanup");
@@ -100,14 +101,14 @@ fn collect_removes_profraw_staging_dir_on_success() {
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("profraw-"))
+                        .is_some_and(|n| n.starts_with("profraw-") || n.starts_with("results-"))
                 })
                 .collect()
         })
         .unwrap_or_default();
     assert!(
         leftovers.is_empty(),
-        "expected no profraw-* dirs under target/affected after collect, found:\n  {}",
+        "expected no profraw-*/results-* staging dirs under target/affected after collect, found:\n  {}",
         leftovers
             .iter()
             .map(|p| p.display().to_string())
