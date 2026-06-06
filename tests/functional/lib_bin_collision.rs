@@ -118,7 +118,7 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
     );
     assert!(
         !stderr.contains("basename fallback ambiguous"),
-        "marker probe must disambiguate lib+bin: stderr=\n{stderr}",
+        "NEXTEST_BINARY_ID must disambiguate lib+bin: stderr=\n{stderr}",
     );
 
     // Both targets must land under their own binary_ids — nextest's
