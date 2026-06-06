@@ -57,8 +57,9 @@ edition = "2021"
     }
 }
 
-/// Run cargo-affected with `RUSTFLAGS='-C debuginfo=0'` so the embedded
-/// source paths the old marker fallback relied on aren't there to cheat with.
+/// Run cargo-affected with `RUSTFLAGS='-C debuginfo=0'` to mirror the
+/// stripped-binary CI environment that originally tripped the
+/// duplicate-basename bug, not just the debug-info-rich default.
 fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
     let bin = env!("CARGO_BIN_EXE_cargo-affected");
     Command::new(bin)
