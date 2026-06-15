@@ -28,8 +28,12 @@ use crate::db::TestId;
 use crate::project::ProjectRoot;
 use crate::selection::{changed_paths_since, ChangedRangesBySha, Reachability};
 
-/// Where rules live, for error messages.
-const TABLE: &str = "[workspace.metadata.affected]";
+/// Where rules live, for user-facing error messages. The `*` shorthand covers
+/// both locations — `[workspace.metadata.affected]` and the single-crate
+/// `[package.metadata.affected]` fallback — since these messages fire equally
+/// for rules loaded from either, and a hardcoded `workspace` would send a
+/// single-crate user grepping for a table their `Cargo.toml` doesn't contain.
+const TABLE: &str = "[*.metadata.affected]";
 
 /// Parsed `affected` metadata table. An absent table deserializes to `Default`
 /// (no rules), preserving the no-config invariant.
