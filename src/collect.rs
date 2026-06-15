@@ -207,6 +207,7 @@ pub fn collect(
         Some(&rustflags),
         Some(&build_dir),
         &cargo_build_args(nextest_args),
+        None,
     )?;
     eprintln!(
         "found {} tests across {} binaries",
@@ -917,11 +918,16 @@ pub(crate) struct BinaryEntry {
 /// the build config of the subsequent `cargo nextest run`, or the listing
 /// enumerates a different test set than the run builds and new-test
 /// detection ("listed minus DB") becomes unsound.
+///
+/// `filter_expr`, when set, passes `-E <expr>` so the listing is restricted to
+/// tests matching a nextest filterset — used to resolve `[workspace.metadata.affected]`
+/// rules to concrete tests. Leave `None` for a full listing.
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
     build_dir: Option<&Path>,
     build_args: &[String],
+    filter_expr: Option<&str>,
 ) -> Result<Listing> {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
@@ -940,6 +946,9 @@ pub(crate) fn nextest_list(
     }
     for a in build_args {
         cmd.arg(a);
+    }
+    if let Some(expr) = filter_expr {
+        cmd.arg("-E").arg(expr);
     }
     let output = cmd
         .spawn()

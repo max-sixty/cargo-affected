@@ -4,6 +4,7 @@
 //! then queries git for changed files to select which tests to rerun.
 
 mod collect;
+mod config;
 mod coverage;
 mod db;
 mod fingerprint;

@@ -23,6 +23,7 @@
 
 mod cache_miss;
 mod clean;
+mod config_rule;
 mod db_has_function_ranges;
 mod diff_collect;
 mod dirty;

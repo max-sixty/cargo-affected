@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::collect::{nextest_list, require_nextest};
+use crate::config;
 use crate::db::{db_path, warn_untracked_rs_files, Db, StoredFingerprintRow};
 use crate::fingerprint::{self, Fingerprint};
 use crate::project::{find_project_root, git_changed_files, ShaRelation};
@@ -177,14 +178,24 @@ pub fn status(
     eprintln!("checking for new tests...");
     // `status` takes no passthrough args, so there are no build flags to
     // thread through — list the default build.
-    let listing = nextest_list(project_root, None, None, &[])?;
+    let listing = nextest_list(project_root, None, None, &[], None)?;
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
+    // Mirror `run`: apply [workspace.metadata.affected] input rules so the dry-run
+    // predicts the same selection `run` would make.
+    let config_hits = config::config_rule_hits(
+        &project,
+        &[],
+        &reach,
+        &changed_ranges,
+        &changed_files,
+    )?;
     let sel = selection::select_with_precomputed_ranges(
         &db,
         &fingerprint.hex,
         &listing,
         &reach,
         &changed_ranges,
+        &config_hits,
         detail,
     )?;
 
