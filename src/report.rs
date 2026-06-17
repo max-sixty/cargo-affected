@@ -165,6 +165,9 @@ pub struct SelectionReport {
 pub struct SelectionSummary {
     pub selected: Option<usize>,
     pub affected: Option<usize>,
+    /// Reachable-known tests force-selected by a `[workspace.metadata.affected]` rule
+    /// (would otherwise have been skipped). Null on full-suite paths.
+    pub config: Option<usize>,
     pub new: Option<usize>,
     pub stranded: Option<usize>,
     pub skipped: Option<usize>,
@@ -208,13 +211,16 @@ pub struct HunkEntry {
     pub end: i64,
 }
 
-/// Per-file counts deduplicated by strongest reason — the three values
+/// Per-file counts deduplicated by strongest reason — the four values
 /// sum to [`ChangedFileEntry::tests_pulled_total`].
 #[derive(Debug, Serialize, Default)]
 pub struct ReasonCounts {
     pub line_overlap: usize,
     pub structural_backstop: usize,
     pub crate_root_sentinel: usize,
+    /// Tests pulled in by a `[workspace.metadata.affected]` rule matching this path.
+    /// Non-zero only for the (typically non-Rust) inputs such rules target.
+    pub config_rule: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +239,9 @@ pub struct SelectedTestEntry {
 #[serde(rename_all = "snake_case")]
 pub enum SelectedTestKind {
     Affected,
+    /// Force-selected by a `[workspace.metadata.affected]` rule (reachable-known, would
+    /// otherwise have been skipped). The `reasons` name the triggering inputs.
+    ConfigRule,
     New,
     Stranded,
 }
@@ -256,6 +265,10 @@ pub enum ReasonKind {
     LineOverlap,
     StructuralBackstop,
     CrateRootSentinel,
+    /// A `[workspace.metadata.affected]` rule matched the (typically non-Rust) input
+    /// named in `file`; `collect_sha` is empty and `matched_hunk` is `[0, 0]`
+    /// since the selection isn't anchored to a coverage hunk.
+    ConfigRule,
 }
 
 impl From<HitKind> for ReasonKind {
@@ -264,6 +277,7 @@ impl From<HitKind> for ReasonKind {
             HitKind::LineOverlap => Self::LineOverlap,
             HitKind::StructuralBackstop => Self::StructuralBackstop,
             HitKind::CrateRootSentinel => Self::CrateRootSentinel,
+            HitKind::ConfigRule => Self::ConfigRule,
         }
     }
 }
@@ -463,6 +477,7 @@ impl Report {
         let summary = SelectionSummary {
             selected: Some(selection.selected().len()),
             affected: Some(selection.affected.len()),
+            config: Some(selection.config_tests.len()),
             new: Some(selection.new_tests.len()),
             stranded: Some(selection.stranded_tests.len()),
             skipped: Some(selection.skipped()),
@@ -482,6 +497,7 @@ impl Report {
         let selected_tests = selection.diagnostics.per_test.as_ref().map(|per_test| {
             build_selected_tests(
                 &selection.affected,
+                &selection.config_tests,
                 &selection.new_tests,
                 &selection.stranded_tests,
                 per_test,
@@ -528,6 +544,7 @@ impl Report {
                 summary: SelectionSummary {
                     selected: None,
                     affected: None,
+                    config: None,
                     new: None,
                     stranded: None,
                     skipped: None,
@@ -731,6 +748,7 @@ fn build_changed_files_entries(
                     line_overlap: counts.line_overlap,
                     structural_backstop: counts.structural_backstop,
                     crate_root_sentinel: counts.crate_root_sentinel,
+                    config_rule: counts.config_rule,
                 },
             }
         })
@@ -745,14 +763,17 @@ fn build_changed_files_entries(
 
 fn build_selected_tests(
     affected: &BTreeSet<TestId>,
+    config_tests: &BTreeSet<TestId>,
     new_tests: &BTreeSet<TestId>,
     stranded: &BTreeSet<TestId>,
     per_test: &BTreeMap<TestId, Vec<HitReason>>,
 ) -> Vec<SelectedTestEntry> {
-    // Union all selected tests, classify, and emit in a stable order.
+    // Union all selected tests, classify, and emit in a stable order. The four
+    // sets are disjoint, so the classification order only needs to be exhaustive.
     let mut out: Vec<SelectedTestEntry> = Vec::new();
     let union: BTreeSet<&TestId> = affected
         .iter()
+        .chain(config_tests.iter())
         .chain(new_tests.iter())
         .chain(stranded.iter())
         .collect();
@@ -761,6 +782,8 @@ fn build_selected_tests(
             SelectedTestKind::New
         } else if stranded.contains(test) {
             SelectedTestKind::Stranded
+        } else if config_tests.contains(test) {
+            SelectedTestKind::ConfigRule
         } else {
             SelectedTestKind::Affected
         };

@@ -31,6 +31,7 @@ use crate::collect::{
     cargo_build_args, nextest_filter_expr, nextest_list, require_nextest,
     write_nextest_config,
 };
+use crate::config;
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint::{self, Fingerprint};
 use crate::project::{find_project_root, git_changed_files, ShaRelation};
@@ -184,18 +185,30 @@ pub fn run(
     // List with the same cargo build flags `run_tests` hands to `nextest
     // run`, so new-test detection compares against the test set the run
     // actually builds — not a feature-less one.
-    let listing = nextest_list(project_root, None, None, &cargo_build_args(nextest_args))?;
+    let build_args = cargo_build_args(nextest_args);
+    let listing = nextest_list(project_root, None, None, &build_args, None)?;
     // Compute per-sha hunks once; selection consumes them and so does
     // the report builder if --report-json is set. The previous code
     // ran `git diff -U0 <sha>` twice per reachable sha on the report
     // path.
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
+    // Declarative input rules ([workspace.metadata.affected]): force-select tests whose
+    // non-Rust inputs (snapshots, docs, templates) changed — coverage can't
+    // link those to tests. No config file → no rules → zero extra work.
+    let config_hits = config::config_rule_hits(
+        &project,
+        &build_args,
+        &reach,
+        &changed_ranges,
+        &changed_files,
+    )?;
     let sel = selection::select_with_precomputed_ranges(
         &db,
         &fingerprint.hex,
         &listing,
         &reach,
         &changed_ranges,
+        &config_hits,
         detail,
     )?;
 

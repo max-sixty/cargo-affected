@@ -29,7 +29,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 pub struct CoverageExport {
@@ -93,7 +93,7 @@ impl<'de> Deserialize<'de> for CoverageRegion {
 /// `line_start..=line_end` is the inclusive line span covered by the function's
 /// hit regions in `file`. Sources are stored relative to the project root so
 /// they line up with `git diff` output.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HitRange {
     pub file: Utf8PathBuf,
     pub line_start: i64,

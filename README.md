@@ -114,7 +114,9 @@ CI should still run the full suite.
 ### False negatives (tests skipped that should have run)
 
 - **Non-Rust sources.** `include_str!` / `include_bytes!` targets, SQL
-  files, migrations, assets, and templates aren't seen by llvm-cov.
+  files, migrations, assets, snapshots, and templates aren't seen by
+  llvm-cov — a change confined to one selects no test. [Input
+  rules](#input-rules) close this for inputs you can name.
 - **Build-time inputs not in the fingerprint.** The fingerprint covers
   `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
   `CARGO_BUILD_TARGET`. Changes to `build.rs`, `rust-toolchain.toml`, or
@@ -127,6 +129,46 @@ CI should still run the full suite.
 
 When in doubt, `cargo affected collect` to refresh coverage, or skip
 cargo-affected and run the full suite.
+
+## Input rules
+
+Coverage can't link a test to a non-Rust input it reads at runtime — an insta
+`.snap`, a doc a sync-test compares against, an `include_str!` target — so a
+change confined to that input selects no test (see [false
+negatives](#false-negatives-tests-skipped-that-should-have-run)). Optional
+`[[workspace.metadata.affected.rule]]` tables in `Cargo.toml` close the gap by
+mapping input globs to the tests that depend on them (use
+`[[package.metadata.affected.rule]]` in a single-crate project):
+
+```toml
+# Any `.snap` edit re-runs the integration suite that owns the snapshots.
+[[workspace.metadata.affected.rule]]
+globs = ["**/*.snap"]
+filterset = "binary_id(=mycrate::integration)"
+
+# Doc-sync tests read these inputs at runtime; run that module when any change.
+[[workspace.metadata.affected.rule]]
+globs = ["README.md", "docs/**/*.md"]
+filterset = "test(/readme_sync/)"
+```
+
+Each rule pairs `globs` (matched against changed paths) with a nextest
+`filterset` (the full [filter-expression
+language](https://nexte.st/docs/filtersets/)). When a changed path matches, the
+filterset is resolved with `cargo nextest list -E` and its tests are
+force-selected — reported under a `config` category distinct from coverage-driven
+selection. A Rust-only diff matches no globs and takes the exact prior path, so
+the speedup is preserved; the extra `nextest list` runs only on diffs that touch
+a configured input. A rule that matches a path but resolves to no tests warns
+rather than failing silently. No rules → no change in behavior.
+
+The rules live in `[*.metadata]`, which cargo ignores for the build — so
+cargo-affected excludes it from the coverage fingerprint. Editing a rule is
+cache-neutral: it doesn't force a re-collect, so you can iterate on rules freely.
+
+Rules are a remedy of last resort, not a substitute for coverage: prefer letting
+`collect` map Rust changes. Reach for a rule only for inputs llvm-cov
+structurally cannot see, and keep periodic full runs for everything else.
 
 ## Comparison with similar tools
 
