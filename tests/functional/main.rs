@@ -23,6 +23,7 @@
 
 mod cache_miss;
 mod clean;
+mod config_rule;
 mod db_has_function_ranges;
 mod diff_collect;
 mod dirty;
@@ -43,10 +44,9 @@ use std::process::{Command, Output};
 // llvm-tools is a hard requirement — every scenario invokes `cargo affected
 // collect`, which calls `llvm-profdata` and `llvm-cov` directly. We let the
 // binary's own missing-tool error path surface: `collect` bails with
-// `Install \`llvm-tools\` via \`rustup component add llvm-tools\``
-// (see src/collect.rs:545), which propagates as a failed scenario assertion.
-// Running `cargo test` on a host without the component fails loudly with
-// that exact message.
+// `Install \`llvm-tools\` via \`rustup component add llvm-tools\``, which
+// propagates as a failed scenario assertion. Running `cargo test` on a host
+// without the component fails loudly with that exact message.
 
 /// Run the cargo-affected binary built by this crate, with `args` in `dir`.
 ///

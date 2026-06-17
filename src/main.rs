@@ -4,6 +4,7 @@
 //! then queries git for changed files to select which tests to rerun.
 
 mod collect;
+mod config;
 mod coverage;
 mod db;
 mod fingerprint;
@@ -104,6 +105,16 @@ enum Action {
 
 fn clean() -> Result<()> {
     let project = project::find_project_root()?;
+
+    // Reclaim any leftover profraw/results staging from crashed or cancelled
+    // collects (a successful collect removes its own). Done first so it runs
+    // even when there's no DB to clear.
+    let swept = collect::clean_staging_dirs(&project.workspace_root)?;
+    if swept > 0 {
+        let s = if swept == 1 { "" } else { "s" };
+        eprintln!("removed {swept} leftover staging dir{s}");
+    }
+
     let path = db::db_path(&project.workspace_root);
     if !path.exists() {
         eprintln!("no coverage database found");
