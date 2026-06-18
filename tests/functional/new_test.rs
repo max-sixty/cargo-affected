@@ -118,7 +118,7 @@ fn ignored_test_not_perpetually_new() {
 /// later edit to a line that test covered would otherwise pull it into
 /// `affected` and produce the same all-ignored selection that makes
 /// `nextest run` exit non-zero. The `affected` loop must filter the
-/// `listing.ignored` set just like the new/stranded split does.
+/// `listing.excluded` set just like the new/stranded split does.
 #[test]
 fn newly_ignored_test_excluded_from_affected() {
     let tmp = tempfile::tempdir().unwrap();
