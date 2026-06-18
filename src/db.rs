@@ -188,6 +188,11 @@ pub enum HitKind {
     /// this file selects this test" link the function-level coverage
     /// can't observe directly.
     CrateRootSentinel,
+    /// The test was force-selected by a `[workspace.metadata.affected]` rule whose
+    /// globs matched a changed (typically non-Rust) input the coverage model
+    /// can't link to a test — an insta `.snap`, a doc, a template. Produced by
+    /// [`crate::config::resolve_config_hits`], not by coverage overlap.
+    ConfigRule,
 }
 
 /// How many distinct fingerprints to retain. `gc()` evicts the least-recently-

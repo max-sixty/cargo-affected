@@ -579,7 +579,7 @@ fn diff_collect_keeps_ignored_test_rows() {
 /// removed from the nextest listing. The structural-edit backstop pulls
 /// both math.rs tests into `affected`; both are now absent from the
 /// listing, so the nextest filter matches nothing and the runner shim
-/// never fires. `handle_no_profraw_dirs` should recognize this as the
+/// never fires. `handle_no_results` should recognize this as the
 /// expected "filter matched nothing real" case (rather than a runner
 /// shim failure) and prune the stale rows.
 #[test]
