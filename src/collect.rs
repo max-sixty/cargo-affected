@@ -792,9 +792,12 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
 /// listing args; `list` would reject every one of them.
 const RUN_ONLY_BARE: &[&str] = &[
     "--fail-fast",
+    "--ff",
     "--no-fail-fast",
+    "--nff",
     "--no-run",
     "--no-capture",
+    "--nocapture",
     "--no-input-handler",
     "--no-output-indent",
     "--hide-progress-bar",
@@ -1250,6 +1253,19 @@ mod tests {
             args_for_listing(&args),
             vec!["--keep1", "--keep2"],
         );
+    }
+
+    #[test]
+    fn args_for_listing_drops_run_only_aliases() {
+        // nextest accepts `--nocapture` (alias of `--no-capture`), `--ff`
+        // (`--fail-fast`), and `--nff` (`--no-fail-fast`) for libtest muscle
+        // memory; `cargo nextest list` rejects each the same as its canonical
+        // form, so all three must be dropped.
+        let args: Vec<String> = ["--nocapture", "--ff", "--keep", "--nff"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(args_for_listing(&args), vec!["--keep"]);
     }
 
     #[test]
