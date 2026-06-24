@@ -52,4 +52,4 @@ cargo affected collect --diff
 
 ## Workspace support
 
-For workspace projects, `find_project_root()` uses `cargo metadata` to determine the workspace root. The workspace root is used for git operations and the DB. `cargo test --no-run --message-format=json` naturally lists binaries from all member crates.
+For workspace projects, `find_project_root()` uses `cargo metadata` to determine the workspace root. The workspace root is used for git operations and the DB. `cargo nextest list --message-format json` naturally enumerates tests from all member crates.
