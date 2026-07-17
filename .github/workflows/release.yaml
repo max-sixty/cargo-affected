@@ -8,6 +8,13 @@ on:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
+# Least privilege: the job only checks out the repo (contents: read) and
+# publishes to crates.io with CARGO_REGISTRY_TOKEN — it never uses the
+# GITHUB_TOKEN for writes. Pin the token scope so a repo-default of
+# read/write doesn't leak into this tag-triggered job.
+permissions:
+  contents: read
+
 jobs:
   publish-cargo:
     runs-on: ubuntu-24.04
