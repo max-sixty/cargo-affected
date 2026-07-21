@@ -2,10 +2,12 @@
 //! data, so it can't be range-matched. The selection layer is supposed to
 //! list it via nextest and tag it `(new)` in the verbose output.
 //!
-//! Two failure modes are guarded here. A perpetually-`#[ignore]`d test is
-//! always listed but never collected, so it must not read as "new" forever.
-//! And the listing must build with the same cargo features as the run, or a
-//! feature-gated new test is invisible to detection.
+//! Several failure modes are guarded here. A perpetually-`#[ignore]`d test is
+//! always listed but never collected, so it must not read as "new" forever. A
+//! test that becomes `#[ignore]`d after collection keeps its coverage rows, so
+//! it must be dropped from the `affected` selection too — a separate path from
+//! new-test detection. And the listing must build with the same cargo features
+//! as the run, or a feature-gated new test is invisible to detection.
 
 use std::path::Path;
 
