@@ -1,6 +1,6 @@
 [package]
 name = "cargo-affected"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.94"
 description = "Run only the tests affected by git changes, using LLVM coverage."
