@@ -148,16 +148,18 @@ fn write_fixture(dir: &Path) {
             // A branch and a loop per function so each one contributes several
             // coverage regions, as real code does.
             body.push_str(&format!(
-                "pub fn f{f}(x: i64) -> i64 {{\n\
-                 \x20   if x > {f} {{\n\
-                 \x20       return x - {f};\n\
-                 \x20   }}\n\
-                 \x20   let mut t = 0;\n\
-                 \x20   for i in 0..(x % 4) {{\n\
-                 \x20       t += i * {};\n\
-                 \x20   }}\n\
-                 \x20   t\n\
-                 }}\n\n",
+                r#"pub fn f{f}(x: i64) -> i64 {{
+    if x > {f} {{
+        return x - {f};
+    }}
+    let mut t = 0;
+    for i in 0..(x % 4) {{
+        t += i * {};
+    }}
+    t
+}}
+
+"#,
                 f + 1,
             ));
         }
@@ -178,7 +180,9 @@ fn write_fixture(dir: &Path) {
             let m = (t * MODULES_PER_TEST + k) % MODULES;
             tests.push_str(&format!("    t += crate::m{m}::all({});\n", t as i64 % 7));
         }
-        tests.push_str("    assert!(t >= 0 || t < 0);\n}\n\n");
+        // The sum is never asserted on — the test exists to touch functions,
+        // and black_box keeps the calls from being optimised away.
+        tests.push_str("    std::hint::black_box(t);\n}\n\n");
     }
     write_if_changed(&src.join("tests.rs"), &tests);
 }
