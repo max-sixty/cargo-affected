@@ -15,6 +15,13 @@ authors = ["Maximilian Roos <m@maxroos.com>"]
 name = "cargo-affected"
 path = "src/main.rs"
 
+# `test = false` keeps `cargo test` — the project's gate — from running a
+# benchmark that builds and collects a whole generated crate.
+[[bench]]
+name = "collect"
+harness = false
+test = false
+
 [dependencies]
 anyhow = "1"
 camino = { version = "1", features = ["serde1"] }

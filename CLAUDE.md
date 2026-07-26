@@ -7,10 +7,17 @@ Like pytest-testmon for Rust. Uses LLVM coverage to map each test to the source-
 ```sh
 cargo clippy --all-targets   # lint
 cargo test                   # unit + functional integration tests
+cargo bench --bench collect  # wall-clock benchmark for `collect`
 ```
 
 Requires `rustup component add llvm-tools` and `cargo-nextest` — both used by
 the functional test suite.
+
+`benches/collect.rs` generates a deliberately *wide* crate (20,000 functions,
+120 tests) under `target/affected-bench/` and times `collect` over it, because
+collect's per-test cost scales with the binary's coverage-map size rather than
+with the test. A benchmark on a small crate measures nothing. It reports the
+fastest of several serial runs; see the file's module docs for why.
 
 ## Architecture
 
