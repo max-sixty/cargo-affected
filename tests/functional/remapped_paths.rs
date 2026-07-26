@@ -28,11 +28,21 @@ fn remapped_source_paths_fail_the_collect() {
     write_two_module_project(dir, "sample_remapped_paths");
     init_git_with_initial_commit(dir);
 
-    // rustc matches the prefix against the path it records, which is the
-    // canonical one — on macOS a temp dir reached via `/var` is recorded under
-    // `/private/var`, and an uncanonicalized prefix would simply not match.
+    // rustc matches the prefix against the path it records, and which form
+    // that is depends on the platform: macOS records a temp dir reached via
+    // `/var` under `/private/var`, so the raw path misses, while Windows
+    // records the plain path cargo was handed, so the canonical form — which
+    // `std::fs::canonicalize` returns as a `\\?\`-prefixed verbatim path —
+    // misses instead. Offer both; rustc applies whichever matches. (Neither
+    // may contain whitespace, since cargo splits RUSTFLAGS on it. Temp
+    // directories don't.)
     let canonical = dir.canonicalize().unwrap();
-    let remap = format!("--remap-path-prefix={}=/elsewhere", canonical.display());
+    let canonical = canonical.to_string_lossy();
+    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    let remap = format!(
+        "--remap-path-prefix={}=/elsewhere --remap-path-prefix={canonical}=/elsewhere",
+        dir.display(),
+    );
     let collect = cargo_affected_with_env(
         dir,
         &["affected", "collect"],
