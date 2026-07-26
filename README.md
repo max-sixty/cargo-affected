@@ -69,11 +69,14 @@ nextest run`: always at least as safe.
 `collect`:
 
 1. `cargo nextest list` enumerates every test.
-2. `cargo nextest run` runs them with `-C instrument-coverage` and a
+2. `llvm-cov export` reads each test binary's coverage map once — where every
+   instrumented function lives in the source. That doesn't vary per test, and
+   it's the expensive part.
+3. `cargo nextest run` runs the tests with `-C instrument-coverage` and a
    per-test `LLVM_PROFILE_FILE`.
-3. For each test, `llvm-profdata` merges its profraw and `llvm-cov export`
-   lists every hit function with its source-line regions.
-4. Per `(test, file, function)`, the min/max line span is stored in
+4. For each test, `llvm-profdata` merges its profraw into the list of
+   functions it executed, and those are looked up in the map from step 2.
+5. Per `(test, file, function)`, the min/max line span is stored in
    `target/affected/coverage.db` (SQLite), keyed by a fingerprint of
    `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
    `CARGO_BUILD_TARGET`. The git HEAD sha is recorded alongside.

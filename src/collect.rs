@@ -31,17 +31,21 @@
 //!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
 //! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
 //!    git error surfaces before we spend time on coverage parsing.
-//! 5. **Inside the runner shim**: each test's shim (`cargo-affected
+//! 5. Export each participating binary's coverage map **once**, with
+//!    `llvm-cov export` against an empty profile, and leave it under
+//!    `CARGO_AFFECTED_MAPPINGS_DIR`. This is the expensive half of extraction
+//!    and it doesn't vary per test — see [`write_function_maps`].
+//! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
-//!    profraw with `llvm-profdata`, exports with `llvm-cov`, parses hit
-//!    ranges, writes a small per-test result file under
+//!    profraw to text with `llvm-profdata`, joins the functions it names
+//!    against the binary's map, writes a small per-test result file under
 //!    `CARGO_AFFECTED_RESULTS_DIR`, and **deletes the per-test profraw dir
 //!    before exiting**. Extraction runs in the process that ran the test, so
 //!    peak disk usage is bounded by nextest's own concurrency
 //!    (O(test-threads × per-test bundle) instead of O(whole-suite)) with no
 //!    external watcher or completion heuristic — the completion signal is the
 //!    test process exiting. See [`crate::shim`].
-//! 6. After nextest exits, read the per-test result files and store mappings
+//! 7. After nextest exits, read the per-test result files and store mappings
 //!    + collect_sha in the DB keyed by (binary_id, test_name).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,7 +55,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
-use crate::coverage::HitRange;
+use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{
@@ -147,13 +151,15 @@ pub fn collect(
         }
     }
 
-    // Profraw bundles and the per-test result files the shim writes both live
-    // under target/affected/ alongside the DB, each PID-suffixed so concurrent
-    // `collect` invocations don't wipe each other's staging.
+    // Profraw bundles, the per-binary coverage maps and the per-test result
+    // files the shim writes all live under target/affected/ alongside the DB,
+    // each PID-suffixed so concurrent `collect` invocations don't wipe each
+    // other's staging.
     let pid = std::process::id();
     let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
     let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
-    for dir in [&profraw_dir, &results_dir] {
+    let mappings_dir = affected_dir(project_root).join(format!("{MAPPINGS_DIR_PREFIX}{pid}"));
+    for dir in [&profraw_dir, &results_dir, &mappings_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
                 .with_context(|| format!("failed to clean {}", dir.display()))?;
@@ -251,6 +257,14 @@ pub fn collect(
         None
     };
 
+    // Resolve the binary half of extraction before any test runs. Only the
+    // binaries this run will actually touch need a map — a `--diff` collect
+    // rerunning three tests shouldn't pay to export a whole workspace.
+    let mapped = binaries_for_run(&listing, diff_plan.as_ref());
+    let s = if mapped.len() == 1 { "y" } else { "ies" };
+    eprintln!("exporting coverage maps for {} binar{s}...", mapped.len());
+    write_function_maps(&mappings_dir, &mapped, &llvm_profdata, &llvm_cov, &canonical_root)?;
+
     // Build (or cache-hit) and run, with the runner shim wired up so each
     // test writes to its own per-test profraw directory.
     //
@@ -276,14 +290,13 @@ pub fn collect(
         .arg("--no-tests=warn")
         .env("RUSTFLAGS", &rustflags)
         // The runner shim extracts each test's coverage in-process and writes
-        // a result file; it needs the staging locations, the LLVM tools, and
-        // the canonical root (for path-relative range filtering). Names are
-        // shared constants so the setter here can't drift from the reader.
+        // a result file; it needs the staging locations, llvm-profdata, and
+        // the coverage maps exported above. Names are shared constants so the
+        // setter here can't drift from the reader.
         .env(shim::ENV_PROFRAW_BASE, &profraw_dir)
         .env(shim::ENV_RESULTS_DIR, &results_dir)
         .env(shim::ENV_LLVM_PROFDATA, &llvm_profdata)
-        .env(shim::ENV_LLVM_COV, &llvm_cov)
-        .env(shim::ENV_CANONICAL_ROOT, &canonical_root)
+        .env(shim::ENV_MAPPINGS_DIR, &mappings_dir)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -318,7 +331,7 @@ pub fn collect(
             nextest_exit,
             &results_dir,
         )?;
-        remove_staging_dirs(&profraw_dir, &results_dir)?;
+        remove_staging_dirs(&[&profraw_dir, &results_dir, &mappings_dir])?;
         return Ok(exit);
     }
 
@@ -421,7 +434,7 @@ pub fn collect(
         region_count,
         total_elapsed.as_secs_f64(),
     );
-    remove_staging_dirs(&profraw_dir, &results_dir)?;
+    remove_staging_dirs(&[&profraw_dir, &results_dir, &mappings_dir])?;
     Ok(nextest_exit)
 }
 
@@ -430,14 +443,128 @@ pub fn collect(
 /// success-path teardown, and the `clean` sweep so the three can't drift.
 const PROFRAW_DIR_PREFIX: &str = "profraw-";
 const RESULTS_DIR_PREFIX: &str = "results-";
+const MAPPINGS_DIR_PREFIX: &str = "mappings-";
 
-/// Drop the per-collect profraw and results staging directories. The shim has
-/// already removed each per-test profraw bundle as it finished; what remains
-/// here is the bookkeeping shell — empty per-binary parent dirs and the small
-/// result files we just consumed. Only called from the success paths — failed
-/// collects keep whatever's still on disk for debugging.
-fn remove_staging_dirs(profraw_dir: &Path, results_dir: &Path) -> Result<()> {
-    for dir in [profraw_dir, results_dir] {
+/// All of them, for the sweeps that don't care which is which. Adding a
+/// staging dir means adding it here, or `clean` silently stops reclaiming it.
+const STAGING_DIR_PREFIXES: &[&str] = &[
+    PROFRAW_DIR_PREFIX,
+    RESULTS_DIR_PREFIX,
+    MAPPINGS_DIR_PREFIX,
+];
+
+/// The binaries whose tests this run will execute, and so the ones needing a
+/// coverage map.
+///
+/// Both branches key off testcases rather than binaries, which also excludes
+/// the testless ones nextest lists anyway — a lib target holding only
+/// constants compiles to a test binary with no instrumented code at all, and
+/// `llvm-cov export` rejects a binary with no coverage map.
+///
+/// A full collect runs every listed test. A `--diff` collect runs only the
+/// selected ones, whose selection can include "phantoms" (tests still in the
+/// DB but gone from the listing) with no binary left to export.
+///
+/// A user filter in the post-`--` passthrough can narrow the run further, and
+/// isn't accounted for here — nextest owns filterset evaluation. The cost of
+/// over-answering is one export per unused binary, bounded by the binary count
+/// rather than the test count.
+fn binaries_for_run<'a>(listing: &'a Listing, diff_plan: Option<&DiffPlan>) -> Vec<&'a BinaryEntry> {
+    let wanted: BTreeSet<&str> = match diff_plan {
+        Some(plan) => plan
+            .selected
+            .iter()
+            .filter(|test| plan.listed.contains(test))
+            .map(|test| test.binary_id.as_str())
+            .collect(),
+        None => listing.tests.iter().map(|t| t.binary_id.as_str()).collect(),
+    };
+    listing
+        .binaries
+        .iter()
+        .filter(|b| wanted.contains(b.binary_id.as_str()))
+        .collect()
+}
+
+/// Export each binary's coverage map into `mappings_dir`, where the runner
+/// shim reads it back (see [`shim::map_path`] for the naming).
+///
+/// The export is run against a deliberately empty profile: `llvm-cov export`
+/// needs one, but every count it produces is discarded here. What survives is
+/// the part of its output that the profile can't change — which functions the
+/// binary contains and which source lines each occupies. That is the expensive
+/// part (34 MB of JSON for a 63,000-function test binary, most of it
+/// dependencies) and the part that is identical for every test in the binary,
+/// which is the whole reason it's hoisted out of the per-test path.
+///
+/// Failures bail rather than degrade: without a map every test in the binary
+/// would collect nothing, and a collect that stores nothing wipes the coverage
+/// it was meant to refresh.
+fn write_function_maps(
+    mappings_dir: &Path,
+    binaries: &[&BinaryEntry],
+    llvm_profdata: &Path,
+    llvm_cov: &Path,
+    canonical_root: &Path,
+) -> Result<()> {
+    // An empty text profile merges into a valid profile containing no records,
+    // which is exactly what "report every function as unexecuted" needs.
+    let proftext = mappings_dir.join("empty.proftext");
+    let profdata = mappings_dir.join("empty.profdata");
+    std::fs::write(&proftext, "").context("failed to write the empty profile")?;
+    let merge = Command::new(llvm_profdata)
+        .arg("merge")
+        .arg(&proftext)
+        .arg("-o")
+        .arg(&profdata)
+        .output()
+        .context("failed to run llvm-profdata merge")?;
+    if !merge.status.success() {
+        bail!(
+            "llvm-profdata merge failed to build an empty profile: {}",
+            String::from_utf8_lossy(&merge.stderr).trim(),
+        );
+    }
+
+    for binary in binaries {
+        // POSIX ERE — no negative lookahead, so the regex enumerates prefixes
+        // to drop. It shrinks `files[]` but leaves `functions[]` (the bulk of
+        // the JSON) intact; `coverage::build_function_map` filters
+        // authoritatively via `strip_prefix(canonical_root)`.
+        let export = Command::new(llvm_cov)
+            .arg("export")
+            .arg("--format=text")
+            .arg(format!("--instr-profile={}", profdata.display()))
+            .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
+            .arg(&binary.binary_path)
+            .output()
+            .with_context(|| {
+                format!("failed to run llvm-cov export for {}", binary.binary_id)
+            })?;
+        if !export.status.success() {
+            bail!(
+                "llvm-cov export failed for {}: {}",
+                binary.binary_id,
+                String::from_utf8_lossy(&export.stderr).trim(),
+            );
+        }
+        let json = String::from_utf8_lossy(&export.stdout);
+        let map = coverage::build_function_map(&json, canonical_root)
+            .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
+        let path = shim::map_path(mappings_dir, &binary.binary_path);
+        std::fs::write(&path, serde_json::to_vec(&map)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Drop this collect's staging directories. The shim has already removed each
+/// per-test profraw bundle as it finished; what remains here is the
+/// bookkeeping shell — empty per-binary parent dirs, the small result files we
+/// just consumed, and the coverage maps. Only called from the success paths —
+/// failed collects keep whatever's still on disk for debugging.
+fn remove_staging_dirs(dirs: &[&Path]) -> Result<()> {
+    for dir in dirs {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
                 .with_context(|| format!("failed to remove {}", dir.display()))?;
@@ -446,8 +573,7 @@ fn remove_staging_dirs(profraw_dir: &Path, results_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove every leftover `profraw-*` / `results-*` staging dir under
-/// `target/affected/`. A successful `collect` removes its own, but a crashed
+/// Remove every leftover staging dir under `target/affected/`. A successful `collect` removes its own, but a crashed
 /// or cancelled run — or a shim SIGKILL'd mid-extraction before its own
 /// cleanup — can orphan bundles (potentially the multi-GB profraw set this
 /// design exists to bound). `clean` reclaims them. Returns the count removed.
@@ -467,9 +593,7 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
             && path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| {
-                    n.starts_with(PROFRAW_DIR_PREFIX) || n.starts_with(RESULTS_DIR_PREFIX)
-                });
+                .is_some_and(|n| STAGING_DIR_PREFIXES.iter().any(|p| n.starts_with(p)));
         if is_staging {
             std::fs::remove_dir_all(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
@@ -894,13 +1018,13 @@ pub(crate) struct Listing {
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
-/// One binary in nextest's listing. Carried for the suite-level count
-/// surfaced in collect's progress output; the runner shim sources binary_id
+/// One binary in nextest's listing. `binary_path` is where its coverage map
+/// comes from and what names the map file; the runner shim sources binary_id
 /// directly from `NEXTEST_BINARY_ID` at test time.
 #[derive(Debug, Clone)]
 pub(crate) struct BinaryEntry {
-    #[allow(dead_code)]
     pub(crate) binary_id: String,
+    pub(crate) binary_path: PathBuf,
 }
 
 /// Enumerate all tests via `cargo nextest list --message-format json`.
@@ -974,8 +1098,13 @@ pub(crate) fn nextest_list(
                 .and_then(|v| v.as_str())
                 .context("nextest list entry missing binary-id")?
                 .to_string();
+            let binary_path = suite
+                .get("binary-path")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing binary-path")?;
             binaries.push(BinaryEntry {
                 binary_id: binary_id.clone(),
+                binary_path: PathBuf::from(binary_path),
             });
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
@@ -1406,8 +1535,8 @@ mod tests {
         assert_eq!(got[0].test_name, "t_ok");
     }
 
-    /// `clean` removes leftover `profraw-*`/`results-*` staging dirs but leaves
-    /// everything else under target/affected/ (the DB, the build dir) alone.
+    /// `clean` removes every leftover staging dir but leaves everything else
+    /// under target/affected/ (the DB, the build dir) alone.
     #[test]
     fn clean_staging_dirs_removes_only_staging() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1415,13 +1544,15 @@ mod tests {
         let affected = root.join("target").join("affected");
         std::fs::create_dir_all(affected.join("profraw-123")).unwrap();
         std::fs::create_dir_all(affected.join("results-456")).unwrap();
+        std::fs::create_dir_all(affected.join("mappings-789")).unwrap();
         std::fs::create_dir_all(affected.join("build")).unwrap();
         std::fs::write(affected.join("coverage.db"), b"db").unwrap();
 
         let removed = clean_staging_dirs(root).unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(!affected.join("profraw-123").exists());
         assert!(!affected.join("results-456").exists());
+        assert!(!affected.join("mappings-789").exists());
         assert!(affected.join("build").exists(), "build dir preserved");
         assert!(affected.join("coverage.db").exists(), "DB preserved");
     }
