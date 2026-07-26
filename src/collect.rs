@@ -1267,6 +1267,70 @@ fn current_target() -> String {
 mod tests {
     use super::*;
 
+    fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
+        Listing {
+            tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
+            ignored: BTreeSet::new(),
+            binaries: binaries
+                .iter()
+                .map(|(id, path)| BinaryEntry {
+                    binary_id: id.to_string(),
+                    binary_path: PathBuf::from(path),
+                })
+                .collect(),
+        }
+    }
+
+    /// A full collect maps every binary that has a test to run — and only
+    /// those. A lib target holding no tests compiles to a binary with no
+    /// coverage map at all, which `llvm-cov export` rejects outright.
+    #[test]
+    fn binaries_for_run_skips_testless_binaries() {
+        let listing = listing(
+            &[("sample", "deps/sample-1"), ("sample::golden", "deps/golden-2")],
+            &[("sample::golden", "golden_matches")],
+        );
+        let mapped: Vec<&str> = binaries_for_run(&listing, None)
+            .iter()
+            .map(|b| b.binary_id.as_str())
+            .collect();
+        assert_eq!(mapped, ["sample::golden"]);
+    }
+
+    /// A `--diff` collect maps only the binaries its selection will reach —
+    /// the point of doing this per run rather than per workspace. Phantoms
+    /// (selected but no longer listed) contribute no binary.
+    #[test]
+    fn binaries_for_run_narrows_to_the_diff_selection() {
+        let listing = listing(
+            &[
+                ("crate-a", "deps/crate_a-1"),
+                ("crate-b", "deps/crate_b-2"),
+                ("crate-c", "deps/crate_c-3"),
+            ],
+            &[
+                ("crate-a", "test_one"),
+                ("crate-b", "test_two"),
+                ("crate-c", "test_three"),
+            ],
+        );
+        let plan = DiffPlan {
+            selected: [
+                TestId::new("crate-a", "test_one"),
+                // Phantom: in the DB, gone from the listing.
+                TestId::new("crate-c", "test_renamed_away"),
+            ]
+            .into_iter()
+            .collect(),
+            listed: listing.tests.iter().cloned().collect(),
+        };
+        let mapped: Vec<&str> = binaries_for_run(&listing, Some(&plan))
+            .iter()
+            .map(|b| b.binary_id.as_str())
+            .collect();
+        assert_eq!(mapped, ["crate-a"]);
+    }
+
     #[test]
     fn filter_expr_empty_matches_nothing() {
         assert_eq!(nextest_filter_expr(&[]), "none()");
