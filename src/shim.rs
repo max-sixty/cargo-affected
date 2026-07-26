@@ -17,14 +17,14 @@
 //! regains control the moment the test process exits — at which point the
 //! LLVM runtime has flushed the profile. So extraction happens right here, in
 //! the process that ran the test: merge the profraw into its text form with
-//! `llvm-profdata`, join the functions it names against the binary's coverage
-//! map, write a small per-test [`TestResult`] JSON file under
+//! `llvm-profdata`, join the functions it names against the binary's
+//! function map, write a small per-test [`TestResult`] JSON file under
 //! `CARGO_AFFECTED_RESULTS_DIR`, and delete the per-test profraw dir before
 //! exiting. `collect` reads those result files once nextest finishes.
 //!
-//! The coverage map is the half of the answer that doesn't vary per test —
+//! The function map is the half of the answer that doesn't vary per test —
 //! where each instrumented function lives in the source — so `collect` derives
-//! it once per binary and leaves it under `CARGO_AFFECTED_MAPPINGS_DIR` for
+//! it once per binary and leaves it under `CARGO_AFFECTED_FUNCTION_MAPS_DIR` for
 //! every shim to read. What the shim contributes is the other half: which
 //! functions this test reached. See [`crate::coverage`] for what the join
 //! costs in precision and what skipping it would cost in time.
@@ -70,7 +70,7 @@ use crate::coverage::{self, FunctionMap, HitRange};
 pub(crate) const ENV_PROFRAW_BASE: &str = "CARGO_AFFECTED_PROFRAW_BASE";
 pub(crate) const ENV_RESULTS_DIR: &str = "CARGO_AFFECTED_RESULTS_DIR";
 pub(crate) const ENV_LLVM_PROFDATA: &str = "CARGO_AFFECTED_LLVM_PROFDATA";
-pub(crate) const ENV_MAPPINGS_DIR: &str = "CARGO_AFFECTED_MAPPINGS_DIR";
+pub(crate) const ENV_FUNCTION_MAPS_DIR: &str = "CARGO_AFFECTED_FUNCTION_MAPS_DIR";
 
 /// Per-test coverage result the shim writes and `collect` reads back. Carries
 /// the verbatim `(binary_id, test_name)` so `collect` doesn't have to invert
@@ -83,12 +83,13 @@ pub(crate) struct TestResult {
 }
 
 /// Outcome of extracting one test's coverage. `Skipped` covers every soft
-/// failure (no profraw, no coverage map, a failed llvm-tool invocation, a
+/// failure (no profraw, no function map, a failed llvm-tool invocation, a
 /// parse error): the test simply gains no coverage this round and gets
-/// re-selected on the next `--diff`. A *systematic* failure (e.g. a present-but-unrunnable llvm tool)
-/// turns every test into `Skipped`; `collect` catches that case — zero tests
-/// collected — and bails rather than storing (and, for a full collect,
-/// wiping) coverage. See the empty-`mappings` guard in `collect`.
+/// re-selected on the next `--diff`. A *systematic* failure (e.g. a
+/// present-but-unrunnable llvm tool) turns every test into `Skipped`;
+/// `collect` catches that case — zero tests collected — and bails rather than
+/// storing (and, for a full collect, wiping) coverage. See the
+/// empty-`mappings` guard in `collect`.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum TestOutcome {
     Collected { ranges: BTreeSet<HitRange> },
@@ -166,7 +167,7 @@ fn run_test(binary: &str, rest: &[String]) -> i32 {
     }
 }
 
-/// The llvm-profdata path, the coverage maps to join against, and where to
+/// The llvm-profdata path, the function maps to join against, and where to
 /// stage output — everything `collect` hands the shim via the environment (see
 /// the `ENV_*` constants). Present together or not at all: `collect` sets every
 /// one whenever it sets [`ENV_PROFRAW_BASE`].
@@ -174,7 +175,7 @@ struct CoverageEnv {
     profraw_base: PathBuf,
     results_dir: PathBuf,
     llvm_profdata: PathBuf,
-    mappings_dir: PathBuf,
+    function_maps_dir: PathBuf,
 }
 
 impl CoverageEnv {
@@ -194,13 +195,13 @@ impl CoverageEnv {
             profraw_base: var(ENV_PROFRAW_BASE),
             results_dir: var(ENV_RESULTS_DIR),
             llvm_profdata: var(ENV_LLVM_PROFDATA),
-            mappings_dir: var(ENV_MAPPINGS_DIR),
+            function_maps_dir: var(ENV_FUNCTION_MAPS_DIR),
         }
     }
 }
 
 /// Merge the profraws in `dir` and join the functions they name against
-/// `binary`'s coverage map, returning the hit ranges or a `Skipped` reason.
+/// `binary`'s function map, returning the hit ranges or a `Skipped` reason.
 ///
 /// `--sparse` drops all-zero records, so the merged profile is already close
 /// to the set of functions the test reached; the counter values decide the
@@ -221,7 +222,7 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
-    let map = match load_function_map(&env.mappings_dir, binary) {
+    let map = match load_function_map(&env.function_maps_dir, binary) {
         Ok(map) => map,
         Err(e) => return TestOutcome::Skipped { reason: e },
     };
@@ -268,7 +269,7 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
     }
 }
 
-/// Read the coverage map `collect` wrote for `binary`.
+/// Read the function map `collect` wrote for `binary`.
 ///
 /// The file is named after the binary, whose cargo-hashed basename changes
 /// whenever its contents do. So a map built for one build of a binary is never
@@ -276,21 +277,21 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
 /// the run leaves the lookup with nothing to find, and the test is skipped
 /// rather than filed under stale line numbers. If that happens to every test,
 /// `collect` bails instead of overwriting stored coverage.
-fn load_function_map(mappings_dir: &Path, binary: &Path) -> Result<FunctionMap, String> {
-    let path = map_path(mappings_dir, binary);
+fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<FunctionMap, String> {
+    let path = map_path(function_maps_dir, binary);
     let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("reading coverage map {}: {e}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("parsing coverage map {}: {e}", path.display()))
+        .map_err(|e| format!("reading function map {}: {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("parsing function map {}: {e}", path.display()))
 }
 
-/// Where a binary's coverage map lives under the mappings directory. Shared
-/// with `collect`, which writes it, so the two can't drift.
-pub(crate) fn map_path(mappings_dir: &Path, binary: &Path) -> PathBuf {
+/// Where a binary's function map lives under the function-maps directory.
+/// Shared with `collect`, which writes it, so the two can't drift.
+pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> PathBuf {
     let name = binary
         .file_name()
         .map(|n| sanitize(&n.to_string_lossy()))
         .unwrap_or_default();
-    mappings_dir.join(format!("{name}.json"))
+    function_maps_dir.join(format!("{name}.json"))
 }
 
 /// Write the per-test result to `<results_dir>/<binary_id>/<test_name>.json`.
@@ -385,7 +386,7 @@ mod tests {
     /// A dir with no `.profraw` (test produced no profile — `#[ignore]`d at
     /// runtime, exited before the runtime flushed, etc.) yields a `Skipped`
     /// with a stable reason, never an error. This path needs no llvm tools
-    /// and no coverage map.
+    /// and no function map.
     #[test]
     fn extract_without_profraw_skips() {
         let tmp = tempfile::tempdir().unwrap();
@@ -394,7 +395,7 @@ mod tests {
             results_dir: tmp.path().to_path_buf(),
             // Never invoked — there's no profraw to merge.
             llvm_profdata: PathBuf::from("llvm-profdata"),
-            mappings_dir: tmp.path().to_path_buf(),
+            function_maps_dir: tmp.path().to_path_buf(),
         };
         let outcome = extract(tmp.path(), Path::new("test-bin"), &env);
         match outcome {
@@ -403,7 +404,7 @@ mod tests {
         }
     }
 
-    /// A profraw with no coverage map to join it against — the binary was
+    /// A profraw with no function map to join it against — the binary was
     /// rebuilt between `collect`'s listing pass and the run, so its hashed
     /// basename no longer matches any map — skips with a reason naming the
     /// file it looked for, rather than filing the test under another build's
@@ -419,7 +420,7 @@ mod tests {
             results_dir: tmp.path().to_path_buf(),
             // Never invoked — the map lookup fails first.
             llvm_profdata: PathBuf::from("llvm-profdata"),
-            mappings_dir: tmp.path().to_path_buf(),
+            function_maps_dir: tmp.path().to_path_buf(),
         };
         let outcome = extract(&profraw_dir, Path::new("deps/integration-abc123"), &env);
         match outcome {

@@ -33,7 +33,7 @@
 //!    git error surfaces before we spend time on coverage parsing.
 //! 5. Export each participating binary's coverage map **once**, with
 //!    `llvm-cov export` against an empty profile, and leave it under
-//!    `CARGO_AFFECTED_MAPPINGS_DIR`. This is the expensive half of extraction
+//!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
 //!    and it doesn't vary per test — see [`write_function_maps`].
 //! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
@@ -151,15 +151,16 @@ pub fn collect(
         }
     }
 
-    // Profraw bundles, the per-binary coverage maps and the per-test result
+    // Profraw bundles, the per-binary function maps and the per-test result
     // files the shim writes all live under target/affected/ alongside the DB,
     // each PID-suffixed so concurrent `collect` invocations don't wipe each
     // other's staging.
     let pid = std::process::id();
     let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
     let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
-    let mappings_dir = affected_dir(project_root).join(format!("{MAPPINGS_DIR_PREFIX}{pid}"));
-    for dir in [&profraw_dir, &results_dir, &mappings_dir] {
+    let function_maps_dir =
+        affected_dir(project_root).join(format!("{FUNCTION_MAPS_DIR_PREFIX}{pid}"));
+    for dir in [&profraw_dir, &results_dir, &function_maps_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
                 .with_context(|| format!("failed to clean {}", dir.display()))?;
@@ -263,7 +264,13 @@ pub fn collect(
     let mapped = binaries_for_run(&listing, diff_plan.as_ref());
     let s = if mapped.len() == 1 { "y" } else { "ies" };
     eprintln!("exporting coverage maps for {} binar{s}...", mapped.len());
-    write_function_maps(&mappings_dir, &mapped, &llvm_profdata, &llvm_cov, &canonical_root)?;
+    write_function_maps(
+        &function_maps_dir,
+        &mapped,
+        &llvm_profdata,
+        &llvm_cov,
+        &canonical_root,
+    )?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
     // test writes to its own per-test profraw directory.
@@ -291,12 +298,12 @@ pub fn collect(
         .env("RUSTFLAGS", &rustflags)
         // The runner shim extracts each test's coverage in-process and writes
         // a result file; it needs the staging locations, llvm-profdata, and
-        // the coverage maps exported above. Names are shared constants so the
+        // the function maps exported above. Names are shared constants so the
         // setter here can't drift from the reader.
         .env(shim::ENV_PROFRAW_BASE, &profraw_dir)
         .env(shim::ENV_RESULTS_DIR, &results_dir)
         .env(shim::ENV_LLVM_PROFDATA, &llvm_profdata)
-        .env(shim::ENV_MAPPINGS_DIR, &mappings_dir)
+        .env(shim::ENV_FUNCTION_MAPS_DIR, &function_maps_dir)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -331,7 +338,7 @@ pub fn collect(
             nextest_exit,
             &results_dir,
         )?;
-        remove_staging_dirs(&[&profraw_dir, &results_dir, &mappings_dir])?;
+        remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
         return Ok(exit);
     }
 
@@ -434,7 +441,7 @@ pub fn collect(
         region_count,
         total_elapsed.as_secs_f64(),
     );
-    remove_staging_dirs(&[&profraw_dir, &results_dir, &mappings_dir])?;
+    remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
     Ok(nextest_exit)
 }
 
@@ -443,14 +450,14 @@ pub fn collect(
 /// success-path teardown, and the `clean` sweep so the three can't drift.
 const PROFRAW_DIR_PREFIX: &str = "profraw-";
 const RESULTS_DIR_PREFIX: &str = "results-";
-const MAPPINGS_DIR_PREFIX: &str = "mappings-";
+const FUNCTION_MAPS_DIR_PREFIX: &str = "function-maps-";
 
 /// All of them, for the sweeps that don't care which is which. Adding a
 /// staging dir means adding it here, or `clean` silently stops reclaiming it.
 const STAGING_DIR_PREFIXES: &[&str] = &[
     PROFRAW_DIR_PREFIX,
     RESULTS_DIR_PREFIX,
-    MAPPINGS_DIR_PREFIX,
+    FUNCTION_MAPS_DIR_PREFIX,
 ];
 
 /// The binaries whose tests this run will execute, and so the ones needing a
@@ -486,8 +493,8 @@ fn binaries_for_run<'a>(listing: &'a Listing, diff_plan: Option<&DiffPlan>) -> V
         .collect()
 }
 
-/// Export each binary's coverage map into `mappings_dir`, where the runner
-/// shim reads it back (see [`shim::map_path`] for the naming).
+/// Export each binary's function map into `function_maps_dir`, where the
+/// runner shim reads it back (see [`shim::map_path`] for the naming).
 ///
 /// The export is run against a deliberately empty profile: `llvm-cov export`
 /// needs one, but every count it produces is discarded here. What survives is
@@ -501,7 +508,7 @@ fn binaries_for_run<'a>(listing: &'a Listing, diff_plan: Option<&DiffPlan>) -> V
 /// would collect nothing, and a collect that stores nothing wipes the coverage
 /// it was meant to refresh.
 fn write_function_maps(
-    mappings_dir: &Path,
+    function_maps_dir: &Path,
     binaries: &[&BinaryEntry],
     llvm_profdata: &Path,
     llvm_cov: &Path,
@@ -509,8 +516,8 @@ fn write_function_maps(
 ) -> Result<()> {
     // An empty text profile merges into a valid profile containing no records,
     // which is exactly what "report every function as unexecuted" needs.
-    let proftext = mappings_dir.join("empty.proftext");
-    let profdata = mappings_dir.join("empty.profdata");
+    let proftext = function_maps_dir.join("empty.proftext");
+    let profdata = function_maps_dir.join("empty.profdata");
     std::fs::write(&proftext, "").context("failed to write the empty profile")?;
     let merge = Command::new(llvm_profdata)
         .arg("merge")
@@ -551,7 +558,7 @@ fn write_function_maps(
         let json = String::from_utf8_lossy(&export.stdout);
         let map = coverage::build_function_map(&json, canonical_root)
             .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
-        let path = shim::map_path(mappings_dir, &binary.binary_path);
+        let path = shim::map_path(function_maps_dir, &binary.binary_path);
         std::fs::write(&path, serde_json::to_vec(&map)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
@@ -561,7 +568,7 @@ fn write_function_maps(
 /// Drop this collect's staging directories. The shim has already removed each
 /// per-test profraw bundle as it finished; what remains here is the
 /// bookkeeping shell — empty per-binary parent dirs, the small result files we
-/// just consumed, and the coverage maps. Only called from the success paths —
+/// just consumed, and the function maps. Only called from the success paths —
 /// failed collects keep whatever's still on disk for debugging.
 fn remove_staging_dirs(dirs: &[&Path]) -> Result<()> {
     for dir in dirs {
@@ -573,10 +580,11 @@ fn remove_staging_dirs(dirs: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// Remove every leftover staging dir under `target/affected/`. A successful `collect` removes its own, but a crashed
-/// or cancelled run — or a shim SIGKILL'd mid-extraction before its own
-/// cleanup — can orphan bundles (potentially the multi-GB profraw set this
-/// design exists to bound). `clean` reclaims them. Returns the count removed.
+/// Remove every leftover staging dir under `target/affected/`. A successful
+/// `collect` removes its own, but a crashed or cancelled run — or a shim
+/// SIGKILL'd mid-extraction before its own cleanup — can orphan bundles
+/// (potentially the multi-GB profraw set this design exists to bound).
+/// `clean` reclaims them. Returns the count removed.
 ///
 /// Only invoked from `clean` (an explicit, destructive user command), never at
 /// collect startup: the PID suffix lets concurrent collects coexist, and a
@@ -1608,7 +1616,7 @@ mod tests {
         let affected = root.join("target").join("affected");
         std::fs::create_dir_all(affected.join("profraw-123")).unwrap();
         std::fs::create_dir_all(affected.join("results-456")).unwrap();
-        std::fs::create_dir_all(affected.join("mappings-789")).unwrap();
+        std::fs::create_dir_all(affected.join("function-maps-789")).unwrap();
         std::fs::create_dir_all(affected.join("build")).unwrap();
         std::fs::write(affected.join("coverage.db"), b"db").unwrap();
 
@@ -1616,7 +1624,7 @@ mod tests {
         assert_eq!(removed, 3);
         assert!(!affected.join("profraw-123").exists());
         assert!(!affected.join("results-456").exists());
-        assert!(!affected.join("mappings-789").exists());
+        assert!(!affected.join("function-maps-789").exists());
         assert!(affected.join("build").exists(), "build dir preserved");
         assert!(affected.join("coverage.db").exists(), "DB preserved");
     }

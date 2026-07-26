@@ -76,7 +76,7 @@ fn collect_leaves_no_profraw_outside_target() {
 /// A successful collect must drop every per-PID staging dir under
 /// `target/affected/`: `profraw-*/` (the per-test profile bundles, ~10+ GB on
 /// a real workspace), `results-*/` (the per-test result files the shim writes)
-/// and `mappings-*/` (the per-binary coverage maps it reads). Each shim
+/// and `function-maps-*/` (the per-binary function maps it reads). Each shim
 /// deletes its own profraw bundle as it finishes; `collect` sweeps the empty
 /// shells, the consumed result files and the maps at the end.
 #[test]
@@ -105,7 +105,7 @@ fn collect_removes_staging_dirs_on_success() {
                         .is_some_and(|n| {
                             n.starts_with("profraw-")
                                 || n.starts_with("results-")
-                                || n.starts_with("mappings-")
+                                || n.starts_with("function-maps-")
                         })
                 })
                 .collect()
