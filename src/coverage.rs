@@ -157,8 +157,66 @@ impl HitRange {
 /// more only when macro expansion pulls a function's regions across files.
 /// Functions outside the project root (stdlib, dependencies) are absent
 /// entirely, which is what keeps the map two orders of magnitude smaller than
-/// the export it comes from.
+/// the export it comes from. That absence is the normal case, not an error:
+/// most of what a test executes is dependency code.
 pub type FunctionMap = BTreeMap<String, Vec<HitRange>>;
+
+/// A binary's identity at the moment its [`FunctionMap`] was exported.
+///
+/// The filename cannot serve: cargo's `-C extra-filename` hash is derived from
+/// the unit's *metadata* — package id, profile, features, rustc version,
+/// RUSTFLAGS, target — not from its contents. Edit a source file, rebuild, and
+/// the test binary keeps the same name while every line number in it may have
+/// moved. A map keyed only by filename would therefore be reapplied to a
+/// different build without anything noticing, and the ranges would be filed
+/// against the wrong lines: silent *under*-selection, the one failure this
+/// tool can't detect downstream.
+///
+/// Length plus modification time distinguishes builds at the cost of one
+/// `stat`. It is not a content hash — hashing a 67 MB binary per test would
+/// cost more than the extraction it guards — so it detects a rebuild rather
+/// than proving byte equality. That is the right granularity: cargo rewrites
+/// the file on every relink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinaryStamp {
+    len: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+}
+
+impl BinaryStamp {
+    /// Stat `binary` and record what identifies this build of it.
+    ///
+    /// An unreadable or timestamp-less binary is an error rather than a
+    /// stamp that compares equal to everything.
+    pub fn of(binary: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(binary)
+            .with_context(|| format!("failed to stat {}", binary.display()))?;
+        let modified = meta
+            .modified()
+            .with_context(|| format!("no modification time for {}", binary.display()))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .with_context(|| format!("modification time of {} predates 1970", binary.display()))?;
+        Ok(Self {
+            len: meta.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+        })
+    }
+}
+
+/// One binary's function map as it travels from `collect` to the runner shim:
+/// the map itself, plus the stamp of the binary it describes.
+///
+/// The shim re-stamps the binary it was handed and refuses a map that doesn't
+/// match, so a rebuild between `collect`'s listing pass and the run surfaces
+/// as a skipped test rather than as coverage filed against stale lines. See
+/// [`BinaryStamp`] for why the filename can't carry that guarantee.
+#[derive(Serialize, Deserialize)]
+pub struct BinaryFunctionMap {
+    pub binary: BinaryStamp,
+    pub functions: FunctionMap,
+}
 
 /// Convert a relative source path into a `Utf8PathBuf` whose string form uses
 /// forward slashes on every platform.
@@ -236,15 +294,22 @@ pub fn build_function_map(json: &str, canonical_root: &Path) -> Result<FunctionM
 /// Names of the functions a test executed, read from the text form of its
 /// merged profile (`llvm-profdata merge --text`).
 ///
-/// The format is a flat token stream — function name, hash, counter count,
-/// then that many counter values — with `#`-prefixed labels, blank separators
-/// and leading `:`-prefixed file flags carrying no data. A function counts as
+/// The grammar covers exactly the record shape `-C instrument-coverage`
+/// produces: a flat token stream of function name, hash, counter count, then
+/// that many counter values, with `#`-prefixed labels, blank separators and
+/// leading `:`-prefixed file flags carrying no data. A function counts as
 /// executed when any of its counters is non-zero.
 ///
-/// Parsing is strict: a record whose fields don't come out as numbers is an
-/// error rather than a skipped function. A silently short parse would hand the
-/// test fewer ranges than it earned, and *under*-selection is the one failure
-/// this tool can't detect downstream.
+/// LLVM's writer has two other per-record sections this doesn't model — MC/DC
+/// bitmaps (`$`-prefixed) and value-profile data — neither of which coverage
+/// instrumentation emits on stable. If one ever appears the token stream
+/// desyncs, and the error names it rather than blaming the next function's
+/// name.
+///
+/// Parsing is strict throughout: a record whose fields don't come out as
+/// numbers is an error rather than a skipped function. A silently short parse
+/// would hand the test fewer ranges than it earned, and *under*-selection is
+/// the one failure this tool can't detect downstream.
 pub fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
     let mut tokens = proftext
         .lines()
@@ -264,6 +329,13 @@ pub fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
                 .parse()
                 .with_context(|| format!("profile record {name} has a non-numeric {field}"))
         };
+        if let Some(marker) = name.strip_prefix('$') {
+            bail!(
+                "profile carries an MC/DC bitmap section (`${marker}`), which \
+                 this parser doesn't model; coverage instrumentation alone \
+                 doesn't emit one"
+            );
+        }
         let _hash = number(&mut tokens, "hash")?;
         let counters = number(&mut tokens, "counter count")?;
         let mut hit = false;
@@ -280,21 +352,40 @@ pub fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
     Ok(executed)
 }
 
-/// Join a test's executed functions against its binary's [`FunctionMap`].
+/// Join a test's executed functions against its binary's [`FunctionMap`],
+/// refusing a join that matched nothing.
 ///
-/// Names absent from the map are the ones outside the project root — the bulk
-/// of any real profile, since dependencies are instrumented too.
-pub fn hit_ranges<'a>(
-    executed: impl IntoIterator<Item = &'a str>,
-    map: &FunctionMap,
-) -> BTreeSet<HitRange> {
+/// Individual misses are the normal case and carry no signal: most of what any
+/// test executes is dependency code, which the map deliberately omits. *Every*
+/// name missing is a different statement — a test always executes at least its
+/// own body, which is project source and so is in the map. So an all-miss join
+/// means the two sides don't describe the same binary: a symbol-name form we
+/// don't recognise, a project root that isn't a prefix of the recorded paths,
+/// a profile from somewhere else.
+///
+/// The check lives here rather than at the call site because the empty set is
+/// a plausible-looking value: returned as a successful result it becomes a
+/// test with no ranges, `collect` folds in that test's crate-root sentinels,
+/// the row count looks healthy, and the stored coverage quietly degrades to
+/// "only crate-root edits select anything" — under-selection across the whole
+/// binary, from a collect that exited 0.
+pub fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
     let mut ranges = BTreeSet::new();
     for name in executed {
-        if let Some(function) = map.get(name) {
+        if let Some(function) = map.get(*name) {
             ranges.extend(function.iter().cloned());
         }
     }
-    ranges
+    if ranges.is_empty() {
+        bail!(
+            "none of the {} functions this test executed appear among the {} \
+             in its binary's function map — the profile and the map don't \
+             describe the same binary",
+            executed.len(),
+            map.len(),
+        );
+    }
+    Ok(ranges)
 }
 
 #[cfg(test)]
@@ -404,8 +495,54 @@ mod tests {
             function_json("id$i32", &[&lib], "[1, 0, 5, 0, 0, 0, 0, 0]"),
         ]);
         let map = build_function_map(&json, &canon).unwrap();
-        let ranges = hit_ranges(["id$u8", "id$i32"], &map);
+        let ranges = hit_ranges(&["id$u8", "id$i32"], &map).unwrap();
         assert_eq!(ranges.len(), 1);
+    }
+
+    /// A name the map doesn't carry is ordinary — dependencies are
+    /// instrumented too, and the map holds only project functions — so a join
+    /// that matched *something* keeps going.
+    #[test]
+    fn unmatched_names_are_not_an_error() {
+        let map: FunctionMap = [(
+            "mine".to_string(),
+            vec![HitRange {
+                file: Utf8PathBuf::from("src/lib.rs"),
+                line_start: 1,
+                line_end: 4,
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let ranges = hit_ranges(&["serde::de", "mine", "regex::exec"], &map).unwrap();
+        assert_eq!(ranges.len(), 1);
+    }
+
+    /// *Every* name missing is the failure this tool cannot afford to record
+    /// as success: a test always executes its own body, so an all-miss join
+    /// means the profile and the map describe different binaries. Returned as
+    /// an empty-but-successful set it would reach the DB as a test with only
+    /// crate-root sentinels, and every edit outside a crate root would then
+    /// select nothing.
+    #[test]
+    fn a_join_that_matches_nothing_is_an_error() {
+        let map: FunctionMap = [(
+            "mine".to_string(),
+            vec![HitRange {
+                file: Utf8PathBuf::from("src/lib.rs"),
+                line_start: 1,
+                line_end: 4,
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let err = hit_ranges(&["serde::de", "regex::exec"], &map).unwrap_err();
+        assert!(
+            err.to_string().contains("don't describe the same binary"),
+            "unexpected error: {err:#}",
+        );
+        // An empty map is the same failure seen from the other side.
+        assert!(hit_ranges(&["mine"], &FunctionMap::new()).is_err());
     }
 
     /// The `--text` profile shape llvm-profdata emits: labelled sections, one
@@ -473,6 +610,30 @@ _RNvC5probe12never_called
     #[test]
     fn empty_profile_is_an_error() {
         assert!(executed_functions("").is_err());
+    }
+
+    /// The stamp exists because the filename can't do this job: cargo's hash
+    /// suffix tracks build metadata, so a rebuilt binary keeps its name while
+    /// its line numbers move. Rewriting a file at the same path must therefore
+    /// produce a different stamp.
+    #[test]
+    fn a_rewritten_binary_gets_a_different_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("integration-abc123");
+        std::fs::write(&binary, b"first build").unwrap();
+        let before = BinaryStamp::of(&binary).unwrap();
+        assert_eq!(before, BinaryStamp::of(&binary).unwrap(), "stable when untouched");
+
+        std::fs::write(&binary, b"second build, a different length").unwrap();
+        assert_ne!(before, BinaryStamp::of(&binary).unwrap());
+    }
+
+    /// A binary that isn't there can't be stamped — an error, never a stamp
+    /// that would compare equal to some other missing binary's.
+    #[test]
+    fn stamping_a_missing_binary_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(BinaryStamp::of(&tmp.path().join("nope")).is_err());
     }
 
     #[test]

@@ -2,10 +2,12 @@
 //!
 //! Delegates build and test execution to `cargo nextest run`. We insert a
 //! small runner shim (`cargo-affected runner-shim`) via
-//! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at
-//! a per-test subdirectory before `exec`ing the real test binary. After
-//! nextest finishes we walk those subdirectories, merge profraws, export
-//! coverage, and write per-(test, file) line ranges to SQLite.
+//! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at a
+//! per-test subdirectory, runs the real test binary, and turns its profile
+//! into line ranges on the spot. Each binary's function map — the expensive,
+//! test-invariant half of that translation — is exported once, before the run.
+//! After nextest finishes we read the per-test results back and write
+//! per-(test, file) line ranges to SQLite.
 //!
 //! We use the `--config` array form rather than the
 //! `CARGO_TARGET_<TRIPLE>_RUNNER` env var because cargo only
@@ -504,9 +506,16 @@ fn binaries_for_run<'a>(listing: &'a Listing, diff_plan: Option<&DiffPlan>) -> V
 /// dependencies) and the part that is identical for every test in the binary,
 /// which is the whole reason it's hoisted out of the per-test path.
 ///
-/// Failures bail rather than degrade: without a map every test in the binary
-/// would collect nothing, and a collect that stores nothing wipes the coverage
-/// it was meant to refresh.
+/// Each map is stamped with the binary it came from, so the shim can tell a
+/// map apart from one built for an earlier build of the same file — cargo's
+/// hash suffix can't, being metadata-derived. See [`coverage::BinaryStamp`].
+///
+/// Failures bail rather than degrade, including a map that comes back empty:
+/// a binary running tests always has instrumented project code, so no
+/// functions under the project root means the paths didn't line up
+/// (`--remap-path-prefix`, a root that isn't a prefix of the sources) and
+/// every test in that binary would silently collect nothing but crate-root
+/// sentinels. Better to say so before running the suite than after.
 fn write_function_maps(
     function_maps_dir: &Path,
     binaries: &[&BinaryEntry],
@@ -556,11 +565,37 @@ fn write_function_maps(
             );
         }
         let json = String::from_utf8_lossy(&export.stdout);
-        let map = coverage::build_function_map(&json, canonical_root)
+        let functions = coverage::build_function_map(&json, canonical_root)
             .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
-        let path = shim::map_path(function_maps_dir, &binary.binary_path);
+        if functions.is_empty() {
+            bail!(
+                "{} has no instrumented functions under {} — every test in it \
+                 would collect nothing. Check that the project root is a \
+                 prefix of the paths the compiler recorded (a \
+                 --remap-path-prefix in RUSTFLAGS is the usual cause).",
+                binary.binary_id,
+                canonical_root.display(),
+            );
+        }
+        let map = coverage::BinaryFunctionMap {
+            binary: coverage::BinaryStamp::of(&binary.binary_path)?,
+            functions,
+        };
+        let path = shim::map_path(function_maps_dir, &binary.binary_path).with_context(|| {
+            format!(
+                "{} has no file name to key its map by",
+                binary.binary_path.display(),
+            )
+        })?;
         std::fs::write(&path, serde_json::to_vec(&map)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
+    // Leave the directory holding nothing but maps, so anything that later
+    // walks it doesn't have to know about the scaffolding.
+    for scratch in [&proftext, &profdata] {
+        std::fs::remove_file(scratch)
+            .with_context(|| format!("failed to remove {}", scratch.display()))?;
     }
     Ok(())
 }

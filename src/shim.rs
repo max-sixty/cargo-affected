@@ -42,9 +42,10 @@
 //! launched and tells us directly. Same answer for `[lib]`/`[[bin]]` pairs
 //! that normalize to the same compiled basename — no marker probe needed.
 //!
-//! Drift still matters for the *map*, which is keyed on the binary's hashed
-//! basename precisely so a shifted hash reads as a missing map rather than as
-//! a stale one. See [`load_function_map`].
+//! The *map* needs more than the id, because cargo's hash suffix tracks build
+//! metadata rather than contents — a rebuilt binary keeps its name. Each map
+//! therefore carries a stamp of the binary it was exported from, and the shim
+//! checks it. See [`load_function_map`].
 //!
 //! Storage layout under `CARGO_AFFECTED_PROFRAW_BASE` (and, mirrored, under
 //! `CARGO_AFFECTED_RESULTS_DIR`) is two levels:
@@ -58,9 +59,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::coverage::{self, FunctionMap, HitRange};
+use crate::coverage::{self, BinaryFunctionMap, BinaryStamp, HitRange};
 
 /// Environment-variable contract between `collect` (which sets all of these on
 /// the `cargo nextest run` command) and the shim (which reads them). Shared
@@ -259,39 +261,63 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
             }
         }
     };
-    match coverage::executed_functions(&proftext) {
-        Ok(executed) => TestOutcome::Collected {
-            ranges: coverage::hit_ranges(executed, &map),
-        },
+    let executed = match coverage::executed_functions(&proftext) {
+        Ok(executed) => executed,
+        Err(e) => {
+            return TestOutcome::Skipped {
+                reason: format!("parse error: {e:#}"),
+            }
+        }
+    };
+
+    match coverage::hit_ranges(&executed, &map.functions)
+        .with_context(|| format!("joining against {}", binary.display()))
+    {
+        Ok(ranges) => TestOutcome::Collected { ranges },
         Err(e) => TestOutcome::Skipped {
-            reason: format!("parse error: {e:#}"),
+            reason: format!("{e:#}"),
         },
     }
 }
 
-/// Read the function map `collect` wrote for `binary`.
+/// Read the function map `collect` wrote for `binary`, and check it describes
+/// the binary we were actually handed.
 ///
-/// The file is named after the binary, whose cargo-hashed basename changes
-/// whenever its contents do. So a map built for one build of a binary is never
-/// silently applied to another: a rebuild between `collect`'s listing pass and
-/// the run leaves the lookup with nothing to find, and the test is skipped
-/// rather than filed under stale line numbers. If that happens to every test,
-/// `collect` bails instead of overwriting stored coverage.
-fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<FunctionMap, String> {
-    let path = map_path(function_maps_dir, binary);
+/// The filename can't carry that check on its own: cargo's hash suffix is
+/// derived from build metadata, not from the binary's contents, so a rebuild
+/// between `collect`'s listing pass and the run produces the *same* name over
+/// different line numbers. The stamp inside the file is what distinguishes
+/// them ([`coverage::BinaryStamp`]). A mismatch skips the test rather than
+/// filing it under stale lines; if it happens to every test, `collect` bails
+/// instead of overwriting stored coverage.
+fn load_function_map(
+    function_maps_dir: &Path,
+    binary: &Path,
+) -> Result<BinaryFunctionMap, String> {
+    let path = map_path(function_maps_dir, binary)
+        .ok_or_else(|| format!("{} has no file name to look a map up by", binary.display()))?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("reading function map {}: {e}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("parsing function map {}: {e}", path.display()))
+    let map: BinaryFunctionMap = serde_json::from_str(&raw)
+        .map_err(|e| format!("parsing function map {}: {e}", path.display()))?;
+    let stamp = BinaryStamp::of(binary).map_err(|e| format!("{e:#}"))?;
+    if stamp != map.binary {
+        return Err(format!(
+            "{} was rebuilt after its function map was exported; the map \
+             describes a different build and its line numbers no longer apply",
+            binary.display(),
+        ));
+    }
+    Ok(map)
 }
 
 /// Where a binary's function map lives under the function-maps directory.
-/// Shared with `collect`, which writes it, so the two can't drift.
-pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> PathBuf {
-    let name = binary
-        .file_name()
-        .map(|n| sanitize(&n.to_string_lossy()))
-        .unwrap_or_default();
-    function_maps_dir.join(format!("{name}.json"))
+/// Shared with `collect`, which writes it, so the two can't drift. `None` for
+/// a path with no file name — impossible for a binary nextest ran, and
+/// refused rather than quietly turned into a shared default name.
+pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBuf> {
+    let name = sanitize(&binary.file_name()?.to_string_lossy());
+    Some(function_maps_dir.join(format!("{name}.json")))
 }
 
 /// Write the per-test result to `<results_dir>/<binary_id>/<test_name>.json`.
@@ -404,42 +430,80 @@ mod tests {
         }
     }
 
-    /// A profraw with no function map to join it against — the binary was
-    /// rebuilt between `collect`'s listing pass and the run, so its hashed
-    /// basename no longer matches any map — skips with a reason naming the
-    /// file it looked for, rather than filing the test under another build's
-    /// line numbers.
-    #[test]
-    fn extract_without_coverage_map_skips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let profraw_dir = tmp.path().join("profraw");
+    /// Build a scratch binary file, a profraw beside it, and the shim env
+    /// pointing at both. Returns `(env, profraw_dir, binary)`.
+    fn extract_fixture(tmp: &Path) -> (CoverageEnv, PathBuf, PathBuf) {
+        let profraw_dir = tmp.join("profraw");
         std::fs::create_dir_all(&profraw_dir).unwrap();
         std::fs::write(profraw_dir.join("a.profraw"), b"").unwrap();
+        let binary = tmp.join("integration-abc123");
+        std::fs::write(&binary, b"not really a binary").unwrap();
         let env = CoverageEnv {
-            profraw_base: tmp.path().to_path_buf(),
-            results_dir: tmp.path().to_path_buf(),
-            // Never invoked — the map lookup fails first.
+            profraw_base: tmp.to_path_buf(),
+            results_dir: tmp.to_path_buf(),
+            // Never invoked — every case here fails at the map lookup first.
             llvm_profdata: PathBuf::from("llvm-profdata"),
-            function_maps_dir: tmp.path().to_path_buf(),
+            function_maps_dir: tmp.to_path_buf(),
         };
-        let outcome = extract(&profraw_dir, Path::new("deps/integration-abc123"), &env);
+        (env, profraw_dir, binary)
+    }
+
+    fn skip_reason(outcome: TestOutcome) -> String {
         match outcome {
-            TestOutcome::Skipped { reason } => assert!(
-                reason.contains("integration-abc123.json"),
-                "reason should name the missing map: {reason}",
-            ),
+            TestOutcome::Skipped { reason } => reason,
             TestOutcome::Collected { .. } => panic!("expected Skipped, got Collected"),
         }
     }
 
-    /// The map file is named after the binary, so cargo's content hash in the
-    /// basename is what stops one build's map being applied to another.
+    /// A profraw with no function map to join it against skips with a reason
+    /// naming the file it looked for.
+    #[test]
+    fn extract_without_function_map_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (env, profraw_dir, binary) = extract_fixture(tmp.path());
+        let reason = skip_reason(extract(&profraw_dir, &binary, &env));
+        assert!(
+            reason.contains("integration-abc123.json"),
+            "reason should name the missing map: {reason}",
+        );
+    }
+
+    /// The map that matters: a binary rebuilt after its map was exported keeps
+    /// its cargo-hashed name — the hash tracks build metadata, not contents —
+    /// so the *stamp* is what catches it. Without this the shim would file the
+    /// test's coverage against the previous build's line numbers, which no
+    /// later step could detect.
+    #[test]
+    fn extract_with_a_map_for_another_build_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (env, profraw_dir, binary) = extract_fixture(tmp.path());
+
+        let map = coverage::BinaryFunctionMap {
+            binary: coverage::BinaryStamp::of(&binary).unwrap(),
+            functions: [("f".to_string(), Vec::new())].into_iter().collect(),
+        };
+        let path = map_path(&env.function_maps_dir, &binary).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&map).unwrap()).unwrap();
+
+        // Same name, different build.
+        std::fs::write(&binary, b"a longer pretend binary than before").unwrap();
+
+        let reason = skip_reason(extract(&profraw_dir, &binary, &env));
+        assert!(
+            reason.contains("rebuilt after its function map was exported"),
+            "reason should name the stale map: {reason}",
+        );
+    }
+
+    /// A binary path with no file name has no map to look up, and gets an
+    /// error rather than a default name every such binary would share.
     #[test]
     fn map_path_is_named_for_the_binary() {
         assert_eq!(
             map_path(Path::new("/tmp/maps"), Path::new("/t/debug/deps/integration-9f2a")),
-            Path::new("/tmp/maps/integration-9f2a.json"),
+            Some(PathBuf::from("/tmp/maps/integration-9f2a.json")),
         );
+        assert_eq!(map_path(Path::new("/tmp/maps"), Path::new("..")), None);
     }
 
     /// `write_result` round-trips through the same JSON `collect` reads back,

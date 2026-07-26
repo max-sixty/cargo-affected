@@ -34,6 +34,7 @@ mod lib_bin_collision;
 mod narrowing;
 mod new_test;
 mod no_profraw_leak;
+mod remapped_paths;
 mod run;
 mod structural;
 mod workspace;
@@ -55,11 +56,19 @@ use std::process::{Command, Output};
 /// (it's normally invoked as `cargo affected …`, where cargo passes the verb
 /// as argv[1]).
 pub fn cargo_affected(dir: &Path, args: &[&str]) -> Output {
+    cargo_affected_with_env(dir, args, &[])
+}
+
+/// [`cargo_affected`] with extra environment variables — for scenarios that
+/// need to influence the build cargo-affected runs, e.g. via `RUSTFLAGS`.
+pub fn cargo_affected_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let bin = env!("CARGO_BIN_EXE_cargo-affected");
-    Command::new(bin)
-        .args(args)
-        .current_dir(dir)
-        .output()
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(dir);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output()
         .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
 }
 

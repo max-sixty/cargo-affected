@@ -6,22 +6,30 @@
 //!
 //! ## What it measures, and why the fixture is shaped the way it is
 //!
-//! Collect's per-test cost is dominated by the coverage extraction the runner
-//! shim performs for every test, and that cost scales with the *binary's*
-//! coverage-map size — the number of instrumented functions — not with what
-//! the test actually touched. A test that runs in 50 ms still pays for a tool
-//! invocation that walks every function in the binary. The test count then
-//! multiplies it.
+//! Collect spends its time turning each test's profile into source ranges, and
+//! the thing that has historically made that expensive is the *binary's*
+//! coverage-map size — the number of instrumented functions — rather than
+//! anything about the test. Work proportional to the whole binary, repeated
+//! per test, is the shape this benchmark exists to catch: it multiplies two
+//! dimensions that a small crate has neither of.
 //!
 //! So the fixture is deliberately wide rather than deep: [`MODULES`] ×
 //! [`FUNCTIONS_PER_MODULE`] trivial functions produce a coverage map of
 //! realistic size, while [`TESTS`] tests each touch only
-//! [`MODULES_PER_TEST`] modules' worth of them. A benchmark on a small crate
-//! shows nothing at all here, because the whole cost is proportional to a
-//! dimension a small crate doesn't have.
+//! [`MODULES_PER_TEST`] modules' worth of them.
 //!
 //! Real numbers for calibration: worktrunk's `integration` test binary carries
 //! 63,021 functions, of which a typical test hits ~2,000 (3%).
+//!
+//! ## Fixed vs marginal
+//!
+//! Not all of a collect scales with the test count: `cargo nextest list`, the
+//! per-binary function-map export and cargo's own freshness check happen once
+//! however many tests run. Dividing the total by [`TESTS`] would fold that in
+//! and report a per-test cost that falls as `TESTS` rises with nothing else
+//! changing. So the fixed part is measured directly — a collect whose filter
+//! matches no test at all — and reported separately from the marginal cost the
+//! change is actually about.
 //!
 //! ## Method
 //!
@@ -30,10 +38,10 @@
 //! rewritten only when its content changes, so cargo's build cache survives
 //! between runs.
 //!
-//! `collect` runs twice: once to warm cargo's cache and once timed. The warm-up
-//! is a full collect rather than a cheaper `cargo build` so it primes exactly
-//! the artifacts the timed run consumes — replicating collect's RUSTFLAGS and
-//! `--target-dir` here would duplicate a contract that lives in `collect.rs`.
+//! The first `collect` is an untimed warm-up. It's a full collect rather than
+//! a cheaper `cargo build` so it primes exactly the artifacts the timed runs
+//! consume — replicating collect's RUSTFLAGS and `--target-dir` here would
+//! duplicate a contract that lives in `collect.rs`.
 //!
 //! The timed runs are serial (`--test-threads=1`). Extraction happens inside
 //! the runner shim, so nextest's concurrency divides it away — a parallel run
@@ -42,9 +50,9 @@
 //! the per-test cost itself: comparable across machines, and the figure that
 //! extrapolates to a two-core CI runner.
 //!
-//! [`SAMPLES`] runs are timed and the **minimum** is reported. Contention only
-//! ever adds time, so the minimum is the estimator least polluted by whatever
-//! else the machine is doing; every sample is printed so a spread between them
+//! Each figure is the **minimum** of [`SAMPLES`] runs. Contention only ever
+//! adds time, so the minimum is the estimator least polluted by whatever else
+//! the machine is doing; every sample is printed so a spread between them
 //! shows the measurement was taken under load and should be repeated.
 
 use std::path::{Path, PathBuf};
@@ -78,20 +86,33 @@ fn main() {
     let warm = collect(&fixture, &[]);
     println!("warm-up:       {warm:.1}s (parallel, primes the build cache)");
 
-    let mut samples = Vec::new();
-    for _ in 0..SAMPLES {
-        samples.push(collect(&fixture, &["--", "--test-threads=1"]));
-    }
-    let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);
-    let all = samples
+    // `none()` matches no test, so this run pays everything a collect pays
+    // except the per-test work: the listing, the function-map export, the
+    // freshness check. `--no-tests=warn` keeps it a success.
+    let (fixed, fixed_spread) = best_of(&fixture, &["--", "--test-threads=1", "-E", "none()"]);
+    println!("fixed:         {fixed:.1}s list + map export, no tests — samples: {fixed_spread}");
+
+    let (total, total_spread) = best_of(&fixture, &["--", "--test-threads=1"]);
+    println!("collect:       {total:.1}s serial — samples: {total_spread}");
+    println!(
+        "per test:      {:.0} ms marginal, {:.0} ms amortized",
+        (total - fixed) * 1000.0 / TESTS as f64,
+        total * 1000.0 / TESTS as f64,
+    );
+}
+
+/// Time [`SAMPLES`] collects; return the fastest and every sample formatted,
+/// so a spread between them shows the machine was busy and the run should be
+/// repeated.
+fn best_of(dir: &Path, extra: &[&str]) -> (f64, String) {
+    let samples: Vec<f64> = (0..SAMPLES).map(|_| collect(dir, extra)).collect();
+    let spread = samples
         .iter()
         .map(|s| format!("{s:.1}"))
         .collect::<Vec<_>>()
         .join(", ");
-    println!(
-        "collect:       {best:.1}s serial ({:.0} ms/test) — samples: {all}",
-        best * 1000.0 / TESTS as f64,
-    );
+    let best = samples.into_iter().fold(f64::INFINITY, f64::min);
+    (best, spread)
 }
 
 /// Run `cargo affected collect` in `dir`, returning wall-clock seconds. Its
@@ -171,6 +192,22 @@ fn write_fixture(dir: &Path) {
         }
         body.push_str("    t\n}\n");
         write_if_changed(&src.join(format!("m{m}.rs")), &body);
+    }
+
+    // A smaller MODULES than last run would otherwise leave orphaned m*.rs
+    // files in the fixture's git repo forever.
+    for entry in std::fs::read_dir(&src).expect("failed to read fixture src dir") {
+        let path = entry.expect("failed to read fixture src entry").path();
+        let orphan = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix('m'))
+            .and_then(|n| n.parse::<usize>().ok())
+            .is_some_and(|m| m >= MODULES);
+        if orphan {
+            std::fs::remove_file(&path)
+                .unwrap_or_else(|e| panic!("failed to remove {}: {e}", path.display()));
+        }
     }
 
     let mut tests = String::from("#![cfg(test)]\n\n");
