@@ -466,7 +466,8 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
 
 /// Per-file changed line ranges between `collect_sha` and the working tree.
 ///
-/// Runs `git diff -U0 --no-color --no-ext-diff <collect_sha>` and parses
+/// Runs `git diff -U0 --no-color --no-ext-diff --no-renames <collect_sha>`
+/// (plus prefix and quotePath settings — see the invocation) and parses
 /// `@@ -A,B +C,D @@` headers. Returns OLD-side line ranges (i.e. line
 /// numbers in the `collect_sha` snapshot, which is what `test_regions`
 /// stores). Pure insertions (`@@ -A,0 +C,D @@`) collapse to the single line
@@ -486,9 +487,11 @@ pub fn git_changed_line_ranges(
     // them, `git diff <commit>` against the working tree uses `c/` and `w/`
     // and our parser would skip every `--- ` line. `core.quotePath=false`
     // stops git from octal-escaping non-ASCII path bytes into a C-quoted
-    // string our parser can't read; paths git still quotes (embedded quotes
-    // or control characters) stay unparsed, which loses nothing — see
-    // `parse_unified_diff` on undecodable paths.
+    // string our parser can't read. Paths git still quotes (embedded quotes,
+    // backslashes, control characters) stay unparsed and their ranges are
+    // dropped — accepted, since such names essentially never reach rustc,
+    // and config-rule matching still sees them verbatim via
+    // `git_changed_files`' `-z`.
     let output = Command::new("git")
         .args([
             "-c",
@@ -570,12 +573,13 @@ fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
                 Some(b'+') => rem_new -= 1,
                 // `\ No newline at end of file` — annotation, not content.
                 Some(b'\\') => {}
-                // Context line — counts against both sides. `-U0` emits
-                // none, but the format allows them.
-                _ => {
-                    rem_old -= 1;
-                    rem_new -= 1;
-                }
+                // `-U0` emits no context lines, so anything else means the
+                // budgets are out of sync with the stream; guessing would
+                // corrupt them silently.
+                _ => bail!(
+                    "unexpected line in git diff hunk content: {}",
+                    String::from_utf8_lossy(line)
+                ),
             }
             continue;
         }
@@ -591,8 +595,13 @@ fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
             // The function-name context after the closing `@@` is file
             // content and can be non-UTF-8; lossy decode keeps the ASCII
             // numeric part intact.
-            let Some(hunk) = parse_hunk_header(&String::from_utf8_lossy(line)) else {
-                continue;
+            let text = String::from_utf8_lossy(line);
+            let Some(hunk) = parse_hunk_header(&text) else {
+                // Content lines are consumed by the budgets above, so an
+                // unparseable `@@ ` line here is a corrupt header — and
+                // without its counts the following content would be
+                // header-matched.
+                bail!("malformed hunk header in git diff output: {text}");
             };
             // Set the budgets even when the hunk's ranges are skipped, so
             // its content lines are still consumed above.
@@ -970,6 +979,21 @@ mod tests {
         );
         assert_eq!(map.len(), 1, "undecodable path should be skipped");
         Ok(())
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_corrupt_input() {
+        // A malformed hunk header has no counts to budget with, so the
+        // parser can't safely skip past its content.
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ garbage @@\n-x\n+y\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("malformed hunk header"), "{err}");
+
+        // A hunk content line without a -/+/\ prefix means the budgets are
+        // out of sync with the stream.
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n-x\nzz\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("unexpected line"), "{err}");
     }
 
     #[test]
