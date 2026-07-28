@@ -51,9 +51,9 @@ use crate::coverage::to_db_relative;
 
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LineRange {
-    pub start: i64,
-    pub end: i64,
+pub(crate) struct LineRange {
+    pub(crate) start: i64,
+    pub(crate) end: i64,
 }
 
 /// How a stored sha relates to the current `HEAD`.
@@ -73,24 +73,24 @@ pub struct LineRange {
 /// or beyond a shallow clone boundary). The diff has no anchor and the cache
 /// is unusable; tests anchored at this sha rerun as new.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShaRelation {
+pub(crate) enum ShaRelation {
     Equal,
     Reachable { commits_ahead: u32 },
     Missing,
 }
 
 /// Project root information.
-pub struct ProjectRoot {
+pub(crate) struct ProjectRoot {
     /// Workspace root directory. Git operations and the DB live here.
     /// For single-crate projects this equals the crate root.
-    pub workspace_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
     /// All Cargo.toml files belonging to the workspace — the root manifest
     /// plus every member's manifest. Sorted, deduplicated. Used for
     /// environment fingerprinting.
-    pub manifest_paths: Vec<PathBuf>,
+    pub(crate) manifest_paths: Vec<PathBuf>,
     /// Raw `cargo metadata --no-deps` JSON. Parsed once at root detection so
     /// less-common lookups (test src paths) don't have to re-spawn cargo.
-    pub metadata: serde_json::Value,
+    pub(crate) metadata: serde_json::Value,
 }
 
 /// `Path::canonicalize` adapted for cross-platform path-prefix arithmetic.
@@ -106,7 +106,7 @@ pub struct ProjectRoot {
 /// or llvm-cov's path forms — `strip_prefix` against the canonicalized
 /// root drops every match. Cargo's own tooling doesn't canonicalize, so
 /// the cargo-given path matches itself fine without help.
-pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
     #[cfg(windows)]
     {
         Ok(path.to_path_buf())
@@ -122,7 +122,7 @@ pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
 ///
 /// Uses `cargo metadata --no-deps --format-version=1` to reliably determine
 /// the workspace root, which handles both single-crate and workspace projects.
-pub fn find_project_root() -> Result<ProjectRoot> {
+pub(crate) fn find_project_root() -> Result<ProjectRoot> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version=1"])
         .output()
@@ -193,7 +193,7 @@ impl ProjectRoot {
     /// `TestId.binary_id` from `cargo nextest list` is exact.
     ///
     /// Reads from the cached `metadata` JSON — no cargo spawn.
-    pub fn crate_root_sentinels_by_binary_id(
+    pub(crate) fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
         // No canonicalize: `workspace_root` and `target.src_path` both come
@@ -406,7 +406,7 @@ fn transitive_closure<'a>(
 /// Returns paths relative to the project root. A non-zero git exit (corrupt
 /// repo, missing object, permissions) is a hard error: silently returning "no
 /// changed files" would look like a clean tree and select zero tests.
-pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
+pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for args in [
         vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
@@ -448,7 +448,7 @@ pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
 /// structural-edit backstop hides some of the damage but only when a hunk
 /// overlaps no stored range; point edits within a function silently
 /// mis-select.
-pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
+pub(crate) fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
     // `--porcelain=v1 -z` emits one NUL-terminated entry per changed path
     // (renames split into two entries; we only care about emptiness).
     // Untracked files are reported by default; ignored files are not. That's
@@ -462,7 +462,7 @@ pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
 /// Capture the current git HEAD sha. Hard error if HEAD is unreachable —
 /// detached/initial-commit repos can't anchor function-level coverage and
 /// silently using "" would later fail with a confusing diff error.
-pub fn git_head_sha(project_root: &Path) -> Result<String> {
+pub(crate) fn git_head_sha(project_root: &Path) -> Result<String> {
     let lines = run_git(project_root, &["rev-parse", "HEAD"])?;
     let sha = lines
         .into_iter()
@@ -484,7 +484,7 @@ pub fn git_head_sha(project_root: &Path) -> Result<String> {
 /// orphans, the PR-vs-main-tip shape) is still `Reachable`: `git diff <sha>
 /// HEAD` resolves the trees fine, and stored coverage ranges live in `sha`'s
 /// coordinate system, which matches the diff's OLD side either way.
-pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
+pub(crate) fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
     let head = git_head_sha(project_root)?;
     if head == sha {
         return Ok(ShaRelation::Equal);
@@ -528,7 +528,7 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
 ///
 /// Errors are loud — git failure (bad sha, corrupt repo, etc.) is propagated
 /// rather than silently emitting an empty map.
-pub fn git_changed_line_ranges(
+pub(crate) fn git_changed_line_ranges(
     project_root: &Path,
     collect_sha: &str,
 ) -> Result<BTreeMap<String, Vec<LineRange>>> {
@@ -579,7 +579,7 @@ pub fn git_changed_line_ranges(
 /// additions, the diagnostic report needs this dedicated query to know
 /// the file existed in the diff at all. Returns paths relative to the
 /// project root.
-pub fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
+pub(crate) fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
     let mut out = run_git(
         project_root,
         &[

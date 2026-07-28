@@ -28,22 +28,22 @@ use crate::project::ProjectRoot;
 
 /// Composite fingerprint plus the per-component hashes that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fingerprint {
+pub(crate) struct Fingerprint {
     /// Composite SHA-256 hex digest. The cache-scoping value used in the DB.
-    pub hex: String,
+    pub(crate) hex: String,
     /// Per-component hashes in the same order they were folded into `hex`.
     /// Used to answer "which input changed?" on a fingerprint mismatch.
-    pub components: Vec<FingerprintComponent>,
+    pub(crate) components: Vec<FingerprintComponent>,
 }
 
 /// A single named input contributing to the composite fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FingerprintComponent {
+pub(crate) struct FingerprintComponent {
     /// Stable label (`cargo_lock`, `manifest:Cargo.toml`, `rustc`,
     /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
-    pub label: String,
+    pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
-    pub hash: String,
+    pub(crate) hash: String,
 }
 
 /// Compute the composite fingerprint and per-component hashes of the build
@@ -56,7 +56,7 @@ pub struct FingerprintComponent {
 /// Inputs are read once into memory; the composite digest and per-component
 /// digests are computed from the same byte buffers. A file changing on disk
 /// after the read still produces a self-consistent `Fingerprint`.
-pub fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
+pub(crate) fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
     let inputs = collect_inputs(project)?;
 
     let mut hasher = Sha256::new();

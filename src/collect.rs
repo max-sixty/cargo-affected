@@ -74,7 +74,7 @@ use crate::shim::{self, TestOutcome, TestResult};
 /// new HEAD. Other tests' rows stay put. Errors out if there's no prior
 /// collect for the current environment, or if any stored sha is no longer
 /// reachable from HEAD.
-pub fn collect(
+pub(crate) fn collect(
     diff: bool,
     verbose: bool,
     allow_dirty: bool,

@@ -103,7 +103,7 @@ pub(crate) enum TestOutcome {
 ///
 /// Never returns — runs the test binary, extracts its coverage, and exits with
 /// the test's exit code.
-pub fn run(args: &[String]) -> ! {
+pub(crate) fn run(args: &[String]) -> ! {
     let Some((binary, rest)) = args.split_first() else {
         eprintln!("cargo-affected runner-shim: missing test binary argument");
         std::process::exit(2);
@@ -373,7 +373,7 @@ fn list_profraw_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// per-test [`TestResult`] carries the verbatim values, so name collisions
 /// inside one binary_id are the only risk, and they don't occur with real Rust
 /// test names (no two tests in the same binary share a sanitized form).
-pub fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {

@@ -33,7 +33,7 @@ use crate::selection::{self, DiagnosticDetail};
 /// therefore matters here as much as it does for `run`: it decides which
 /// tests get built, and a dry run listing a feature-less build would
 /// under-report against a `run -- --features …`.
-pub fn status(
+pub(crate) fn status(
     verbose: bool,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,

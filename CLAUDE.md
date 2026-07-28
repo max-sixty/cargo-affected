@@ -45,6 +45,9 @@ missing dependencies and double the surface area we have to reason about.
 If a required tool isn't installed, error out with an install hint and let the
 user fix it.
 
+Items are `pub(crate)`, never `pub` — nothing here is a library, so `pub` would
+claim an external contract that doesn't exist.
+
 ## Manual testing
 
 ```sh

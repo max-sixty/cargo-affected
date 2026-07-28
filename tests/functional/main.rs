@@ -55,13 +55,13 @@ use std::process::{Command, Output};
 /// expects the redundant `affected` subcommand even when invoked directly
 /// (it's normally invoked as `cargo affected …`, where cargo passes the verb
 /// as argv[1]).
-pub fn cargo_affected(dir: &Path, args: &[&str]) -> Output {
+pub(crate) fn cargo_affected(dir: &Path, args: &[&str]) -> Output {
     cargo_affected_with_env(dir, args, &[])
 }
 
 /// [`cargo_affected`] with extra environment variables — for scenarios that
 /// need to influence the build cargo-affected runs, e.g. via `RUSTFLAGS`.
-pub fn cargo_affected_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+pub(crate) fn cargo_affected_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let bin = env!("CARGO_BIN_EXE_cargo-affected");
     let mut cmd = Command::new(bin);
     cmd.args(args).current_dir(dir);
@@ -73,7 +73,7 @@ pub fn cargo_affected_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) 
 }
 
 /// Run a git command in `dir`, panicking on failure.
-pub fn git(dir: &Path, args: &[&str]) {
+pub(crate) fn git(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -91,7 +91,7 @@ pub fn git(dir: &Path, args: &[&str]) {
 /// single `String` for substring assertions. Stderr first matches every
 /// existing call site — selection summaries and notices land on stderr while
 /// nextest's PASS/FAIL lines land on stdout, and tests grep both.
-pub fn combined_output(out: &Output) -> String {
+pub(crate) fn combined_output(out: &Output) -> String {
     format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -100,7 +100,7 @@ pub fn combined_output(out: &Output) -> String {
 }
 
 /// Capture `git rev-parse HEAD` in `dir` as a 40-char sha.
-pub fn git_head(dir: &Path) -> String {
+pub(crate) fn git_head(dir: &Path) -> String {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
@@ -112,7 +112,7 @@ pub fn git_head(dir: &Path) -> String {
 
 /// Replace exactly `from` with `to` in a file. Panics if `from` is absent so
 /// a sample-project rename can't silently no-op.
-pub fn replace_in_file(path: &Path, from: &str, to: &str) {
+pub(crate) fn replace_in_file(path: &Path, from: &str, to: &str) {
     let content = std::fs::read_to_string(path).unwrap();
     assert!(
         content.contains(from),
@@ -132,7 +132,7 @@ pub fn replace_in_file(path: &Path, from: &str, to: &str) {
 /// host that signs by default fails every commit here, because the signing key
 /// belongs to the developer, not to the `test@example.com` identity we just
 /// set.
-pub fn init_git_with_initial_commit(dir: &Path) {
+pub(crate) fn init_git_with_initial_commit(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main"]);
     git(dir, &["config", "user.email", "test@example.com"]);
     git(dir, &["config", "user.name", "Test"]);
@@ -151,7 +151,7 @@ pub fn init_git_with_initial_commit(dir: &Path) {
 ///
 /// `crate_name` should be unique per scenario (see header note on package
 /// names).
-pub fn write_two_module_project(dir: &Path, crate_name: &str) {
+pub(crate) fn write_two_module_project(dir: &Path, crate_name: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
         format!(

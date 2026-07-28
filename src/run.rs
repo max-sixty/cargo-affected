@@ -44,7 +44,7 @@ use crate::selection::{self, DiagnosticDetail};
 /// every stored `collect_sha` unreachable from HEAD. Partial divergence
 /// (some shas reachable, some not) proceeds with the reachable subset and
 /// surfaces stranded tests as "stranded".
-pub fn run(
+pub(crate) fn run(
     all: bool,
     verbose: bool,
     report_json: Option<&Path>,

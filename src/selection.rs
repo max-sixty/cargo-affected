@@ -97,7 +97,7 @@ impl Selection {
 /// dominated by `Full`'s per-test reason vectors, so the default is
 /// bounded; `Full` is opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum DiagnosticDetail {
+pub(crate) enum DiagnosticDetail {
     /// Per-file/per-kind aggregate counters only.
     Summary,
     /// Per-test reason vectors plus the per-file aggregates.
