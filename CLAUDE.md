@@ -11,7 +11,10 @@ cargo bench --bench collect  # wall-clock benchmark for `collect`
 ```
 
 Requires `rustup component add llvm-tools` and `cargo-nextest` — both used by
-the functional test suite.
+the functional test suite. Scenario conventions (unique package names, scratch-repo
+git config, assertion style, the two under-selection tripwires): `tests/CLAUDE.md`.
+
+`pre-commit run --all-files` runs the same fmt/clippy/typos gates CI does.
 
 `benches/collect.rs` generates a deliberately *wide* crate (20,000 functions,
 120 tests) under `target/affected-bench/` and times `collect` over it, because
