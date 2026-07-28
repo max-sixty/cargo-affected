@@ -20,12 +20,9 @@ touches via LLVM coverage, then reruns only the tests whose ranges overlap
 
 ## Installation
 
-Not on crates.io yet. Install from source:
-
 ```sh
-git clone https://github.com/max-sixty/cargo-affected
-cd cargo-affected
-cargo install --path .
+cargo install cargo-affected
+cargo install cargo-nextest --locked
 rustup component add llvm-tools
 ```
 
