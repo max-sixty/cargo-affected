@@ -462,7 +462,11 @@ pub fn summary_line(
         CacheStatus::MissNoReachableSha => {
             format!("cargo-affected: cache={status} mode=full-suite missing_shas={missing_shas}")
         }
-        _ => format!("cargo-affected: cache={status} mode=full-suite"),
+        // Named rather than `_`: these three share a rendering today, and a
+        // new status should have to say whether it joins them.
+        CacheStatus::MissFingerprint | CacheStatus::MissNoCoverage | CacheStatus::ForcedAll => {
+            format!("cargo-affected: cache={status} mode=full-suite")
+        }
     }
 }
 
