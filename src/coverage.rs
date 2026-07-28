@@ -69,23 +69,23 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
-pub struct CoverageExport {
-    pub data: Vec<CoverageData>,
+pub(crate) struct CoverageExport {
+    pub(crate) data: Vec<CoverageData>,
 }
 
 #[derive(Deserialize)]
-pub struct CoverageData {
+pub(crate) struct CoverageData {
     #[serde(default)]
-    pub functions: Vec<CoverageFunction>,
+    pub(crate) functions: Vec<CoverageFunction>,
 }
 
 #[derive(Deserialize)]
-pub struct CoverageFunction {
-    pub name: String,
+pub(crate) struct CoverageFunction {
+    pub(crate) name: String,
     #[serde(default)]
-    pub filenames: Vec<String>,
+    pub(crate) filenames: Vec<String>,
     #[serde(default)]
-    pub regions: Vec<CoverageRegion>,
+    pub(crate) regions: Vec<CoverageRegion>,
 }
 
 /// Sentinel `line_end` value marking a row as a "crate-root sentinel" — a
@@ -94,7 +94,7 @@ pub struct CoverageFunction {
 /// (e.g., `mod foo;` or `use ...;` in a crate root). Detection at query
 /// time relies on exact-value equality, so all sentinel-creators must use
 /// this constant via [`HitRange::sentinel`].
-pub const CRATE_ROOT_SENTINEL_END: i64 = i64::MAX;
+pub(crate) const CRATE_ROOT_SENTINEL_END: i64 = i64::MAX;
 
 /// A region tuple as emitted by `llvm-cov export`. Only the source extent and
 /// the file it belongs to are used; the columns, the execution count (always
@@ -102,10 +102,10 @@ pub const CRATE_ROOT_SENTINEL_END: i64 = i64::MAX;
 /// fields (`expanded_file_id`, `kind`, optional extras for newer LLVM) are
 /// accepted but ignored.
 #[derive(Debug)]
-pub struct CoverageRegion {
-    pub line_start: i64,
-    pub line_end: i64,
-    pub file_id: usize,
+pub(crate) struct CoverageRegion {
+    pub(crate) line_start: i64,
+    pub(crate) line_end: i64,
+    pub(crate) file_id: usize,
 }
 
 impl<'de> Deserialize<'de> for CoverageRegion {
@@ -130,10 +130,10 @@ impl<'de> Deserialize<'de> for CoverageRegion {
 /// hit regions in `file`. Sources are stored relative to the project root so
 /// they line up with `git diff` output.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct HitRange {
-    pub file: Utf8PathBuf,
-    pub line_start: i64,
-    pub line_end: i64,
+pub(crate) struct HitRange {
+    pub(crate) file: Utf8PathBuf,
+    pub(crate) line_start: i64,
+    pub(crate) line_end: i64,
 }
 
 impl HitRange {
@@ -141,7 +141,7 @@ impl HitRange {
     /// [`CRATE_ROOT_SENTINEL_END`]. Stored alongside real function ranges
     /// to model an implicit "any hunk in this file selects this test" link
     /// the function-level coverage can't observe directly.
-    pub fn sentinel(file: Utf8PathBuf) -> Self {
+    pub(crate) fn sentinel(file: Utf8PathBuf) -> Self {
         Self {
             file,
             line_start: 1,
@@ -159,7 +159,7 @@ impl HitRange {
 /// entirely, which is what keeps the map two orders of magnitude smaller than
 /// the export it comes from. That absence is the normal case, not an error:
 /// most of what a test executes is dependency code.
-pub type FunctionMap = BTreeMap<String, Vec<HitRange>>;
+pub(crate) type FunctionMap = BTreeMap<String, Vec<HitRange>>;
 
 /// A binary's identity at the moment its [`FunctionMap`] was exported.
 ///
@@ -178,7 +178,7 @@ pub type FunctionMap = BTreeMap<String, Vec<HitRange>>;
 /// than proving byte equality. That is the right granularity: cargo rewrites
 /// the file on every relink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BinaryStamp {
+pub(crate) struct BinaryStamp {
     len: u64,
     modified_secs: u64,
     modified_nanos: u32,
@@ -189,7 +189,7 @@ impl BinaryStamp {
     ///
     /// An unreadable or timestamp-less binary is an error rather than a
     /// stamp that compares equal to everything.
-    pub fn of(binary: &Path) -> Result<Self> {
+    pub(crate) fn of(binary: &Path) -> Result<Self> {
         let meta = std::fs::metadata(binary)
             .with_context(|| format!("failed to stat {}", binary.display()))?;
         let modified = meta
@@ -213,9 +213,9 @@ impl BinaryStamp {
 /// as a skipped test rather than as coverage filed against stale lines. See
 /// [`BinaryStamp`] for why the filename can't carry that guarantee.
 #[derive(Serialize, Deserialize)]
-pub struct BinaryFunctionMap {
-    pub binary: BinaryStamp,
-    pub functions: FunctionMap,
+pub(crate) struct BinaryFunctionMap {
+    pub(crate) binary: BinaryStamp,
+    pub(crate) functions: FunctionMap,
 }
 
 /// Convert a relative source path into a `Utf8PathBuf` whose string form uses
@@ -227,7 +227,7 @@ pub struct BinaryFunctionMap {
 /// must be normalised to git's separator or selection silently misses on
 /// Windows. Returns `None` if the path isn't valid UTF-8 (paths originating
 /// from cargo/llvm-cov already are, but the call shape is still fallible).
-pub fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
+pub(crate) fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
     let utf8 = Utf8PathBuf::try_from(path.to_path_buf()).ok()?;
     if cfg!(windows) && utf8.as_str().contains('\\') {
         Some(Utf8PathBuf::from(utf8.as_str().replace('\\', "/")))
@@ -243,7 +243,7 @@ pub fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
 /// `files[]` but leaves `functions[]` intact, so the filter is applied here.
 /// Multiple monomorphizations of a generic that land on the same source extent
 /// collapse to one range.
-pub fn build_function_map(json: &str, canonical_root: &Path) -> Result<FunctionMap> {
+pub(crate) fn build_function_map(json: &str, canonical_root: &Path) -> Result<FunctionMap> {
     let export: CoverageExport =
         serde_json::from_str(json).context("failed to parse llvm-cov export JSON")?;
 
@@ -310,7 +310,7 @@ pub fn build_function_map(json: &str, canonical_root: &Path) -> Result<FunctionM
 /// numbers is an error rather than a skipped function. A silently short parse
 /// would hand the test fewer ranges than it earned, and *under*-selection is
 /// the one failure this tool can't detect downstream.
-pub fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
+pub(crate) fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
     let mut tokens = proftext
         .lines()
         .map(str::trim)
@@ -369,7 +369,7 @@ pub fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
 /// the row count looks healthy, and the stored coverage quietly degrades to
 /// "only crate-root edits select anything" — under-selection across the whole
 /// binary, from a collect that exited 0.
-pub fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
+pub(crate) fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
     let mut ranges = BTreeSet::new();
     for name in executed {
         if let Some(function) = map.get(*name) {
@@ -407,7 +407,10 @@ mod tests {
     }
 
     fn export_json(functions: &[String]) -> String {
-        format!(r#"{{"data": [{{"functions": [{}]}}]}}"#, functions.join(", "))
+        format!(
+            r#"{{"data": [{{"functions": [{}]}}]}}"#,
+            functions.join(", ")
+        )
     }
 
     /// A project with two source files: the map records each function's full
@@ -426,7 +429,11 @@ mod tests {
 
         let json = export_json(&[
             // Two regions, the second reaching further down the file.
-            function_json("adds", &[&lib], "[10, 0, 12, 0, 0, 0, 0, 0], [11, 0, 15, 0, 0, 0, 0, 0]"),
+            function_json(
+                "adds",
+                &[&lib],
+                "[10, 0, 12, 0, 0, 0, 0, 0], [11, 0, 15, 0, 0, 0, 0, 0]",
+            ),
             function_json("greets", &[&utils], "[5, 0, 7, 0, 0, 0, 0, 0]"),
             function_json(
                 "std_io",
@@ -589,10 +596,10 @@ _RNvC5probe12never_called
             truncated.to_string().contains("counter value"),
             "unexpected error: {truncated:#}",
         );
-        let unparseable = executed_functions("func\nnot-a-hash\n1\n1\n").unwrap_err();
+        let unparsable = executed_functions("func\nnot-a-hash\n1\n1\n").unwrap_err();
         assert!(
-            unparseable.to_string().contains("non-numeric hash"),
-            "unexpected error: {unparseable:#}",
+            unparsable.to_string().contains("non-numeric hash"),
+            "unexpected error: {unparsable:#}",
         );
         // An unknown trailing section (a future LLVM addition) desyncs the
         // grammar and surfaces as a parse error naming the token it tripped
@@ -622,7 +629,11 @@ _RNvC5probe12never_called
         let binary = tmp.path().join("integration-abc123");
         std::fs::write(&binary, b"first build").unwrap();
         let before = BinaryStamp::of(&binary).unwrap();
-        assert_eq!(before, BinaryStamp::of(&binary).unwrap(), "stable when untouched");
+        assert_eq!(
+            before,
+            BinaryStamp::of(&binary).unwrap(),
+            "stable when untouched"
+        );
 
         std::fs::write(&binary, b"second build, a different length").unwrap();
         assert_ne!(before, BinaryStamp::of(&binary).unwrap());

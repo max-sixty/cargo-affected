@@ -1,4 +1,44 @@
 //! Shared project utilities: root detection and git queries.
+//!
+//! Two jobs sit together here because they answer the same question from
+//! different directions — *what is this project, right now*. `cargo metadata`
+//! says which crates it contains and where its root is; git says what has
+//! changed and which snapshots are still addressable.
+//!
+//! ## Line numbers are in the collect_sha's coordinate system
+//!
+//! The invariant everything downstream rests on. [`git_changed_line_ranges`]
+//! returns **OLD-side** line numbers — positions in the `collect_sha`
+//! snapshot, not in the working tree — because that is the coordinate system
+//! `test_regions` rows were recorded in. Overlap queries compare the two
+//! directly, so a switch to NEW-side numbers wouldn't fail loudly; it would
+//! quietly select the wrong tests, more wrongly the further HEAD drifts from
+//! the anchor.
+//!
+//! [`relation_to_head`] is what lets that hold for shas that aren't ancestors
+//! of HEAD. Only a sha genuinely absent from the repo is `Missing`; a sibling
+//! or post-`reset` orphan stays `Reachable`, because `git diff <sha> HEAD`
+//! resolves either way and the ranges still live in `<sha>`'s coordinates.
+//! `Reachable { commits_ahead: 0 }` is such a sibling — it resolves, but its
+//! tree differs from HEAD's, which is why callers treat it as divergence
+//! rather than an exact hit.
+//!
+//! ## Git failure is never "nothing changed"
+//!
+//! Every query here propagates a non-zero git exit rather than degrading to an
+//! empty result. An empty change set is indistinguishable from a clean tree,
+//! so a swallowed error would select zero tests and report success — silent
+//! under-selection, the one failure this tool cannot detect downstream.
+//!
+//! ## Paths must match what the compiler recorded
+//!
+//! [`canonicalize_no_verbatim`] exists because the two platforms fail in
+//! opposite directions: macOS needs canonicalization (temp dirs reached via
+//! `/var` are recorded under `/private/var`), while Windows needs its absence
+//! (`Path::canonicalize` adds a `\\?\` prefix and expands 8.3 names, neither
+//! of which cargo or llvm-cov produce). Getting this wrong makes
+//! `strip_prefix` against the project root discard every function — see
+//! `tests/functional/remapped_paths.rs` for what that costs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,9 +51,9 @@ use crate::coverage::to_db_relative;
 
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LineRange {
-    pub start: i64,
-    pub end: i64,
+pub(crate) struct LineRange {
+    pub(crate) start: i64,
+    pub(crate) end: i64,
 }
 
 /// How a stored sha relates to the current `HEAD`.
@@ -33,24 +73,24 @@ pub struct LineRange {
 /// or beyond a shallow clone boundary). The diff has no anchor and the cache
 /// is unusable; tests anchored at this sha rerun as new.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShaRelation {
+pub(crate) enum ShaRelation {
     Equal,
     Reachable { commits_ahead: u32 },
     Missing,
 }
 
 /// Project root information.
-pub struct ProjectRoot {
+pub(crate) struct ProjectRoot {
     /// Workspace root directory. Git operations and the DB live here.
     /// For single-crate projects this equals the crate root.
-    pub workspace_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
     /// All Cargo.toml files belonging to the workspace — the root manifest
     /// plus every member's manifest. Sorted, deduplicated. Used for
     /// environment fingerprinting.
-    pub manifest_paths: Vec<PathBuf>,
+    pub(crate) manifest_paths: Vec<PathBuf>,
     /// Raw `cargo metadata --no-deps` JSON. Parsed once at root detection so
     /// less-common lookups (test src paths) don't have to re-spawn cargo.
-    pub metadata: serde_json::Value,
+    pub(crate) metadata: serde_json::Value,
 }
 
 /// `Path::canonicalize` adapted for cross-platform path-prefix arithmetic.
@@ -66,7 +106,7 @@ pub struct ProjectRoot {
 /// or llvm-cov's path forms — `strip_prefix` against the canonicalized
 /// root drops every match. Cargo's own tooling doesn't canonicalize, so
 /// the cargo-given path matches itself fine without help.
-pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
     #[cfg(windows)]
     {
         Ok(path.to_path_buf())
@@ -82,7 +122,7 @@ pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
 ///
 /// Uses `cargo metadata --no-deps --format-version=1` to reliably determine
 /// the workspace root, which handles both single-crate and workspace projects.
-pub fn find_project_root() -> Result<ProjectRoot> {
+pub(crate) fn find_project_root() -> Result<ProjectRoot> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version=1"])
         .output()
@@ -153,7 +193,7 @@ impl ProjectRoot {
     /// `TestId.binary_id` from `cargo nextest list` is exact.
     ///
     /// Reads from the cached `metadata` JSON — no cargo spawn.
-    pub fn crate_root_sentinels_by_binary_id(
+    pub(crate) fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
         // No canonicalize: `workspace_root` and `target.src_path` both come
@@ -286,7 +326,10 @@ impl TestTarget {
 }
 
 fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
-    let is_test = target.get("test").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_test = target
+        .get("test")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !is_test {
         return None;
     }
@@ -310,7 +353,11 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
     let src_path = to_db_relative(rel)?;
-    Some(TestTarget { name, kind, src_path })
+    Some(TestTarget {
+        name,
+        kind,
+        src_path,
+    })
 }
 
 /// Construct nextest's stable `binary_id` for a workspace target. Mirrors
@@ -359,7 +406,7 @@ fn transitive_closure<'a>(
 /// Returns paths relative to the project root. A non-zero git exit (corrupt
 /// repo, missing object, permissions) is a hard error: silently returning "no
 /// changed files" would look like a clean tree and select zero tests.
-pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
+pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for args in [
         vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
@@ -401,7 +448,7 @@ pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
 /// structural-edit backstop hides some of the damage but only when a hunk
 /// overlaps no stored range; point edits within a function silently
 /// mis-select.
-pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
+pub(crate) fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
     // `--porcelain=v1 -z` emits one NUL-terminated entry per changed path
     // (renames split into two entries; we only care about emptiness).
     // Untracked files are reported by default; ignored files are not. That's
@@ -415,7 +462,7 @@ pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
 /// Capture the current git HEAD sha. Hard error if HEAD is unreachable —
 /// detached/initial-commit repos can't anchor function-level coverage and
 /// silently using "" would later fail with a confusing diff error.
-pub fn git_head_sha(project_root: &Path) -> Result<String> {
+pub(crate) fn git_head_sha(project_root: &Path) -> Result<String> {
     let lines = run_git(project_root, &["rev-parse", "HEAD"])?;
     let sha = lines
         .into_iter()
@@ -437,7 +484,7 @@ pub fn git_head_sha(project_root: &Path) -> Result<String> {
 /// orphans, the PR-vs-main-tip shape) is still `Reachable`: `git diff <sha>
 /// HEAD` resolves the trees fine, and stored coverage ranges live in `sha`'s
 /// coordinate system, which matches the diff's OLD side either way.
-pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
+pub(crate) fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
     let head = git_head_sha(project_root)?;
     if head == sha {
         return Ok(ShaRelation::Equal);
@@ -461,7 +508,9 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
         .trim()
         .parse::<u32>()
         .context("git rev-list --count returned non-numeric output")?;
-    Ok(ShaRelation::Reachable { commits_ahead: count })
+    Ok(ShaRelation::Reachable {
+        commits_ahead: count,
+    })
 }
 
 /// Per-file changed line ranges between `collect_sha` and the working tree.
@@ -479,7 +528,7 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
 ///
 /// Errors are loud — git failure (bad sha, corrupt repo, etc.) is propagated
 /// rather than silently emitting an empty map.
-pub fn git_changed_line_ranges(
+pub(crate) fn git_changed_line_ranges(
     project_root: &Path,
     collect_sha: &str,
 ) -> Result<BTreeMap<String, Vec<LineRange>>> {
@@ -530,10 +579,7 @@ pub fn git_changed_line_ranges(
 /// additions, the diagnostic report needs this dedicated query to know
 /// the file existed in the diff at all. Returns paths relative to the
 /// project root.
-pub fn git_added_files_since(
-    project_root: &Path,
-    collect_sha: &str,
-) -> Result<Vec<String>> {
+pub(crate) fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
     let mut out = run_git(
         project_root,
         &[
@@ -598,7 +644,7 @@ fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
             let text = String::from_utf8_lossy(line);
             let Some(hunk) = parse_hunk_header(&text) else {
                 // Content lines are consumed by the budgets above, so an
-                // unparseable `@@ ` line here is a corrupt header — and
+                // unparsable `@@ ` line here is a corrupt header — and
                 // without its counts the following content would be
                 // header-matched.
                 bail!("malformed hunk header in git diff output: {text}");
@@ -606,7 +652,9 @@ fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
             // Set the budgets even when the hunk's ranges are skipped, so
             // its content lines are still consumed above.
             (rem_old, rem_new) = (hunk.old_count, hunk.new_count);
-            let Some(file) = current_file.clone() else { continue };
+            let Some(file) = current_file.clone() else {
+                continue;
+            };
             // /dev/null sentinel — skip.
             if file == "/dev/null" {
                 continue;
@@ -679,11 +727,21 @@ fn parse_hunk_header(line: &str) -> Option<Hunk> {
     let (old_start, old_count) = parse_side(old, '-')?;
     let (_, new_count) = parse_side(new, '+')?;
     let old_range = if old_count == 0 {
-        LineRange { start: old_start, end: old_start }
+        LineRange {
+            start: old_start,
+            end: old_start,
+        }
     } else {
-        LineRange { start: old_start, end: old_start + old_count - 1 }
+        LineRange {
+            start: old_start,
+            end: old_start + old_count - 1,
+        }
     };
-    Some(Hunk { old_range, old_count, new_count })
+    Some(Hunk {
+        old_range,
+        old_count,
+        new_count,
+    })
 }
 
 /// Run `git <args>` in `project_root` and return NUL-separated stdout entries.
@@ -818,7 +876,13 @@ mod tests {
         git(dir.path(), &["commit", "-q", "-m", "add a"]);
 
         let modified: String = (1..=10)
-            .map(|i| if i == 5 { "modified\n".into() } else { format!("line {i}\n") })
+            .map(|i| {
+                if i == 5 {
+                    "modified\n".into()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
             .collect();
         std::fs::write(dir.path().join("a.txt"), &modified)?;
 
@@ -985,14 +1049,12 @@ mod tests {
     fn parse_unified_diff_rejects_corrupt_input() {
         // A malformed hunk header has no counts to budget with, so the
         // parser can't safely skip past its content.
-        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ garbage @@\n-x\n+y\n")
-            .unwrap_err();
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ garbage @@\n-x\n+y\n").unwrap_err();
         assert!(err.to_string().contains("malformed hunk header"), "{err}");
 
         // A hunk content line without a -/+/\ prefix means the budgets are
         // out of sync with the stream.
-        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n-x\nzz\n")
-            .unwrap_err();
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n-x\nzz\n").unwrap_err();
         assert!(err.to_string().contains("unexpected line"), "{err}");
     }
 
@@ -1248,9 +1310,13 @@ mod tests {
         // build-dep (which is excluded).
         assert_eq!(
             map.get("math").unwrap(),
-            &[p("math/src/lib.rs"), p("strings/src/lib.rs"), p("utils/src/lib.rs")]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+            &[
+                p("math/src/lib.rs"),
+                p("strings/src/lib.rs"),
+                p("utils/src/lib.rs")
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         );
 
         // math::integration: own crate root + math's lib + transitive deps.

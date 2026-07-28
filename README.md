@@ -41,6 +41,11 @@ cargo affected status     # dry-run: show what would run
 cargo affected clean      # wipe the coverage cache
 ```
 
+`status` predicts `run`, so give it the same post-`--` args you'd give
+`run` — `cargo affected status -- --features extra`. Those flags decide
+which tests get built, and a dry run of a feature-less build can't tell
+you about tests that only exist with the feature on.
+
 For CI integration or debugging selection, both `run` and `status`
 accept `--report-json <PATH>` to emit a structured artifact alongside
 their normal output. See [`docs/report-json.md`](docs/report-json.md)

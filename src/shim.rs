@@ -103,7 +103,7 @@ pub(crate) enum TestOutcome {
 ///
 /// Never returns — runs the test binary, extracts its coverage, and exits with
 /// the test's exit code.
-pub fn run(args: &[String]) -> ! {
+pub(crate) fn run(args: &[String]) -> ! {
     let Some((binary, rest)) = args.split_first() else {
         eprintln!("cargo-affected runner-shim: missing test binary argument");
         std::process::exit(2);
@@ -290,10 +290,7 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
 /// them ([`coverage::BinaryStamp`]). A mismatch skips the test rather than
 /// filing it under stale lines; if it happens to every test, `collect` bails
 /// instead of overwriting stored coverage.
-fn load_function_map(
-    function_maps_dir: &Path,
-    binary: &Path,
-) -> Result<BinaryFunctionMap, String> {
+fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<BinaryFunctionMap, String> {
     let path = map_path(function_maps_dir, binary)
         .ok_or_else(|| format!("{} has no file name to look a map up by", binary.display()))?;
     let raw = std::fs::read_to_string(&path)
@@ -376,7 +373,7 @@ fn list_profraw_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// per-test [`TestResult`] carries the verbatim values, so name collisions
 /// inside one binary_id are the only risk, and they don't occur with real Rust
 /// test names (no two tests in the same binary share a sanitized form).
-pub fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
@@ -500,7 +497,10 @@ mod tests {
     #[test]
     fn map_path_is_named_for_the_binary() {
         assert_eq!(
-            map_path(Path::new("/tmp/maps"), Path::new("/t/debug/deps/integration-9f2a")),
+            map_path(
+                Path::new("/tmp/maps"),
+                Path::new("/t/debug/deps/integration-9f2a")
+            ),
             Some(PathBuf::from("/tmp/maps/integration-9f2a.json")),
         );
         assert_eq!(map_path(Path::new("/tmp/maps"), Path::new("..")), None);

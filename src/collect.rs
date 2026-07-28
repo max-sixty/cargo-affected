@@ -74,7 +74,7 @@ use crate::shim::{self, TestOutcome, TestResult};
 /// new HEAD. Other tests' rows stay put. Errors out if there's no prior
 /// collect for the current environment, or if any stored sha is no longer
 /// reachable from HEAD.
-pub fn collect(
+pub(crate) fn collect(
     diff: bool,
     verbose: bool,
     allow_dirty: bool,
@@ -189,14 +189,13 @@ pub fn collect(
             );
         }
     }
-    let crate_root_ranges_by_binary_id: BTreeMap<String, BTreeSet<HitRange>> =
-        crate_root_sentinels
-            .into_iter()
-            .map(|(binary_id, paths)| {
-                let ranges = paths.into_iter().map(HitRange::sentinel).collect();
-                (binary_id, ranges)
-            })
-            .collect();
+    let crate_root_ranges_by_binary_id: BTreeMap<String, BTreeSet<HitRange>> = crate_root_sentinels
+        .into_iter()
+        .map(|(binary_id, paths)| {
+            let ranges = paths.into_iter().map(HitRange::sentinel).collect();
+            (binary_id, ranges)
+        })
+        .collect();
 
     let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     if !rustflags.is_empty() {
@@ -243,11 +242,7 @@ pub fn collect(
         match plan_diff_collect(project_root, &db, env_fingerprint, &listing)? {
             DiffOutcome::Plan(plan) => Some(plan),
             DiffOutcome::NothingToRecollect { listed } => {
-                let pruned = db.prune_missing_tests(env_fingerprint, &listed)?;
-                if pruned > 0 {
-                    let s = if pruned == 1 { "" } else { "s" };
-                    eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-                }
+                prune_and_report(&mut db, env_fingerprint, &listed)?;
                 eprintln!(
                     "done. nothing to recollect — no affected tests and no new tests \
                      ({:.1}s total)",
@@ -265,7 +260,7 @@ pub fn collect(
     // rerunning three tests shouldn't pay to export a whole workspace.
     let mapped = binaries_for_run(&listing, diff_plan.as_ref());
     let s = if mapped.len() == 1 { "y" } else { "ies" };
-    eprintln!("exporting coverage maps for {} binar{s}...", mapped.len());
+    eprintln!("exporting coverage maps for {} binary{s}...", mapped.len());
     write_function_maps(
         &function_maps_dir,
         &mapped,
@@ -412,11 +407,7 @@ pub fn collect(
             &collect_sha,
             &mappings,
         )?;
-        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
+        prune_and_report(&mut db, env_fingerprint, &plan.listed)?;
     } else {
         eprintln!(
             "storing coverage for {} tests ({region_count} ranges)...",
@@ -478,7 +469,10 @@ const STAGING_DIR_PREFIXES: &[&str] = &[
 /// isn't accounted for here — nextest owns filterset evaluation. The cost of
 /// over-answering is one export per unused binary, bounded by the binary count
 /// rather than the test count.
-fn binaries_for_run<'a>(listing: &'a Listing, diff_plan: Option<&DiffPlan>) -> Vec<&'a BinaryEntry> {
+fn binaries_for_run<'a>(
+    listing: &'a Listing,
+    diff_plan: Option<&DiffPlan>,
+) -> Vec<&'a BinaryEntry> {
     let wanted: BTreeSet<&str> = match diff_plan {
         Some(plan) => plan
             .selected
@@ -554,9 +548,7 @@ fn write_function_maps(
             .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
             .arg(&binary.binary_path)
             .output()
-            .with_context(|| {
-                format!("failed to run llvm-cov export for {}", binary.binary_id)
-            })?;
+            .with_context(|| format!("failed to run llvm-cov export for {}", binary.binary_id))?;
         if !export.status.success() {
             bail!(
                 "llvm-cov export failed for {}: {}",
@@ -651,7 +643,7 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
 /// levels of walking find them all. Sorted by `(binary_id, test_name)` so the
 /// skip log and stored rows come out in a stable order.
 ///
-/// An unreadable or unparseable result file is skipped with a warning, not a
+/// An unreadable or unparsable result file is skipped with a warning, not a
 /// hard error: the shim writes atomically (`.tmp` + rename), so a torn file
 /// shouldn't occur, but if one does (e.g. the shim was SIGKILL'd at just the
 /// wrong moment, or the disk filled), losing one test's coverage — it
@@ -714,7 +706,10 @@ impl DiffPlan {
     /// current listing). Used to distinguish the all-phantoms case from a
     /// runner-shim failure when extraction yields no results.
     fn live_selected_count(&self) -> usize {
-        self.selected.iter().filter(|t| self.listed.contains(t)).count()
+        self.selected
+            .iter()
+            .filter(|t| self.listed.contains(t))
+            .count()
     }
 }
 
@@ -727,9 +722,7 @@ enum DiffOutcome {
     Plan(DiffPlan),
     /// Nothing to recollect — no affected tests, no new tests. Caller still
     /// runs prune so renamed/deleted tests' rows go away.
-    NothingToRecollect {
-        listed: BTreeSet<TestId>,
-    },
+    NothingToRecollect { listed: BTreeSet<TestId> },
 }
 
 /// Run the diff-mode preflight + selection. Read-only against `db` — any
@@ -788,7 +781,10 @@ fn plan_diff_collect(
         return Ok(DiffOutcome::NothingToRecollect { listed: sel.listed });
     }
 
-    eprintln!("\n{}\n", selection::format_summary(&sel, "to recollect", false));
+    eprintln!(
+        "\n{}\n",
+        selection::format_summary(&sel, "to recollect", false)
+    );
     Ok(DiffOutcome::Plan(DiffPlan {
         selected,
         listed: sel.listed,
@@ -842,11 +838,7 @@ fn handle_no_results(
             "no tests rerun: every selected test is absent from the current \
              nextest listing (renamed or deleted between collects)"
         );
-        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
+        prune_and_report(db, env_fingerprint, &plan.listed)?;
         return Ok(0);
     }
 
@@ -924,8 +916,7 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to read {}", project_config.display()))
+            return Err(e).with_context(|| format!("failed to read {}", project_config.display()))
         }
     };
     let mut doc: toml_edit::DocumentMut = existing
@@ -1123,7 +1114,10 @@ pub(crate) fn nextest_list(
         .wait_with_output()
         .context("failed to wait for cargo nextest list")?;
     if !output.status.success() {
-        bail!("cargo nextest list failed (exit {:?})", output.status.code());
+        bail!(
+            "cargo nextest list failed (exit {:?})",
+            output.status.code()
+        );
     }
 
     let stdout = std::str::from_utf8(&output.stdout)
@@ -1191,7 +1185,11 @@ pub(crate) fn require_nextest(project_root: &Path) -> Result<()> {
     };
     // `cargo nextest --version` prints `cargo-nextest 0.9.132 (...)`. Pull
     // out the second whitespace-separated field on the first line.
-    let line = std::str::from_utf8(&stdout).unwrap_or_default().lines().next().unwrap_or("");
+    let line = std::str::from_utf8(&stdout)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("");
     let version = line.split_whitespace().nth(1).unwrap_or("");
     if !nextest_version_at_least(version, MIN_NEXTEST_VERSION) {
         bail!(
@@ -1209,10 +1207,11 @@ const MIN_NEXTEST_VERSION: &str = "0.9.116";
 
 /// Compare `actual` >= `required` using semver-ish dotted-number ordering.
 /// Trailing pre-release/build metadata after `-` or `+` is ignored.
-/// Conservative: any unparseable version is treated as too old.
+/// Conservative: any unparsable version is treated as too old.
 fn nextest_version_at_least(actual: &str, required: &str) -> bool {
     fn parts(v: &str) -> Option<Vec<u64>> {
-        v.split(['-', '+']).next()?
+        v.split(['-', '+'])
+            .next()?
             .split('.')
             .map(|p| p.parse().ok())
             .collect()
@@ -1221,6 +1220,21 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
         (Some(a), Some(r)) => a >= r,
         _ => false,
     }
+}
+
+/// Drop rows for tests that have vanished from the nextest listing, and say
+/// how many went.
+///
+/// Three paths reach this same point from different directions — a `--diff`
+/// with nothing to recollect, a `--diff` after its run, and the no-results
+/// handler — and they are all reporting one fact, so they report it one way.
+fn prune_and_report(db: &mut Db, env_fingerprint: &str, listed: &BTreeSet<TestId>) -> Result<()> {
+    let pruned = db.prune_missing_tests(env_fingerprint, listed)?;
+    if pruned > 0 {
+        let s = if pruned == 1 { "" } else { "s" };
+        eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+    }
+    Ok(())
 }
 
 /// Find an LLVM tool by name.
@@ -1330,7 +1344,10 @@ mod tests {
     #[test]
     fn binaries_for_run_skips_testless_binaries() {
         let listing = listing(
-            &[("sample", "deps/sample-1"), ("sample::golden", "deps/golden-2")],
+            &[
+                ("sample", "deps/sample-1"),
+                ("sample::golden", "deps/golden-2"),
+            ],
             &[("sample::golden", "golden_matches")],
         );
         let mapped: Vec<&str> = binaries_for_run(&listing, None)
@@ -1509,7 +1526,9 @@ mod tests {
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         // Our selection landed under [profile.default].
         assert_eq!(
-            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            doc["profile"]["default"]["default-filter"]
+                .as_str()
+                .unwrap(),
             "binary_id(=x) & test(=y)",
         );
         // The project's own settings survived untouched.
@@ -1521,7 +1540,10 @@ mod tests {
         assert_eq!(doc["profile"]["ci"]["retries"].as_integer().unwrap(), 2);
         assert!(doc["scripts"]["setup"]["build-bins"]["command"].is_array());
         assert_eq!(
-            doc["profile"]["default"]["scripts"].as_array_of_tables().unwrap().len(),
+            doc["profile"]["default"]["scripts"]
+                .as_array_of_tables()
+                .unwrap()
+                .len(),
             1,
         );
     }
@@ -1543,7 +1565,9 @@ mod tests {
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
-            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            doc["profile"]["default"]["default-filter"]
+                .as_str()
+                .unwrap(),
             "(test(=y)) & (not test(slow))",
         );
     }
@@ -1564,7 +1588,9 @@ mod tests {
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
-            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            doc["profile"]["default"]["default-filter"]
+                .as_str()
+                .unwrap(),
             "test(=solo)",
         );
     }
@@ -1613,7 +1639,7 @@ mod tests {
         // Pre-release / build metadata after `-`/`+` is ignored.
         assert!(nextest_version_at_least("0.9.132-dev", "0.9.116"));
         assert!(nextest_version_at_least("0.9.116+sha.abc", "0.9.116"));
-        // Unparseable: conservative — treat as too old.
+        // Unparsable: conservative — treat as too old.
         assert!(!nextest_version_at_least("garbage", "0.9.116"));
         assert!(!nextest_version_at_least("", "0.9.116"));
     }

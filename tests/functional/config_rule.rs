@@ -12,9 +12,7 @@
 
 use std::path::Path;
 
-use crate::{
-    cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file,
-};
+use crate::{cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file};
 
 /// Crate whose only test reads `golden.txt` at runtime and compares it to a
 /// `const` — a hermetic stand-in for an insta snapshot or doc-sync test.
@@ -32,7 +30,11 @@ edition = "2021"
 
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("lib.rs"), "pub const GREETING: &str = \"hello\";\n").unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
 
     // The data file the test reads at runtime. llvm-cov never sees it, so no
     // coverage row links it to `golden_matches`.
@@ -76,7 +78,11 @@ fn config_rule_selects_test_for_non_rust_input_change() {
     // Seed coverage: `golden_matches` runs, covering `GREETING` and the test
     // body — but nothing links `golden.txt` to it.
     let collect = cargo_affected(dir, &["affected", "collect"]);
-    assert!(collect.status.success(), "collect failed: {}", combined_output(&collect));
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
 
     // The non-Rust input changes. No Rust hunk → coverage selects nothing.
     replace_in_file(&dir.join("golden.txt"), "hello", "hi");
@@ -127,7 +133,11 @@ fn config_rule_rescues_committed_added_input() {
     init_git_with_initial_commit(dir);
 
     let collect = cargo_affected(dir, &["affected", "collect"]);
-    assert!(collect.status.success(), "collect failed: {}", combined_output(&collect));
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
 
     // Add a brand-new input and commit it: it's an addition since collect_sha,
     // with no modified sibling. Only `git_added_files_since` surfaces it.
@@ -159,7 +169,11 @@ fn config_rule_inert_when_no_glob_matches() {
     init_git_with_initial_commit(dir);
 
     let collect = cargo_affected(dir, &["affected", "collect"]);
-    assert!(collect.status.success(), "collect failed: {}", combined_output(&collect));
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
 
     // Edit a Rust file (not golden.txt). The rule's glob doesn't match, so the
     // config category stays empty and selection is driven purely by coverage.
