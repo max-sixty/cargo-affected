@@ -8,6 +8,7 @@ mod config;
 mod coverage;
 mod db;
 mod fingerprint;
+mod plan;
 mod project;
 mod report;
 mod run;
@@ -98,6 +99,13 @@ enum Action {
         /// Detail level for the report's selection section.
         #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
         report_detail: selection::DiagnosticDetail,
+        /// Extra args forwarded to the `cargo nextest list` this uses to
+        /// enumerate tests. Must be preceded by `--` (e.g. `cargo affected
+        /// status -- --features foo`). Pass whatever you'd pass `run`: the
+        /// flags decide which tests get built, so a dry run listing a
+        /// feature-less build under-reports against `run -- --features foo`.
+        #[arg(last = true)]
+        nextest_args: Vec<String>,
     },
     /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
@@ -191,8 +199,14 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         Action::Status {
             report_json,
             report_detail,
+            nextest_args,
         } => {
-            status::status(verbose, report_json.as_deref(), report_detail)?;
+            status::status(
+                verbose,
+                report_json.as_deref(),
+                report_detail,
+                &nextest_args,
+            )?;
             Ok(0)
         }
         Action::Clean => {
@@ -267,6 +281,17 @@ mod tests {
         };
         assert!(!diff);
         assert!(!allow_dirty);
+        assert_eq!(nextest_args, vec!["--features", "foo"]);
+    }
+
+    #[test]
+    fn status_accepts_explicit_double_dash_separator() {
+        // `status` predicts `run`, so it takes the same passthrough — the
+        // build flags decide which tests exist to be predicted about.
+        let cli = parse(&["status", "--", "--features", "foo"]);
+        let Action::Status { nextest_args, .. } = cli.action else {
+            panic!("expected Status");
+        };
         assert_eq!(nextest_args, vec!["--features", "foo"]);
     }
 

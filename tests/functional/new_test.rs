@@ -5,7 +5,9 @@
 //! Two failure modes are guarded here. A perpetually-`#[ignore]`d test is
 //! always listed but never collected, so it must not read as "new" forever.
 //! And the listing must build with the same cargo features as the run, or a
-//! feature-gated new test is invisible to detection.
+//! feature-gated new test is invisible to detection — checked for `run` and
+//! for `status`, which has to reach the same answer to be worth anything as a
+//! dry run.
 
 use std::path::Path;
 
@@ -247,6 +249,58 @@ fn new_test_detection_uses_run_features() {
     assert!(
         !combined.contains("test_base"),
         "test_base is in the DB and unaffected — it must not run, got:\n{combined}"
+    );
+}
+
+/// The same gap, one command over. `status` exists to predict `run`, and it
+/// listed tests with no features at all while `run` listed with the caller's
+/// — so `status` under-reported a feature-gated new test that `run` would go
+/// on to execute, which is the one direction a dry run must never be wrong in.
+/// Both now list through `plan::plan` with the same `cargo_build_args`, and
+/// `status` takes the passthrough that makes that possible.
+#[test]
+fn status_prediction_uses_run_features() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_feature_gated_test_project(dir, "sample_feature_status");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Without the passthrough, the featured test isn't built and so isn't
+    // there to find — the honest answer for the build being described.
+    let bare = cargo_affected(dir, &["affected", "status", "-v"]);
+    assert!(
+        bare.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    let bare = combined_output(&bare);
+    assert!(
+        !bare.contains("test_extra"),
+        "a feature-gated test is absent from a feature-less build, got:\n{bare}"
+    );
+
+    // With it, status predicts exactly what `run -- --features extra` does.
+    let status = cargo_affected(
+        dir,
+        &["affected", "status", "-v", "--", "--features", "extra"],
+    );
+    assert!(
+        status.status.success(),
+        "status --features failed: stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&status.stderr),
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let combined = combined_output(&status);
+    assert!(
+        combined.contains("test_extra (new)"),
+        "status must predict the feature-gated new test, got:\n{combined}"
     );
 }
 
