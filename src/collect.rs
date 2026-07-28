@@ -242,11 +242,7 @@ pub fn collect(
         match plan_diff_collect(project_root, &db, env_fingerprint, &listing)? {
             DiffOutcome::Plan(plan) => Some(plan),
             DiffOutcome::NothingToRecollect { listed } => {
-                let pruned = db.prune_missing_tests(env_fingerprint, &listed)?;
-                if pruned > 0 {
-                    let s = if pruned == 1 { "" } else { "s" };
-                    eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-                }
+                prune_and_report(&mut db, env_fingerprint, &listed)?;
                 eprintln!(
                     "done. nothing to recollect — no affected tests and no new tests \
                      ({:.1}s total)",
@@ -411,11 +407,7 @@ pub fn collect(
             &collect_sha,
             &mappings,
         )?;
-        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
+        prune_and_report(&mut db, env_fingerprint, &plan.listed)?;
     } else {
         eprintln!(
             "storing coverage for {} tests ({region_count} ranges)...",
@@ -846,11 +838,7 @@ fn handle_no_results(
             "no tests rerun: every selected test is absent from the current \
              nextest listing (renamed or deleted between collects)"
         );
-        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
+        prune_and_report(db, env_fingerprint, &plan.listed)?;
         return Ok(0);
     }
 
@@ -1232,6 +1220,21 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
         (Some(a), Some(r)) => a >= r,
         _ => false,
     }
+}
+
+/// Drop rows for tests that have vanished from the nextest listing, and say
+/// how many went.
+///
+/// Three paths reach this same point from different directions — a `--diff`
+/// with nothing to recollect, a `--diff` after its run, and the no-results
+/// handler — and they are all reporting one fact, so they report it one way.
+fn prune_and_report(db: &mut Db, env_fingerprint: &str, listed: &BTreeSet<TestId>) -> Result<()> {
+    let pruned = db.prune_missing_tests(env_fingerprint, listed)?;
+    if pruned > 0 {
+        let s = if pruned == 1 { "" } else { "s" };
+        eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+    }
+    Ok(())
 }
 
 /// Find an LLVM tool by name.
