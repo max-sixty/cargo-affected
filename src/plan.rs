@@ -16,10 +16,20 @@
 //! `status` prints a database inventory to stdout in the conditional. Those
 //! are two renderings of one decision, not two decisions.
 //!
-//! [`plan`] is the decision. [`write_selection_report`] and
-//! [`write_full_suite_report`] are the two report shapes, which differ only in
-//! whether a selection was computed at all.
+//! Two decisions live here, in the order the commands make them.
+//! [`assess`] classifies the cache — usable, or one of three ways of missing —
+//! and [`plan`] turns a usable one into a selection. [`write_selection_report`]
+//! and [`write_full_suite_report`] are the two report shapes, which differ only
+//! in whether a selection was computed at all.
+//!
+//! Splitting the classification out is what makes the guarantee hold in both
+//! directions. A new cache state is a non-exhaustive `match` in `run` *and*
+//! `status`, so the compiler asks for the second rendering rather than leaving
+//! it to whoever remembers. What stays at the call sites is what genuinely
+//! varies: the wording, the stream, and — for `status` — a database inventory
+//! `run` has no reason to print.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -33,6 +43,124 @@ use crate::report::{
     self, CacheStatus, CollectShaSnapshot, FullSuiteInputs, Report, SelectionInputs,
 };
 use crate::selection::{self, ChangedRangesBySha, DiagnosticDetail, Reachability, Selection};
+
+/// Where the coverage cache stands for this environment, and what each
+/// standing carries.
+///
+/// The classification is the decision; the wording is not. `run` and `status`
+/// each `match` this and write their own prose, so a new state is a compile
+/// error in both rather than something to remember in the second file.
+pub(crate) enum CacheState {
+    /// At least one `collect_sha` resolves, so a diff can be anchored.
+    Usable(Reachability),
+    /// Nothing to anchor against, for one of three reasons.
+    Miss(CacheMiss),
+}
+
+/// Why the cache couldn't anchor a diff. Each variant is a different thing to
+/// tell the user and a different `CacheStatus` in the report, but all three
+/// end the same way: every test runs.
+pub(crate) enum CacheMiss {
+    /// No rows under any fingerprint — nothing has ever been collected.
+    NoCoverage,
+    /// Rows exist, but none for this environment. `differing` names the
+    /// fingerprint components that diverge from the closest stored snapshot.
+    Fingerprint { differing: Vec<String> },
+    /// Rows for this environment, but every `collect_sha` is gone from the
+    /// repo.
+    NoReachableSha(Reachability),
+}
+
+impl CacheState {
+    /// The reachability result, on the two states that got far enough to
+    /// compute one. Lets a caller emit the missing-sha notice once rather
+    /// than in each arm that could reach it.
+    pub(crate) fn reachability(&self) -> Option<&Reachability> {
+        match self {
+            Self::Usable(reach) | Self::Miss(CacheMiss::NoReachableSha(reach)) => Some(reach),
+            Self::Miss(CacheMiss::NoCoverage | CacheMiss::Fingerprint { .. }) => None,
+        }
+    }
+}
+
+impl CacheMiss {
+    /// The report's name for this miss.
+    pub(crate) fn status(&self) -> CacheStatus {
+        match self {
+            Self::NoCoverage => CacheStatus::MissNoCoverage,
+            Self::Fingerprint { .. } => CacheStatus::MissFingerprint,
+            Self::NoReachableSha(_) => CacheStatus::MissNoReachableSha,
+        }
+    }
+}
+
+/// [`assess`]'s result: the cache's standing plus the values both commands
+/// display or feed to the report.
+pub(crate) struct Assessment {
+    /// Distinct tests recorded under this fingerprint.
+    pub(crate) test_count: usize,
+    /// Every `collect_sha` under this fingerprint, reachable or not. Empty
+    /// when the fingerprint matched nothing.
+    pub(crate) collect_shas: BTreeSet<String>,
+    /// Stored fingerprint snapshots — always populated on a miss (they decide
+    /// [`CacheMiss::Fingerprint`] vs [`CacheMiss::NoCoverage`]),
+    /// otherwise only when a report will consume them.
+    pub(crate) stored: Vec<StoredFingerprintRow>,
+    pub(crate) state: CacheState,
+}
+
+/// Classify the cache once, for whichever command asked.
+///
+/// `want_stored` requests the diagnostic snapshots on the paths that don't
+/// otherwise need them — they're report-only there, and reading them costs a
+/// query that a plain `run` shouldn't pay.
+pub(crate) fn assess(
+    project_root: &Path,
+    db: &Db,
+    fingerprint: &Fingerprint,
+    want_stored: bool,
+) -> Result<Assessment> {
+    let test_count = db.test_count(&fingerprint.hex)?;
+    if test_count == 0 {
+        // Unconditional here regardless of `want_stored`: whether anything is
+        // stored under *another* fingerprint is exactly what separates "you
+        // changed environments" from "you never collected".
+        let stored = db.stored_fingerprint_snapshots()?;
+        let state = CacheState::Miss(if stored.is_empty() {
+            CacheMiss::NoCoverage
+        } else {
+            let snapshots = report::snapshots_from(stored.clone());
+            CacheMiss::Fingerprint {
+                differing: report::closest_stored_diff_labels(&fingerprint.components, &snapshots),
+            }
+        });
+        return Ok(Assessment {
+            test_count,
+            collect_shas: BTreeSet::new(),
+            stored,
+            state,
+        });
+    }
+
+    let stored = if want_stored {
+        db.stored_fingerprint_snapshots()?
+    } else {
+        Vec::new()
+    };
+    let collect_shas = db.collect_shas(&fingerprint.hex)?;
+    let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
+    let state = if reach.reachable.is_empty() {
+        CacheState::Miss(CacheMiss::NoReachableSha(reach))
+    } else {
+        CacheState::Usable(reach)
+    };
+    Ok(Assessment {
+        test_count,
+        collect_shas,
+        stored,
+        state,
+    })
+}
 
 /// A computed selection, plus the two by-products the report needs.
 ///

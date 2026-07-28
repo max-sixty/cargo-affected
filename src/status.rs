@@ -16,7 +16,7 @@ use anyhow::Result;
 use crate::collect::{cargo_build_args, require_nextest};
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
-use crate::plan::{self, SelectionReport};
+use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
 use crate::project::{find_project_root, git_changed_files};
 use crate::report::{self, CacheStatus};
 use crate::selection::{self, DiagnosticDetail};
@@ -70,110 +70,96 @@ pub fn status(
 
     let fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
-    let stored = if report_json.is_some() {
-        db.stored_fingerprint_snapshots()?
-    } else {
-        Vec::new()
-    };
+    let Assessment {
+        test_count,
+        collect_shas,
+        stored,
+        state,
+    } = plan::assess(project_root, &db, &fingerprint, report_json.is_some())?;
 
-    let known_count = db.test_count(&fingerprint.hex)?;
-    let region_count = db.region_count(&fingerprint.hex)?;
     let last_collected = db.last_collected()?.unwrap_or_else(|| "never".to_string());
-    let collect_shas = db.collect_shas(&fingerprint.hex)?;
-
     let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
 
-    if known_count == 0 {
-        // Fetch stored snapshots on demand for the diff line if --report-json
-        // didn't already force the read; cheap relative to the rest of status.
-        let stored = if stored.is_empty() {
-            db.stored_fingerprint_snapshots()?
-        } else {
-            stored
-        };
-        let (status, reason) = if !stored.is_empty() {
-            let snapshots = report::snapshots_from(stored.clone());
-            let differing = report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
-            (
-                CacheStatus::MissFingerprint,
-                format!(
-                    "no coverage data for the current environment{}",
-                    report::fingerprint_miss_clause(&differing),
-                ),
-            )
-        } else {
-            (
-                CacheStatus::MissNoCoverage,
-                "no coverage data yet".to_string(),
-            )
-        };
+    // The inventory heads the output either way; what follows it depends on
+    // whether any of it turned out to be usable. Nothing tracked means there
+    // are no regions or shas to count, so those queries don't run.
+    if test_count == 0 {
+        println!(
+            "coverage database: {}\nlast collected: {last_collected}",
+            rel_path.display(),
+        );
+    } else {
         println!(
             "coverage database: {}\n\
              last collected: {last_collected}\n\
-             {reason} — would run all tests; run `cargo affected collect` to enable selection",
+             tests tracked: {test_count}\n\
+             regions stored: {}",
             rel_path.display(),
+            db.region_count(&fingerprint.hex)?,
         );
-        if let Some(report_path) = report_json {
-            plan::write_full_suite_report(
-                "status",
-                status,
-                Some(fingerprint),
-                stored,
-                vec![],
-                report_path,
-            )?;
-        }
-        eprintln!("{}", report::summary_line(status, None, 0, 0));
-        return Ok(());
+        let mut sha_list: Vec<&str> = collect_shas.iter().map(String::as_str).collect();
+        sha_list.sort();
+        println!("collect shas: {}", sha_list.join(", "));
     }
 
-    println!(
-        "coverage database: {}\n\
-         last collected: {last_collected}\n\
-         tests tracked: {known_count}\n\
-         regions stored: {region_count}",
-        rel_path.display(),
-    );
-    let mut sha_list: Vec<&str> = collect_shas.iter().map(String::as_str).collect();
-    sha_list.sort();
-    println!("collect shas: {}", sha_list.join(", "));
-
-    let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
-    if !reach.missing.is_empty() {
-        let stale_rows = db.region_count_at_shas(&fingerprint.hex, &reach.missing)?;
-        println!(
-            "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
-            selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
-            if reach.missing.len() == 1 { "" } else { "s" },
-        );
-    }
-    if reach.reachable.is_empty() {
-        println!(
-            "\nnote: no reachable collect_sha for the current environment — \
-             would run all tests; run `cargo affected collect` to re-anchor"
-        );
-        if let Some(report_path) = report_json {
-            let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
-            plan::write_full_suite_report(
-                "status",
-                CacheStatus::MissNoReachableSha,
-                Some(fingerprint),
-                stored,
-                report::collect_sha_snapshots(&reach, &row_counts),
-                report_path,
-            )?;
+    if let Some(reach) = state.reachability() {
+        if !reach.missing.is_empty() {
+            let stale_rows = db.region_count_at_shas(&fingerprint.hex, &reach.missing)?;
+            println!(
+                "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
+                selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
+                if reach.missing.len() == 1 { "" } else { "s" },
+            );
         }
-        eprintln!(
-            "{}",
-            report::summary_line(
-                CacheStatus::MissNoReachableSha,
-                None,
-                reach.missing.len(),
-                0,
-            )
-        );
-        return Ok(());
     }
+
+    let reach = match state {
+        CacheState::Usable(reach) => reach,
+        CacheState::Miss(miss) => {
+            let status = miss.status();
+            let (collect_sha_snapshots, missing) = match &miss {
+                CacheMiss::NoCoverage => {
+                    println!(
+                        "no coverage data yet — would run all tests; \
+                         run `cargo affected collect` to enable selection"
+                    );
+                    (Vec::new(), 0)
+                }
+                CacheMiss::Fingerprint { differing } => {
+                    println!(
+                        "no coverage data for the current environment{} — would run \
+                         all tests; run `cargo affected collect` to enable selection",
+                        report::fingerprint_miss_clause(differing),
+                    );
+                    (Vec::new(), 0)
+                }
+                CacheMiss::NoReachableSha(reach) => {
+                    println!(
+                        "\nnote: no reachable collect_sha for the current environment — \
+                         would run all tests; run `cargo affected collect` to re-anchor"
+                    );
+                    let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
+                    (
+                        report::collect_sha_snapshots(reach, &row_counts),
+                        reach.missing.len(),
+                    )
+                }
+            };
+            if let Some(report_path) = report_json {
+                plan::write_full_suite_report(
+                    "status",
+                    status,
+                    Some(fingerprint),
+                    stored,
+                    collect_sha_snapshots,
+                    report_path,
+                )?;
+            }
+            eprintln!("{}", report::summary_line(status, None, missing, 0));
+            return Ok(());
+        }
+    };
+
     if reach.max_commits_ahead > 0 {
         println!(
             "\nnote: {} commit(s) since collect — \

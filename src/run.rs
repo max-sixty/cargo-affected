@@ -32,7 +32,7 @@ use crate::collect::{
 };
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
-use crate::plan::{self, SelectionReport};
+use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
 use crate::project::{find_project_root, git_changed_files};
 use crate::report::{self, CacheStatus};
 use crate::selection::{self, DiagnosticDetail};
@@ -85,89 +85,69 @@ pub fn run(
 
     let fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
-    let stored = if report_json.is_some() {
-        db.stored_fingerprint_snapshots()?
-    } else {
-        // Stored snapshots are diagnostic-only — skip the read when no
-        // report is requested.
-        Vec::new()
+    let assessment = plan::assess(project_root, &db, &fingerprint, report_json.is_some())?;
+    let Assessment { stored, state, .. } = assessment;
+
+    // Stranded shas are worth saying whether or not any sha survived, so it
+    // goes here rather than inside the two arms that could emit it.
+    if let Some(reach) = state.reachability() {
+        if !reach.missing.is_empty() {
+            eprintln!(
+                "{}",
+                selection::missing_shas_notice(&reach.missing, "will rerun as 'stranded'")
+            );
+        }
+    }
+
+    let reach = match state {
+        CacheState::Usable(reach) => reach,
+        // Every miss narrates itself, then they share one exit: report the
+        // full suite, print the summary, run everything.
+        CacheState::Miss(miss) => {
+            let status = miss.status();
+            let (collect_shas, missing) = match &miss {
+                CacheMiss::NoCoverage => {
+                    eprintln!(
+                        "note: no coverage data yet — running all tests; \
+                         run `cargo affected collect` to enable selection"
+                    );
+                    (Vec::new(), 0)
+                }
+                CacheMiss::Fingerprint { differing } => {
+                    eprintln!(
+                        "note: no coverage data for the current environment{} — \
+                         running all tests; run `cargo affected collect` to refresh",
+                        report::fingerprint_miss_clause(differing),
+                    );
+                    (Vec::new(), 0)
+                }
+                CacheMiss::NoReachableSha(reach) => {
+                    eprintln!(
+                        "note: no reachable collect_sha for the current environment — \
+                         running all tests; run `cargo affected collect` to re-anchor"
+                    );
+                    let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
+                    (
+                        report::collect_sha_snapshots(reach, &row_counts),
+                        reach.missing.len(),
+                    )
+                }
+            };
+            if let Some(path) = report_json {
+                plan::write_full_suite_report(
+                    "run",
+                    status,
+                    Some(fingerprint),
+                    stored,
+                    collect_shas,
+                    path,
+                )?;
+            }
+            eprintln!("{}", report::summary_line(status, None, missing, 0));
+            return run_tests(project_root, None, nextest_args);
+        }
     };
 
-    if db.test_count(&fingerprint.hex)? == 0 {
-        // Reuse pre-fetched snapshots when --report-json forced the read;
-        // otherwise fetch on demand for the human-facing diff line. Either
-        // way the cache-miss path is about to invoke nextest, so the cost
-        // is in the noise.
-        let stored = if stored.is_empty() {
-            db.stored_fingerprint_snapshots()?
-        } else {
-            stored
-        };
-        let status = if !stored.is_empty() {
-            let snapshots = report::snapshots_from(stored.clone());
-            let differing = report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
-            eprintln!(
-                "note: no coverage data for the current environment{} — \
-                 running all tests; run `cargo affected collect` to refresh",
-                report::fingerprint_miss_clause(&differing),
-            );
-            CacheStatus::MissFingerprint
-        } else {
-            eprintln!(
-                "note: no coverage data yet — running all tests; \
-                 run `cargo affected collect` to enable selection"
-            );
-            CacheStatus::MissNoCoverage
-        };
-        if let Some(path) = report_json {
-            plan::write_full_suite_report(
-                "run",
-                status,
-                Some(fingerprint.clone()),
-                stored,
-                vec![],
-                path,
-            )?;
-        }
-        eprintln!("{}", report::summary_line(status, None, 0, 0));
-        return run_tests(project_root, None, nextest_args);
-    }
-
-    let collect_shas = db.collect_shas(&fingerprint.hex)?;
-    let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
-    if !reach.missing.is_empty() {
-        eprintln!(
-            "{}",
-            selection::missing_shas_notice(&reach.missing, "will rerun as 'stranded'")
-        );
-    }
-    if reach.reachable.is_empty() {
-        eprintln!(
-            "note: no reachable collect_sha for the current environment — \
-             running all tests; run `cargo affected collect` to re-anchor"
-        );
-        if let Some(path) = report_json {
-            let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
-            plan::write_full_suite_report(
-                "run",
-                CacheStatus::MissNoReachableSha,
-                Some(fingerprint.clone()),
-                stored,
-                report::collect_sha_snapshots(&reach, &row_counts),
-                path,
-            )?;
-        }
-        eprintln!(
-            "{}",
-            report::summary_line(
-                CacheStatus::MissNoReachableSha,
-                None,
-                reach.missing.len(),
-                0,
-            )
-        );
-        return run_tests(project_root, None, nextest_args);
-    }
     if reach.max_commits_ahead > 0 {
         eprintln!(
             "note: {} commit(s) since collect — \
