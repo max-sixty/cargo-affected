@@ -180,9 +180,7 @@ fn newly_ignored_test_excluded_from_affected() {
 fn write_single_test_project(dir: &Path, crate_name: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-        ),
+        format!("[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
     )
     .unwrap();
     std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
@@ -258,9 +256,7 @@ fn new_test_detection_uses_run_features() {
 fn write_ignored_test_project(dir: &Path, crate_name: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-        ),
+        format!("[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
     )
     .unwrap();
     std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();

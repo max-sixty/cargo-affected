@@ -22,6 +22,12 @@ name = "collect"
 harness = false
 test = false
 
+[lints.rust]
+# Nothing here needs to reach past the borrow checker: the crate shells out to
+# llvm-tools and git, and reads their output. `forbid` rather than `deny` so a
+# local `allow` can't quietly reintroduce it.
+unsafe_code = "forbid"
+
 [dependencies]
 anyhow = "1"
 camino = { version = "1", features = ["serde1"] }

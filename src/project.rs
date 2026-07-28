@@ -286,7 +286,10 @@ impl TestTarget {
 }
 
 fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
-    let is_test = target.get("test").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_test = target
+        .get("test")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !is_test {
         return None;
     }
@@ -310,7 +313,11 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
     let src_path = to_db_relative(rel)?;
-    Some(TestTarget { name, kind, src_path })
+    Some(TestTarget {
+        name,
+        kind,
+        src_path,
+    })
 }
 
 /// Construct nextest's stable `binary_id` for a workspace target. Mirrors
@@ -461,7 +468,9 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
         .trim()
         .parse::<u32>()
         .context("git rev-list --count returned non-numeric output")?;
-    Ok(ShaRelation::Reachable { commits_ahead: count })
+    Ok(ShaRelation::Reachable {
+        commits_ahead: count,
+    })
 }
 
 /// Per-file changed line ranges between `collect_sha` and the working tree.
@@ -530,10 +539,7 @@ pub fn git_changed_line_ranges(
 /// additions, the diagnostic report needs this dedicated query to know
 /// the file existed in the diff at all. Returns paths relative to the
 /// project root.
-pub fn git_added_files_since(
-    project_root: &Path,
-    collect_sha: &str,
-) -> Result<Vec<String>> {
+pub fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
     let mut out = run_git(
         project_root,
         &[
@@ -598,7 +604,7 @@ fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
             let text = String::from_utf8_lossy(line);
             let Some(hunk) = parse_hunk_header(&text) else {
                 // Content lines are consumed by the budgets above, so an
-                // unparseable `@@ ` line here is a corrupt header — and
+                // unparsable `@@ ` line here is a corrupt header — and
                 // without its counts the following content would be
                 // header-matched.
                 bail!("malformed hunk header in git diff output: {text}");
@@ -606,7 +612,9 @@ fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
             // Set the budgets even when the hunk's ranges are skipped, so
             // its content lines are still consumed above.
             (rem_old, rem_new) = (hunk.old_count, hunk.new_count);
-            let Some(file) = current_file.clone() else { continue };
+            let Some(file) = current_file.clone() else {
+                continue;
+            };
             // /dev/null sentinel — skip.
             if file == "/dev/null" {
                 continue;
@@ -679,11 +687,21 @@ fn parse_hunk_header(line: &str) -> Option<Hunk> {
     let (old_start, old_count) = parse_side(old, '-')?;
     let (_, new_count) = parse_side(new, '+')?;
     let old_range = if old_count == 0 {
-        LineRange { start: old_start, end: old_start }
+        LineRange {
+            start: old_start,
+            end: old_start,
+        }
     } else {
-        LineRange { start: old_start, end: old_start + old_count - 1 }
+        LineRange {
+            start: old_start,
+            end: old_start + old_count - 1,
+        }
     };
-    Some(Hunk { old_range, old_count, new_count })
+    Some(Hunk {
+        old_range,
+        old_count,
+        new_count,
+    })
 }
 
 /// Run `git <args>` in `project_root` and return NUL-separated stdout entries.
@@ -818,7 +836,13 @@ mod tests {
         git(dir.path(), &["commit", "-q", "-m", "add a"]);
 
         let modified: String = (1..=10)
-            .map(|i| if i == 5 { "modified\n".into() } else { format!("line {i}\n") })
+            .map(|i| {
+                if i == 5 {
+                    "modified\n".into()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
             .collect();
         std::fs::write(dir.path().join("a.txt"), &modified)?;
 
@@ -985,14 +1009,12 @@ mod tests {
     fn parse_unified_diff_rejects_corrupt_input() {
         // A malformed hunk header has no counts to budget with, so the
         // parser can't safely skip past its content.
-        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ garbage @@\n-x\n+y\n")
-            .unwrap_err();
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ garbage @@\n-x\n+y\n").unwrap_err();
         assert!(err.to_string().contains("malformed hunk header"), "{err}");
 
         // A hunk content line without a -/+/\ prefix means the budgets are
         // out of sync with the stream.
-        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n-x\nzz\n")
-            .unwrap_err();
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n-x\nzz\n").unwrap_err();
         assert!(err.to_string().contains("unexpected line"), "{err}");
     }
 
@@ -1248,9 +1270,13 @@ mod tests {
         // build-dep (which is excluded).
         assert_eq!(
             map.get("math").unwrap(),
-            &[p("math/src/lib.rs"), p("strings/src/lib.rs"), p("utils/src/lib.rs")]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+            &[
+                p("math/src/lib.rs"),
+                p("strings/src/lib.rs"),
+                p("utils/src/lib.rs")
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         );
 
         // math::integration: own crate root + math's lib + transitive deps.

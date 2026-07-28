@@ -176,11 +176,7 @@ edition = "2021"
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
 
-    std::fs::write(
-        src.join("lib.rs"),
-        "pub mod math;\npub mod strings;\n",
-    )
-    .unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod math;\npub mod strings;\n").unwrap();
 
     // Lines kept stable (no top comment) so range assertions can reason about
     // line numbers if needed. The struct between `add` and `multiply` is the

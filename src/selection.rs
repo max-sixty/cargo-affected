@@ -32,6 +32,8 @@ pub(crate) struct Selection {
     /// Excludes `#[ignore]`d tests: their coverage rows can persist from
     /// an earlier (non-ignored) collect, but `nextest run` would skip them
     /// — same all-ignored-selection rationale as [`new_tests`].
+    ///
+    /// [`new_tests`]: Self::new_tests
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
@@ -392,8 +394,7 @@ pub(crate) fn compute(
     // In `Full` mode we additionally retain the per-test vector for the
     // JSON report to consume.
     let mut affected = BTreeSet::new();
-    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> =
-        BTreeMap::new();
+    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> = BTreeMap::new();
     let mut per_test_reasons: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
     let retain_per_test = matches!(detail, DiagnosticDetail::Full);
     for (collect_sha, ranges_by_file) in changed_ranges_by_sha {
@@ -401,8 +402,7 @@ pub(crate) fn compute(
             if hunks.is_empty() {
                 continue;
             }
-            let hits =
-                db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
+            let hits = db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
                 if listing.ignored.contains(&hit.test_id) {
                     // Coverage rows from a previous (non-ignored) collect
@@ -457,13 +457,16 @@ pub(crate) fn compute(
             if retain_per_test {
                 // Config reasons name the triggering input path; they have no
                 // sha-anchored coverage hunk, so those fields are left empty.
-                per_test_reasons.entry(test.clone()).or_default().push(HitReason {
-                    collect_sha: String::new(),
-                    file: path.clone(),
-                    kind: HitKind::ConfigRule,
-                    matched_hunk: (0, 0),
-                    stored_range: None,
-                });
+                per_test_reasons
+                    .entry(test.clone())
+                    .or_default()
+                    .push(HitReason {
+                        collect_sha: String::new(),
+                        file: path.clone(),
+                        kind: HitKind::ConfigRule,
+                        matched_hunk: (0, 0),
+                        stored_range: None,
+                    });
             }
         }
     }
@@ -637,12 +640,36 @@ mod tests {
     fn strongest_reason_orders_line_then_backstop_then_sentinel() {
         // Pairwise: stronger arg returned regardless of position.
         for (a, b, expected) in [
-            (HitKind::LineOverlap, HitKind::CrateRootSentinel, HitKind::LineOverlap),
-            (HitKind::CrateRootSentinel, HitKind::LineOverlap, HitKind::LineOverlap),
-            (HitKind::StructuralBackstop, HitKind::CrateRootSentinel, HitKind::StructuralBackstop),
-            (HitKind::CrateRootSentinel, HitKind::StructuralBackstop, HitKind::StructuralBackstop),
-            (HitKind::LineOverlap, HitKind::StructuralBackstop, HitKind::LineOverlap),
-            (HitKind::StructuralBackstop, HitKind::LineOverlap, HitKind::LineOverlap),
+            (
+                HitKind::LineOverlap,
+                HitKind::CrateRootSentinel,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::CrateRootSentinel,
+                HitKind::LineOverlap,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::StructuralBackstop,
+                HitKind::CrateRootSentinel,
+                HitKind::StructuralBackstop,
+            ),
+            (
+                HitKind::CrateRootSentinel,
+                HitKind::StructuralBackstop,
+                HitKind::StructuralBackstop,
+            ),
+            (
+                HitKind::LineOverlap,
+                HitKind::StructuralBackstop,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::StructuralBackstop,
+                HitKind::LineOverlap,
+                HitKind::LineOverlap,
+            ),
         ] {
             assert_eq!(strongest(a, b), expected, "{a:?} vs {b:?}");
         }

@@ -28,11 +28,7 @@ use crate::selection::{self, DiagnosticDetail};
 /// stored `collect_sha` unreachable. Partial divergence proceeds with the
 /// reachable subset and surfaces stranded tests, mirroring `run` so the
 /// dry-run accurately predicts what `run` would do.
-pub fn status(
-    verbose: bool,
-    report_json: Option<&Path>,
-    detail: DiagnosticDetail,
-) -> Result<()> {
+pub fn status(verbose: bool, report_json: Option<&Path>, detail: DiagnosticDetail) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
@@ -54,7 +50,10 @@ pub fn status(
                 report_path,
             )?;
         }
-        eprintln!("{}", report::summary_line(CacheStatus::MissNoCoverage, None, 0, 0));
+        eprintln!(
+            "{}",
+            report::summary_line(CacheStatus::MissNoCoverage, None, 0, 0)
+        );
         return Ok(());
     }
 
@@ -83,8 +82,7 @@ pub fn status(
         };
         let (status, reason) = if !stored.is_empty() {
             let snapshots = report::snapshots_from(stored.clone());
-            let differing =
-                report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
+            let differing = report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
             (
                 CacheStatus::MissFingerprint,
                 format!(
@@ -93,7 +91,10 @@ pub fn status(
                 ),
             )
         } else {
-            (CacheStatus::MissNoCoverage, "no coverage data yet".to_string())
+            (
+                CacheStatus::MissNoCoverage,
+                "no coverage data yet".to_string(),
+            )
         };
         println!(
             "coverage database: {}\n\
@@ -182,13 +183,8 @@ pub fn status(
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
     // Mirror `run`: apply [workspace.metadata.affected] input rules so the dry-run
     // predicts the same selection `run` would make.
-    let config_hits = config::config_rule_hits(
-        &project,
-        &[],
-        &reach,
-        &changed_ranges,
-        &changed_files,
-    )?;
+    let config_hits =
+        config::config_rule_hits(&project, &[], &reach, &changed_ranges, &changed_files)?;
     let sel = selection::select_with_precomputed_ranges(
         &db,
         &fingerprint.hex,
@@ -199,7 +195,11 @@ pub fn status(
         detail,
     )?;
 
-    let status = if reach.per_sha.values().all(|r| matches!(r, ShaRelation::Equal)) {
+    let status = if reach
+        .per_sha
+        .values()
+        .all(|r| matches!(r, ShaRelation::Equal))
+    {
         CacheStatus::HitExact
     } else {
         CacheStatus::HitWithDivergence
@@ -252,7 +252,10 @@ pub fn status(
         return Ok(());
     }
 
-    println!("\n{}", selection::format_summary(&sel, "would run", verbose));
+    println!(
+        "\n{}",
+        selection::format_summary(&sel, "would run", verbose)
+    );
 
     Ok(())
 }

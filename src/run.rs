@@ -28,16 +28,13 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::collect::{
-    cargo_build_args, nextest_filter_expr, nextest_list, require_nextest,
-    write_nextest_config,
+    cargo_build_args, nextest_filter_expr, nextest_list, require_nextest, write_nextest_config,
 };
 use crate::config;
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint::{self, Fingerprint};
 use crate::project::{find_project_root, git_changed_files, ShaRelation};
-use crate::report::{
-    self, CacheStatus, FullSuiteInputs, Report, SelectionInputs,
-};
+use crate::report::{self, CacheStatus, FullSuiteInputs, Report, SelectionInputs};
 use crate::selection::{self, DiagnosticDetail, Reachability};
 
 /// Entry point for `cargo affected run`. Returns the exit code to propagate.
@@ -79,7 +76,10 @@ pub fn run(
                 path,
             )?;
         }
-        eprintln!("{}", report::summary_line(CacheStatus::ForcedAll, None, 0, 0));
+        eprintln!(
+            "{}",
+            report::summary_line(CacheStatus::ForcedAll, None, 0, 0)
+        );
         return run_tests(project_root, None, nextest_args);
     }
 
@@ -105,8 +105,7 @@ pub fn run(
         };
         let status = if !stored.is_empty() {
             let snapshots = report::snapshots_from(stored.clone());
-            let differing =
-                report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
+            let differing = report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
             eprintln!(
                 "note: no coverage data for the current environment{} — \
                  running all tests; run `cargo affected collect` to refresh",
@@ -121,7 +120,14 @@ pub fn run(
             CacheStatus::MissNoCoverage
         };
         if let Some(path) = report_json {
-            write_full_suite("run", status, Some(fingerprint.clone()), stored, vec![], path)?;
+            write_full_suite(
+                "run",
+                status,
+                Some(fingerprint.clone()),
+                stored,
+                vec![],
+                path,
+            )?;
         }
         eprintln!("{}", report::summary_line(status, None, 0, 0));
         return run_tests(project_root, None, nextest_args);
@@ -370,4 +376,3 @@ fn run_tests(
     }
     Ok(status.code().unwrap_or(1))
 }
-

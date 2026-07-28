@@ -100,13 +100,11 @@ fn collect_removes_staging_dirs_on_success() {
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| {
-                            n.starts_with("profraw-")
-                                || n.starts_with("results-")
-                                || n.starts_with("function-maps-")
-                        })
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n.starts_with("profraw-")
+                            || n.starts_with("results-")
+                            || n.starts_with("function-maps-")
+                    })
                 })
                 .collect()
         })

@@ -447,9 +447,8 @@ pub fn summary_line(
             let (selected, total) = selection.unwrap_or((0, 0));
             // Empty cache → vacuous 100% (we ran nothing of nothing).
             let pct = (selected * 100).checked_div(total).unwrap_or(100);
-            let mut line = format!(
-                "cargo-affected: cache={status} selection={selected}/{total} ({pct}%)"
-            );
+            let mut line =
+                format!("cargo-affected: cache={status} selection={selected}/{total} ({pct}%)");
             if matches!(status, CacheStatus::HitWithDivergence) {
                 if missing_shas > 0 {
                     line.push_str(&format!(" missing_shas={missing_shas}"));
@@ -461,9 +460,7 @@ pub fn summary_line(
             line
         }
         CacheStatus::MissNoReachableSha => {
-            format!(
-                "cargo-affected: cache={status} mode=full-suite missing_shas={missing_shas}"
-            )
+            format!("cargo-affected: cache={status} mode=full-suite missing_shas={missing_shas}")
         }
         _ => format!("cargo-affected: cache={status} mode=full-suite"),
     }
@@ -562,18 +559,16 @@ impl Report {
     /// disk full) leaves the previous artifact intact rather than a
     /// truncated JSON file.
     pub fn write_json(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("failed to serialize report to JSON")?;
+        let json =
+            serde_json::to_string_pretty(self).context("failed to serialize report to JSON")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!("failed to rename {} -> {}", tmp.display(), path.display())
-        })?;
+        std::fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 }
@@ -638,14 +633,15 @@ fn build_stored_fingerprints(
 /// fingerprint component lists. Used by both the JSON report's per-stored
 /// `differing_labels` and the human-facing cache-miss explanation. A label
 /// present in one side but missing from the other counts as differing.
-fn diff_labels(
-    current: &[FingerprintComponent],
-    stored: &[FingerprintComponent],
-) -> Vec<String> {
-    let current_by_label: BTreeMap<&str, &str> =
-        current.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
-    let stored_by_label: BTreeMap<&str, &str> =
-        stored.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
+fn diff_labels(current: &[FingerprintComponent], stored: &[FingerprintComponent]) -> Vec<String> {
+    let current_by_label: BTreeMap<&str, &str> = current
+        .iter()
+        .map(|c| (c.label.as_str(), c.hash.as_str()))
+        .collect();
+    let stored_by_label: BTreeMap<&str, &str> = stored
+        .iter()
+        .map(|c| (c.label.as_str(), c.hash.as_str()))
+        .collect();
     let mut differing: BTreeSet<String> = BTreeSet::new();
     for (label, hash) in &current_by_label {
         if stored_by_label.get(*label) != Some(hash) {
@@ -968,7 +964,10 @@ mod tests {
         });
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
-        assert_eq!(json["selection"]["summary"]["mode"], "full-suite-no-listing");
+        assert_eq!(
+            json["selection"]["summary"]["mode"],
+            "full-suite-no-listing"
+        );
         assert!(json["selection"]["summary"]["selected"].is_null());
         assert!(json["selection"]["changed_files"].is_null());
         assert!(json["selection"]["selected_tests"].is_null());

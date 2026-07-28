@@ -407,7 +407,10 @@ mod tests {
     }
 
     fn export_json(functions: &[String]) -> String {
-        format!(r#"{{"data": [{{"functions": [{}]}}]}}"#, functions.join(", "))
+        format!(
+            r#"{{"data": [{{"functions": [{}]}}]}}"#,
+            functions.join(", ")
+        )
     }
 
     /// A project with two source files: the map records each function's full
@@ -426,7 +429,11 @@ mod tests {
 
         let json = export_json(&[
             // Two regions, the second reaching further down the file.
-            function_json("adds", &[&lib], "[10, 0, 12, 0, 0, 0, 0, 0], [11, 0, 15, 0, 0, 0, 0, 0]"),
+            function_json(
+                "adds",
+                &[&lib],
+                "[10, 0, 12, 0, 0, 0, 0, 0], [11, 0, 15, 0, 0, 0, 0, 0]",
+            ),
             function_json("greets", &[&utils], "[5, 0, 7, 0, 0, 0, 0, 0]"),
             function_json(
                 "std_io",
@@ -589,10 +596,10 @@ _RNvC5probe12never_called
             truncated.to_string().contains("counter value"),
             "unexpected error: {truncated:#}",
         );
-        let unparseable = executed_functions("func\nnot-a-hash\n1\n1\n").unwrap_err();
+        let unparsable = executed_functions("func\nnot-a-hash\n1\n1\n").unwrap_err();
         assert!(
-            unparseable.to_string().contains("non-numeric hash"),
-            "unexpected error: {unparseable:#}",
+            unparsable.to_string().contains("non-numeric hash"),
+            "unexpected error: {unparsable:#}",
         );
         // An unknown trailing section (a future LLVM addition) desyncs the
         // grammar and surfaces as a parse error naming the token it tripped
@@ -622,7 +629,11 @@ _RNvC5probe12never_called
         let binary = tmp.path().join("integration-abc123");
         std::fs::write(&binary, b"first build").unwrap();
         let before = BinaryStamp::of(&binary).unwrap();
-        assert_eq!(before, BinaryStamp::of(&binary).unwrap(), "stable when untouched");
+        assert_eq!(
+            before,
+            BinaryStamp::of(&binary).unwrap(),
+            "stable when untouched"
+        );
 
         std::fs::write(&binary, b"second build, a different length").unwrap();
         assert_ne!(before, BinaryStamp::of(&binary).unwrap());

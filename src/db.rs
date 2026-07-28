@@ -252,7 +252,13 @@ fn batch_delete_tests<'a>(
     const CHUNK: usize = 400;
     for chunk in tests.chunks(CHUNK) {
         let predicate = (0..chunk.len())
-            .map(|i| format!("(binary_id = ?{} AND test_name = ?{})", 2 + i * 2, 3 + i * 2))
+            .map(|i| {
+                format!(
+                    "(binary_id = ?{} AND test_name = ?{})",
+                    2 + i * 2,
+                    3 + i * 2
+                )
+            })
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!(
@@ -436,7 +442,10 @@ impl Db {
             )?;
             let rows: BTreeSet<TestId> = stmt
                 .query_map([fingerprint], |row| {
-                    Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok(TestId::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             rows
@@ -571,9 +580,9 @@ impl Db {
     /// fingerprint. Empty when no coverage has been collected yet for the
     /// current environment.
     pub fn collect_shas(&self, fingerprint: &str) -> Result<BTreeSet<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT collect_sha FROM test_regions WHERE env_fingerprint = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT collect_sha FROM test_regions WHERE env_fingerprint = ?1")?;
         let shas = stmt
             .query_map([fingerprint], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -681,10 +690,7 @@ impl Db {
     /// `test_regions` row counts per `collect_sha`, scoped to one
     /// fingerprint. Used by the report to show how much data is
     /// anchored at each sha. One query — diagnostic, not a hot path.
-    pub fn row_counts_by_sha(
-        &self,
-        fingerprint: &str,
-    ) -> Result<BTreeMap<String, usize>> {
+    pub fn row_counts_by_sha(&self, fingerprint: &str) -> Result<BTreeMap<String, usize>> {
         let mut stmt = self.conn.prepare(
             "SELECT collect_sha, COUNT(*) FROM test_regions \
              WHERE env_fingerprint = ?1 \
@@ -706,16 +712,16 @@ impl Db {
     /// (in DB but only at currently-missing shas) from "genuinely new"
     /// tests (not in DB at all): if a listed test appears here but not
     /// in [`Db::all_tests_at_shas`] for the reachable subset, it's stranded.
-    pub fn all_tests_for_fingerprint(
-        &self,
-        fingerprint: &str,
-    ) -> Result<BTreeSet<TestId>> {
+    pub fn all_tests_for_fingerprint(&self, fingerprint: &str) -> Result<BTreeSet<TestId>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT binary_id, test_name FROM test_regions \
              WHERE env_fingerprint = ?1",
         )?;
         let rows = stmt.query_map([fingerprint], |row| {
-            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(TestId::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<BTreeSet<TestId>>>()
             .map_err(Into::into)
@@ -742,7 +748,10 @@ impl Db {
         let mut stmt = self.conn.prepare(&sql)?;
         let params = std::iter::once(fingerprint).chain(shas.iter().map(String::as_str));
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(TestId::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<BTreeSet<TestId>>>()
             .map_err(Into::into)
@@ -864,11 +873,7 @@ impl Db {
 
 /// Warn (to stderr) about changed `.rs` files that have no coverage data under
 /// the current fingerprint.
-pub fn warn_untracked_rs_files(
-    db: &Db,
-    fingerprint: &str,
-    changed_files: &[String],
-) -> Result<()> {
+pub fn warn_untracked_rs_files(db: &Db, fingerprint: &str, changed_files: &[String]) -> Result<()> {
     for file in changed_files {
         if file.ends_with(".rs") && !db.file_tracked(fingerprint, file)? {
             eprintln!(
@@ -1086,16 +1091,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let a_ranges = BTreeSet::from([
-            rng("src/lib.rs", 10, 20),
-            rng("src/utils.rs", 5, 15),
-        ]);
+        let a_ranges = BTreeSet::from([rng("src/lib.rs", 10, 20), rng("src/utils.rs", 5, 15)]);
         let b_ranges = BTreeSet::from([rng("src/lib.rs", 50, 60)]);
         db.store_coverage(
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), a_ranges), (tid(BIN_A, "test_b"), b_ranges)],
+            &[
+                (tid(BIN_A, "test_a"), a_ranges),
+                (tid(BIN_A, "test_b"), b_ranges),
+            ],
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 2);
@@ -1111,9 +1116,12 @@ mod tests {
         assert_eq!(hits, BTreeSet::from([tid(BIN_A, "test_b")]));
 
         // Multiple hunks in same file → union.
-        let hits = ids(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18), hunk(55, 55)])?,
-        );
+        let hits = ids(db.tests_covering_ranges(
+            FP_A,
+            SHA_A,
+            "src/lib.rs",
+            &[hunk(15, 18), hunk(55, 55)],
+        )?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -1138,8 +1146,14 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)])),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/lib.rs", 50, 60)])),
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([rng("src/lib.rs", 10, 20)]),
+                ),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/lib.rs", 50, 60)]),
+                ),
             ],
         )?;
 
@@ -1204,14 +1218,17 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 10)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 1, 10)]),
+            )],
         )?;
 
         assert_eq!(db.test_count(FP_B)?, 0);
         assert_eq!(db.region_count(FP_B)?, 0);
         assert!(db
             .tests_covering_ranges(FP_B, SHA_A, "src/lib.rs", &[hunk(1, 5)])?
-            .is_empty());  // Vec<TestHit>::is_empty()
+            .is_empty()); // Vec<TestHit>::is_empty()
         assert!(!db.file_tracked(FP_B, "src/lib.rs")?);
         assert!(db
             .all_tests_at_shas(FP_B, &BTreeSet::from([SHA_A.to_string()]))?
@@ -1230,13 +1247,19 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 1, 5)]),
+            )],
         )?;
         db.store_coverage(
             FP_B,
             &comps_for(FP_B),
             SHA_B,
-            &[(tid(BIN_A, "test_b"), BTreeSet::from([rng("src/other.rs", 10, 15)]))],
+            &[(
+                tid(BIN_A, "test_b"),
+                BTreeSet::from([rng("src/other.rs", 10, 15)]),
+            )],
         )?;
 
         // Rewriting FP_A leaves FP_B alone.
@@ -1244,7 +1267,10 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/new.rs", 1, 1)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/new.rs", 1, 1)]),
+            )],
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 1);
@@ -1275,15 +1301,23 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "builds"), BTreeSet::from([rng("crate_a/tests/builds.rs", 1, 5)])),
-                (tid(BIN_B, "builds"), BTreeSet::from([rng("crate_b/tests/builds.rs", 1, 5)])),
+                (
+                    tid(BIN_A, "builds"),
+                    BTreeSet::from([rng("crate_a/tests/builds.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_B, "builds"),
+                    BTreeSet::from([rng("crate_b/tests/builds.rs", 1, 5)]),
+                ),
             ],
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 2);
-        let a = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?);
+        let a =
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(a, BTreeSet::from([tid(BIN_A, "builds")]));
-        let b = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?);
+        let b =
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(b, BTreeSet::from([tid(BIN_B, "builds")]));
         Ok(())
     }
@@ -1293,8 +1327,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(
+            tid(BIN_A, "test_a"),
+            BTreeSet::from([rng("src/lib.rs", 1, 5)]),
+        )];
         db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
         db.store_coverage(FP_B, &comps_for(FP_B), SHA_B, &mappings)?;
         assert!(db.has_any_coverage()?);
@@ -1316,14 +1352,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         for fp in ["fp1", "fp2", "fp3", "fp4"] {
             db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
             db.conn.execute(
                 "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
-                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+                rusqlite::params![
+                    fp,
+                    format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')
+                ],
             )?;
         }
         assert_eq!(db.fingerprint_count()?, 4);
@@ -1426,9 +1464,18 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/b.rs", 1, 5)])),
-                (tid(BIN_A, "test_c"), BTreeSet::from([rng("src/c.rs", 1, 5)])),
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([rng("src/a.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/b.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_c"),
+                    BTreeSet::from([rng("src/c.rs", 1, 5)]),
+                ),
             ],
         )?;
         assert_eq!(db.collect_shas(FP_A)?, BTreeSet::from([SHA_A.to_string()]));
@@ -1438,7 +1485,10 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_B,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 10, 20)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/a.rs", 10, 20)]),
+            )],
         )?;
 
         // Both shas now coexist for FP_A.
@@ -1482,9 +1532,18 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/b.rs", 1, 5)])),
-                (tid(BIN_A, "test_c"), BTreeSet::from([rng("src/c.rs", 1, 5)])),
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([rng("src/a.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/b.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_c"),
+                    BTreeSet::from([rng("src/c.rs", 1, 5)]),
+                ),
             ],
         )?;
 
@@ -1589,7 +1648,10 @@ mod tests {
             FP_A,
             &comps,
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 1, 5)]),
+            )],
         )?;
 
         assert_eq!(
@@ -1609,8 +1671,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         db.store_coverage(
             FP_A,
@@ -1643,14 +1704,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         for fp in ["fp1", "fp2", "fp3", "fp4"] {
             db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
             db.conn.execute(
                 "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
-                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+                rusqlite::params![
+                    fp,
+                    format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')
+                ],
             )?;
         }
         // Sanity: every fingerprint has a components row.
@@ -1820,7 +1883,10 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 10, 20)]),
+            )],
         )?;
 
         let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?;
@@ -1854,7 +1920,10 @@ mod tests {
         let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].reason.kind, HitKind::CrateRootSentinel);
-        assert_eq!(hits[0].reason.stored_range, Some((1, CRATE_ROOT_SENTINEL_END)));
+        assert_eq!(
+            hits[0].reason.stored_range,
+            Some((1, CRATE_ROOT_SENTINEL_END))
+        );
         Ok(())
     }
 
@@ -1877,12 +1946,12 @@ mod tests {
             &[
                 (
                     tid(BIN_A, "test_a"),
-                    BTreeSet::from([
-                        rng("src/lib.rs", 10, 15),
-                        rng("src/lib.rs", 30, 35),
-                    ]),
+                    BTreeSet::from([rng("src/lib.rs", 10, 15), rng("src/lib.rs", 30, 35)]),
                 ),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/lib.rs", 50, 55)])),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/lib.rs", 50, 55)]),
+                ),
             ],
         )?;
 

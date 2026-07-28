@@ -290,10 +290,7 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
 /// them ([`coverage::BinaryStamp`]). A mismatch skips the test rather than
 /// filing it under stale lines; if it happens to every test, `collect` bails
 /// instead of overwriting stored coverage.
-fn load_function_map(
-    function_maps_dir: &Path,
-    binary: &Path,
-) -> Result<BinaryFunctionMap, String> {
+fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<BinaryFunctionMap, String> {
     let path = map_path(function_maps_dir, binary)
         .ok_or_else(|| format!("{} has no file name to look a map up by", binary.display()))?;
     let raw = std::fs::read_to_string(&path)
@@ -500,7 +497,10 @@ mod tests {
     #[test]
     fn map_path_is_named_for_the_binary() {
         assert_eq!(
-            map_path(Path::new("/tmp/maps"), Path::new("/t/debug/deps/integration-9f2a")),
+            map_path(
+                Path::new("/tmp/maps"),
+                Path::new("/t/debug/deps/integration-9f2a")
+            ),
             Some(PathBuf::from("/tmp/maps/integration-9f2a.json")),
         );
         assert_eq!(map_path(Path::new("/tmp/maps"), Path::new("..")), None);

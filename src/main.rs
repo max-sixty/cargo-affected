@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
     bin_name = "cargo affected",
     version,
     disable_help_subcommand = true,
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Print extra output: pipeline internals during `collect`, every
@@ -307,7 +307,10 @@ mod tests {
     fn known_run_flags_parse_before_double_dash() {
         // Subcommand-owned flags still parse normally before `--`.
         let cli = parse(&["run", "--all", "--", "--features", "foo"]);
-        let Action::Run { all, nextest_args, .. } = cli.action else {
+        let Action::Run {
+            all, nextest_args, ..
+        } = cli.action
+        else {
             panic!("expected Run");
         };
         assert!(all);
