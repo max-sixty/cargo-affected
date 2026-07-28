@@ -1,4 +1,44 @@
 //! Shared project utilities: root detection and git queries.
+//!
+//! Two jobs sit together here because they answer the same question from
+//! different directions — *what is this project, right now*. `cargo metadata`
+//! says which crates it contains and where its root is; git says what has
+//! changed and which snapshots are still addressable.
+//!
+//! ## Line numbers are in the collect_sha's coordinate system
+//!
+//! The invariant everything downstream rests on. [`git_changed_line_ranges`]
+//! returns **OLD-side** line numbers — positions in the `collect_sha`
+//! snapshot, not in the working tree — because that is the coordinate system
+//! `test_regions` rows were recorded in. Overlap queries compare the two
+//! directly, so a switch to NEW-side numbers wouldn't fail loudly; it would
+//! quietly select the wrong tests, more wrongly the further HEAD drifts from
+//! the anchor.
+//!
+//! [`relation_to_head`] is what lets that hold for shas that aren't ancestors
+//! of HEAD. Only a sha genuinely absent from the repo is `Missing`; a sibling
+//! or post-`reset` orphan stays `Reachable`, because `git diff <sha> HEAD`
+//! resolves either way and the ranges still live in `<sha>`'s coordinates.
+//! `Reachable { commits_ahead: 0 }` is such a sibling — it resolves, but its
+//! tree differs from HEAD's, which is why callers treat it as divergence
+//! rather than an exact hit.
+//!
+//! ## Git failure is never "nothing changed"
+//!
+//! Every query here propagates a non-zero git exit rather than degrading to an
+//! empty result. An empty change set is indistinguishable from a clean tree,
+//! so a swallowed error would select zero tests and report success — silent
+//! under-selection, the one failure this tool cannot detect downstream.
+//!
+//! ## Paths must match what the compiler recorded
+//!
+//! [`canonicalize_no_verbatim`] exists because the two platforms fail in
+//! opposite directions: macOS needs canonicalization (temp dirs reached via
+//! `/var` are recorded under `/private/var`), while Windows needs its absence
+//! (`Path::canonicalize` adds a `\\?\` prefix and expands 8.3 names, neither
+//! of which cargo or llvm-cov produce). Getting this wrong makes
+//! `strip_prefix` against the project root discard every function — see
+//! `tests/functional/remapped_paths.rs` for what that costs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
