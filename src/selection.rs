@@ -1,11 +1,16 @@
 //! Shared test-selection plumbing for `run`, `status`, and `collect --diff`.
 //!
 //! Reachability classification, per-sha diff collection, the selection
-//! computation itself, and the human-facing notices/summaries. The three
-//! callers all walk the same path: classify stored `collect_sha`s, gather
-//! per-sha changed line ranges, list tests via nextest, look up overlaps for
-//! known tests, and union with tests added since the last `collect`. This
-//! module owns the whole flow so the callers can't drift apart.
+//! computation itself, and the human-facing notices/summaries — the pieces
+//! every selection walks: classify stored `collect_sha`s, gather per-sha
+//! changed line ranges, look up overlaps for known tests, and union with
+//! tests added since the last `collect`.
+//!
+//! The pieces live here; the order they're called in does not. `run` and
+//! `status` reach them through [`crate::plan`], which is what keeps those two
+//! agreeing. `collect --diff` composes them differently — it has already
+//! listed tests for its own purposes and wants a selection to rerun, not to
+//! report — so it calls [`select_with_reach`] directly.
 //!
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
@@ -245,12 +250,15 @@ pub(crate) fn changed_ranges_per_sha(
 
 /// Compute selection given a pre-built listing and a `Reachability`.
 ///
-/// Bundles the two steps that always happen together — per-sha diff query
-/// and the selection compute — so the three callers (`run`, `status`,
-/// `collect --diff`) don't each open-code the pair. Caller stays
-/// responsible for handling `reach.reachable.is_empty()` upstream:
-/// `run`/`status` widen to all tests there, `collect --diff` bails. Those
-/// policies and their notices differ, so they don't belong in here.
+/// Bundles the per-sha diff query with the selection compute for the caller
+/// that only wants the answer: `collect --diff`. [`crate::plan`] runs the
+/// same pair by hand because it needs the intermediate ranges again when
+/// building the report, and re-deriving them would mean a second `git diff
+/// -U0` per reachable sha.
+///
+/// Caller stays responsible for handling `reach.reachable.is_empty()`
+/// upstream: `run`/`status` widen to all tests there, `collect --diff` bails.
+/// Those policies and their notices differ, so they don't belong in here.
 pub(crate) fn select_with_reach(
     project_root: &Path,
     db: &Db,
