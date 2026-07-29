@@ -42,34 +42,34 @@ use crate::selection::{FileReasonCounts, Reachability, Selection};
 
 /// JSON schema version. Bump on any incompatible field-shape change so
 /// consumers can refuse to parse a too-new report.
-pub const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Top-level report structure. Field semantics in the module doc.
 #[derive(Debug, Serialize)]
-pub struct Report {
-    pub schema_version: u32,
-    pub cargo_affected_version: &'static str,
-    pub command: &'static str,
-    pub cache: CacheReport,
-    pub selection: SelectionReport,
+pub(crate) struct Report {
+    pub(crate) schema_version: u32,
+    pub(crate) cargo_affected_version: &'static str,
+    pub(crate) command: &'static str,
+    pub(crate) cache: CacheReport,
+    pub(crate) selection: SelectionReport,
 }
 
 /// Cache state and per-fingerprint component info. The `status` field
 /// drives consumer behavior; everything else is diagnostic detail.
 #[derive(Debug, Serialize)]
-pub struct CacheReport {
-    pub status: CacheStatus,
-    pub current_fingerprint: Option<String>,
-    pub current_components: Option<Vec<ComponentEntry>>,
-    pub stored_fingerprints: Vec<StoredFingerprintEntry>,
-    pub collect_shas: Vec<CollectShaEntry>,
+pub(crate) struct CacheReport {
+    pub(crate) status: CacheStatus,
+    pub(crate) current_fingerprint: Option<String>,
+    pub(crate) current_components: Option<Vec<ComponentEntry>>,
+    pub(crate) stored_fingerprints: Vec<StoredFingerprintEntry>,
+    pub(crate) collect_shas: Vec<CollectShaEntry>,
 }
 
 /// What happened on the cache lookup. Closed enum; consumers should
 /// treat unknown variants as forward-compatible.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum CacheStatus {
+pub(crate) enum CacheStatus {
     /// Every reachable collect_sha equals HEAD; full-precision selection.
     HitExact,
     /// Fingerprint matched but at least one reachable sha is ahead of
@@ -92,7 +92,7 @@ impl CacheStatus {
     /// Stable kebab-case string used by the JSON serializer and the
     /// stderr summary line. One canonical mapping; the serde derive
     /// uses the same encoding.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::HitExact => "hit-exact",
             Self::HitWithDivergence => "hit-with-divergence",
@@ -111,65 +111,68 @@ impl std::fmt::Display for CacheStatus {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ComponentEntry {
-    pub label: String,
-    pub hash: String,
+pub(crate) struct ComponentEntry {
+    pub(crate) label: String,
+    pub(crate) hash: String,
 }
 
 /// One stored fingerprint with its component-level diff against the
 /// current environment. Sorted at the source so consumers don't have to.
 #[derive(Debug, Serialize)]
-pub struct StoredFingerprintEntry {
-    pub fingerprint: String,
-    pub last_seen: String,
+pub(crate) struct StoredFingerprintEntry {
+    pub(crate) fingerprint: String,
+    pub(crate) last_seen: String,
     /// Number of components whose hash differs from the current
     /// environment. 0 == this stored fingerprint is the current one.
-    pub diff_count: usize,
+    pub(crate) diff_count: usize,
     /// Sorted labels of the differing components.
-    pub differing_labels: Vec<String>,
+    pub(crate) differing_labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct CollectShaEntry {
-    pub sha: String,
-    pub relation: ShaRelationKind,
+pub(crate) struct CollectShaEntry {
+    pub(crate) sha: String,
+    pub(crate) relation: ShaRelationKind,
     /// Number of commits between this sha and HEAD; absent for `equal`
     /// and `missing`. Skipped (not emitted as `null`) so consumers can
     /// use field presence to detect reachable shas — matches the
     /// documented v1 schema.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub commits_ahead: Option<u32>,
+    pub(crate) commits_ahead: Option<u32>,
     /// Total `test_regions` rows anchored at this sha for the current
     /// fingerprint.
-    pub row_count: usize,
+    pub(crate) row_count: usize,
 }
 
 /// JSON encoding of [`ShaRelation`]. Mirrors the variants but flattens
 /// `commits_ahead` into a sibling field on [`CollectShaEntry`].
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum ShaRelationKind {
+pub(crate) enum ShaRelationKind {
     Equal,
     Reachable,
     Missing,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SelectionReport {
-    pub summary: SelectionSummary,
-    pub changed_files: Option<Vec<ChangedFileEntry>>,
-    pub selected_tests: Option<Vec<SelectedTestEntry>>,
+pub(crate) struct SelectionReport {
+    pub(crate) summary: SelectionSummary,
+    pub(crate) changed_files: Option<Vec<ChangedFileEntry>>,
+    pub(crate) selected_tests: Option<Vec<SelectedTestEntry>>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SelectionSummary {
-    pub selected: Option<usize>,
-    pub affected: Option<usize>,
-    pub new: Option<usize>,
-    pub stranded: Option<usize>,
-    pub skipped: Option<usize>,
-    pub total_reachable_known: Option<usize>,
-    pub mode: SelectionMode,
+pub(crate) struct SelectionSummary {
+    pub(crate) selected: Option<usize>,
+    pub(crate) affected: Option<usize>,
+    /// Reachable-known tests force-selected by a `[workspace.metadata.affected]` rule
+    /// (would otherwise have been skipped). Null on full-suite paths.
+    pub(crate) config: Option<usize>,
+    pub(crate) new: Option<usize>,
+    pub(crate) stranded: Option<usize>,
+    pub(crate) skipped: Option<usize>,
+    pub(crate) total_reachable_known: Option<usize>,
+    pub(crate) mode: SelectionMode,
 }
 
 /// Whether selection actually ran. `Selection` populates the count
@@ -178,84 +181,94 @@ pub struct SelectionSummary {
 /// paths cheap.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum SelectionMode {
+pub(crate) enum SelectionMode {
     Selection,
     FullSuiteNoListing,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChangedFileEntry {
-    pub path: String,
+pub(crate) struct ChangedFileEntry {
+    pub(crate) path: String,
     /// `true` iff the file has at least one stored test_regions row at a
     /// reachable sha under the current fingerprint. Non-Rust files,
     /// freshly-added files, and files outside any tested target's
     /// dep graph all read `false`.
-    pub tracked_by_coverage: bool,
-    pub hunks_by_sha: Vec<HunksForSha>,
-    pub tests_pulled_total: usize,
-    pub tests_pulled_by_reason: ReasonCounts,
+    pub(crate) tracked_by_coverage: bool,
+    pub(crate) hunks_by_sha: Vec<HunksForSha>,
+    pub(crate) tests_pulled_total: usize,
+    pub(crate) tests_pulled_by_reason: ReasonCounts,
 }
 
 #[derive(Debug, Serialize)]
-pub struct HunksForSha {
-    pub sha: String,
-    pub hunks: Vec<HunkEntry>,
+pub(crate) struct HunksForSha {
+    pub(crate) sha: String,
+    pub(crate) hunks: Vec<HunkEntry>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct HunkEntry {
-    pub start: i64,
-    pub end: i64,
+pub(crate) struct HunkEntry {
+    pub(crate) start: i64,
+    pub(crate) end: i64,
 }
 
-/// Per-file counts deduplicated by strongest reason — the three values
+/// Per-file counts deduplicated by strongest reason — the four values
 /// sum to [`ChangedFileEntry::tests_pulled_total`].
 #[derive(Debug, Serialize, Default)]
-pub struct ReasonCounts {
-    pub line_overlap: usize,
-    pub structural_backstop: usize,
-    pub crate_root_sentinel: usize,
+pub(crate) struct ReasonCounts {
+    pub(crate) line_overlap: usize,
+    pub(crate) structural_backstop: usize,
+    pub(crate) crate_root_sentinel: usize,
+    /// Tests pulled in by a `[workspace.metadata.affected]` rule matching this path.
+    /// Non-zero only for the (typically non-Rust) inputs such rules target.
+    pub(crate) config_rule: usize,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SelectedTestEntry {
-    pub binary_id: String,
-    pub test_name: String,
-    pub kind: SelectedTestKind,
+pub(crate) struct SelectedTestEntry {
+    pub(crate) binary_id: String,
+    pub(crate) test_name: String,
+    pub(crate) kind: SelectedTestKind,
     /// All reasons that pulled this test in, sorted
     /// `(file, kind, collect_sha)`. Empty for `new` and `stranded`.
-    pub reasons: Vec<ReasonEntry>,
+    pub(crate) reasons: Vec<ReasonEntry>,
 }
 
 /// Why a test ended up rerun. See `selection.rs` for the formal
 /// definitions of new vs stranded.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SelectedTestKind {
+pub(crate) enum SelectedTestKind {
     Affected,
+    /// Force-selected by a `[workspace.metadata.affected]` rule (reachable-known, would
+    /// otherwise have been skipped). The `reasons` name the triggering inputs.
+    ConfigRule,
     New,
     Stranded,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ReasonEntry {
-    pub collect_sha: String,
-    pub file: String,
-    pub kind: ReasonKind,
+pub(crate) struct ReasonEntry {
+    pub(crate) collect_sha: String,
+    pub(crate) file: String,
+    pub(crate) kind: ReasonKind,
     /// `[line_start, line_end]` of the stored row that matched. `None`
     /// for `structural_backstop` (no row matched by definition).
-    pub stored_range: Option<[i64; 2]>,
+    pub(crate) stored_range: Option<[i64; 2]>,
     /// `[start, end]` of the diff hunk that triggered selection.
-    pub matched_hunk: [i64; 2],
+    pub(crate) matched_hunk: [i64; 2],
 }
 
 /// JSON encoding of [`HitKind`].
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub enum ReasonKind {
+pub(crate) enum ReasonKind {
     LineOverlap,
     StructuralBackstop,
     CrateRootSentinel,
+    /// A `[workspace.metadata.affected]` rule matched the (typically non-Rust) input
+    /// named in `file`; `collect_sha` is empty and `matched_hunk` is `[0, 0]`
+    /// since the selection isn't anchored to a coverage hunk.
+    ConfigRule,
 }
 
 impl From<HitKind> for ReasonKind {
@@ -264,6 +277,7 @@ impl From<HitKind> for ReasonKind {
             HitKind::LineOverlap => Self::LineOverlap,
             HitKind::StructuralBackstop => Self::StructuralBackstop,
             HitKind::CrateRootSentinel => Self::CrateRootSentinel,
+            HitKind::ConfigRule => Self::ConfigRule,
         }
     }
 }
@@ -271,38 +285,38 @@ impl From<HitKind> for ReasonKind {
 /// Inputs for [`Report::build_selection`]. Bundles the data the report
 /// builder needs into one struct so the call site doesn't have to thread
 /// 10+ arguments.
-pub struct SelectionInputs<'a> {
-    pub command: &'static str,
-    pub current_fingerprint: String,
-    pub current_components: Vec<FingerprintComponent>,
-    pub stored_fingerprints: Vec<StoredFingerprintSnapshot>,
-    pub collect_shas: Vec<CollectShaSnapshot>,
-    pub status: CacheStatus,
-    pub selection: &'a Selection,
-    pub changed_files: Vec<ChangedFileInput>,
+pub(crate) struct SelectionInputs<'a> {
+    pub(crate) command: &'static str,
+    pub(crate) current_fingerprint: String,
+    pub(crate) current_components: Vec<FingerprintComponent>,
+    pub(crate) stored_fingerprints: Vec<StoredFingerprintSnapshot>,
+    pub(crate) collect_shas: Vec<CollectShaSnapshot>,
+    pub(crate) status: CacheStatus,
+    pub(crate) selection: &'a Selection,
+    pub(crate) changed_files: Vec<ChangedFileInput>,
     /// `false` collapses to `selection.changed_files = None` (no diff
     /// anchor was usable).
-    pub include_changed_files: bool,
+    pub(crate) include_changed_files: bool,
 }
 
 /// Inputs for [`Report::build_full_suite`] — the partial-report path for
 /// `--all` and cache-miss cases. `selection.summary.mode` becomes
 /// `"full-suite-no-listing"` and per-test detail is omitted.
-pub struct FullSuiteInputs {
-    pub command: &'static str,
-    pub current_fingerprint: Option<String>,
-    pub current_components: Option<Vec<FingerprintComponent>>,
-    pub stored_fingerprints: Vec<StoredFingerprintSnapshot>,
-    pub collect_shas: Vec<CollectShaSnapshot>,
-    pub status: CacheStatus,
+pub(crate) struct FullSuiteInputs {
+    pub(crate) command: &'static str,
+    pub(crate) current_fingerprint: Option<String>,
+    pub(crate) current_components: Option<Vec<FingerprintComponent>>,
+    pub(crate) stored_fingerprints: Vec<StoredFingerprintSnapshot>,
+    pub(crate) collect_shas: Vec<CollectShaSnapshot>,
+    pub(crate) status: CacheStatus,
 }
 
 /// Snapshot of one stored fingerprint as the report builder receives it
 /// (before computing diff against current).
-pub struct StoredFingerprintSnapshot {
-    pub fingerprint: String,
-    pub last_seen: String,
-    pub components: Vec<FingerprintComponent>,
+pub(crate) struct StoredFingerprintSnapshot {
+    pub(crate) fingerprint: String,
+    pub(crate) last_seen: String,
+    pub(crate) components: Vec<FingerprintComponent>,
 }
 
 impl From<StoredFingerprintRow> for StoredFingerprintSnapshot {
@@ -317,31 +331,31 @@ impl From<StoredFingerprintRow> for StoredFingerprintSnapshot {
 
 /// Convert a sequence of stored fingerprint rows from the DB into the
 /// snapshot shape the report builder consumes.
-pub fn snapshots_from(rows: Vec<StoredFingerprintRow>) -> Vec<StoredFingerprintSnapshot> {
+pub(crate) fn snapshots_from(rows: Vec<StoredFingerprintRow>) -> Vec<StoredFingerprintSnapshot> {
     rows.into_iter().map(Into::into).collect()
 }
 
 /// Snapshot of one collect_sha — what relation it has to HEAD and how
 /// many rows are anchored at it.
-pub struct CollectShaSnapshot {
-    pub sha: String,
-    pub relation: ShaRelation,
-    pub row_count: usize,
+pub(crate) struct CollectShaSnapshot {
+    pub(crate) sha: String,
+    pub(crate) relation: ShaRelation,
+    pub(crate) row_count: usize,
 }
 
 /// Per-changed-file input. `hunks_by_sha` lists the diff hunks computed
 /// against each stored sha (per-sha because a diff anchor is per-sha).
-pub struct ChangedFileInput {
-    pub path: String,
-    pub tracked_by_coverage: bool,
-    pub hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>>,
+pub(crate) struct ChangedFileInput {
+    pub(crate) path: String,
+    pub(crate) tracked_by_coverage: bool,
+    pub(crate) hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>>,
 }
 
 /// Compose per-sha snapshots for the report from a `Reachability` (per-sha
 /// relation) and a sha → row-count map. Rows missing from `row_counts`
 /// land at 0 (the sha isn't anchoring any rows for the current
 /// fingerprint — common for `Missing` shas).
-pub fn collect_sha_snapshots(
+pub(crate) fn collect_sha_snapshots(
     reach: &Reachability,
     row_counts: &BTreeMap<String, usize>,
 ) -> Vec<CollectShaSnapshot> {
@@ -371,7 +385,7 @@ pub fn collect_sha_snapshots(
 ///
 /// `tracked_by_coverage` is set in one DB query
 /// ([`Db::tracked_files_at_shas`]) instead of one query per file.
-pub fn build_changed_file_inputs(
+pub(crate) fn build_changed_file_inputs(
     project_root: &std::path::Path,
     db: &Db,
     fingerprint: &str,
@@ -422,7 +436,7 @@ pub fn build_changed_file_inputs(
 ///
 /// `selection` is `(selected_count, total_reachable_known)` — `None` on
 /// full-suite paths where no listing happened.
-pub fn summary_line(
+pub(crate) fn summary_line(
     status: CacheStatus,
     selection: Option<(usize, usize)>,
     missing_shas: usize,
@@ -433,9 +447,8 @@ pub fn summary_line(
             let (selected, total) = selection.unwrap_or((0, 0));
             // Empty cache → vacuous 100% (we ran nothing of nothing).
             let pct = (selected * 100).checked_div(total).unwrap_or(100);
-            let mut line = format!(
-                "cargo-affected: cache={status} selection={selected}/{total} ({pct}%)"
-            );
+            let mut line =
+                format!("cargo-affected: cache={status} selection={selected}/{total} ({pct}%)");
             if matches!(status, CacheStatus::HitWithDivergence) {
                 if missing_shas > 0 {
                     line.push_str(&format!(" missing_shas={missing_shas}"));
@@ -447,22 +460,25 @@ pub fn summary_line(
             line
         }
         CacheStatus::MissNoReachableSha => {
-            format!(
-                "cargo-affected: cache={status} mode=full-suite missing_shas={missing_shas}"
-            )
+            format!("cargo-affected: cache={status} mode=full-suite missing_shas={missing_shas}")
         }
-        _ => format!("cargo-affected: cache={status} mode=full-suite"),
+        // Named rather than `_`: these three share a rendering today, and a
+        // new status should have to say whether it joins them.
+        CacheStatus::MissFingerprint | CacheStatus::MissNoCoverage | CacheStatus::ForcedAll => {
+            format!("cargo-affected: cache={status} mode=full-suite")
+        }
     }
 }
 
 impl Report {
     /// Build a selection-mode report. Use [`Self::build_full_suite`] for
     /// `--all` and cache-miss paths where no selection ran.
-    pub fn build_selection(inputs: SelectionInputs<'_>) -> Self {
+    pub(crate) fn build_selection(inputs: SelectionInputs<'_>) -> Self {
         let selection = inputs.selection;
         let summary = SelectionSummary {
             selected: Some(selection.selected().len()),
             affected: Some(selection.affected.len()),
+            config: Some(selection.config_tests.len()),
             new: Some(selection.new_tests.len()),
             stranded: Some(selection.stranded_tests.len()),
             skipped: Some(selection.skipped()),
@@ -482,6 +498,7 @@ impl Report {
         let selected_tests = selection.diagnostics.per_test.as_ref().map(|per_test| {
             build_selected_tests(
                 &selection.affected,
+                &selection.config_tests,
                 &selection.new_tests,
                 &selection.stranded_tests,
                 per_test,
@@ -512,7 +529,7 @@ impl Report {
     /// `null` and `selected_tests` / `changed_files` are omitted to
     /// avoid forcing an expensive `nextest list` we wouldn't otherwise
     /// run.
-    pub fn build_full_suite(inputs: FullSuiteInputs) -> Self {
+    pub(crate) fn build_full_suite(inputs: FullSuiteInputs) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             cargo_affected_version: env!("CARGO_PKG_VERSION"),
@@ -528,6 +545,7 @@ impl Report {
                 summary: SelectionSummary {
                     selected: None,
                     affected: None,
+                    config: None,
                     new: None,
                     stranded: None,
                     skipped: None,
@@ -544,19 +562,17 @@ impl Report {
     /// `<path>.tmp`, then rename. A partial write (process killed,
     /// disk full) leaves the previous artifact intact rather than a
     /// truncated JSON file.
-    pub fn write_json(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("failed to serialize report to JSON")?;
+    pub(crate) fn write_json(&self, path: &Path) -> Result<()> {
+        let json =
+            serde_json::to_string_pretty(self).context("failed to serialize report to JSON")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!("failed to rename {} -> {}", tmp.display(), path.display())
-        })?;
+        std::fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 }
@@ -621,14 +637,15 @@ fn build_stored_fingerprints(
 /// fingerprint component lists. Used by both the JSON report's per-stored
 /// `differing_labels` and the human-facing cache-miss explanation. A label
 /// present in one side but missing from the other counts as differing.
-fn diff_labels(
-    current: &[FingerprintComponent],
-    stored: &[FingerprintComponent],
-) -> Vec<String> {
-    let current_by_label: BTreeMap<&str, &str> =
-        current.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
-    let stored_by_label: BTreeMap<&str, &str> =
-        stored.iter().map(|c| (c.label.as_str(), c.hash.as_str())).collect();
+fn diff_labels(current: &[FingerprintComponent], stored: &[FingerprintComponent]) -> Vec<String> {
+    let current_by_label: BTreeMap<&str, &str> = current
+        .iter()
+        .map(|c| (c.label.as_str(), c.hash.as_str()))
+        .collect();
+    let stored_by_label: BTreeMap<&str, &str> = stored
+        .iter()
+        .map(|c| (c.label.as_str(), c.hash.as_str()))
+        .collect();
     let mut differing: BTreeSet<String> = BTreeSet::new();
     for (label, hash) in &current_by_label {
         if stored_by_label.get(*label) != Some(hash) {
@@ -652,7 +669,7 @@ fn diff_labels(
 /// user sees *which* build input changed without parsing the JSON
 /// report. Reuses [`diff_labels`] verbatim — no host-OS-specific logic;
 /// the rustc host triple is just one of the labels that can appear.
-pub fn closest_stored_diff_labels(
+pub(crate) fn closest_stored_diff_labels(
     current: &[FingerprintComponent],
     stored: &[StoredFingerprintSnapshot],
 ) -> Vec<String> {
@@ -669,7 +686,7 @@ pub fn closest_stored_diff_labels(
 /// unconditionally; the leading space is part of the returned text so
 /// the slot reads cleanly inside a sentence ("for the current
 /// environment{clause} — running …").
-pub fn fingerprint_miss_clause(labels: &[String]) -> String {
+pub(crate) fn fingerprint_miss_clause(labels: &[String]) -> String {
     if labels.is_empty() {
         String::new()
     } else {
@@ -731,6 +748,7 @@ fn build_changed_files_entries(
                     line_overlap: counts.line_overlap,
                     structural_backstop: counts.structural_backstop,
                     crate_root_sentinel: counts.crate_root_sentinel,
+                    config_rule: counts.config_rule,
                 },
             }
         })
@@ -745,14 +763,17 @@ fn build_changed_files_entries(
 
 fn build_selected_tests(
     affected: &BTreeSet<TestId>,
+    config_tests: &BTreeSet<TestId>,
     new_tests: &BTreeSet<TestId>,
     stranded: &BTreeSet<TestId>,
     per_test: &BTreeMap<TestId, Vec<HitReason>>,
 ) -> Vec<SelectedTestEntry> {
-    // Union all selected tests, classify, and emit in a stable order.
+    // Union all selected tests, classify, and emit in a stable order. The four
+    // sets are disjoint, so the classification order only needs to be exhaustive.
     let mut out: Vec<SelectedTestEntry> = Vec::new();
     let union: BTreeSet<&TestId> = affected
         .iter()
+        .chain(config_tests.iter())
         .chain(new_tests.iter())
         .chain(stranded.iter())
         .collect();
@@ -761,6 +782,8 @@ fn build_selected_tests(
             SelectedTestKind::New
         } else if stranded.contains(test) {
             SelectedTestKind::Stranded
+        } else if config_tests.contains(test) {
+            SelectedTestKind::ConfigRule
         } else {
             SelectedTestKind::Affected
         };
@@ -945,7 +968,10 @@ mod tests {
         });
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
-        assert_eq!(json["selection"]["summary"]["mode"], "full-suite-no-listing");
+        assert_eq!(
+            json["selection"]["summary"]["mode"],
+            "full-suite-no-listing"
+        );
         assert!(json["selection"]["summary"]["selected"].is_null());
         assert!(json["selection"]["changed_files"].is_null());
         assert!(json["selection"]["selected_tests"].is_null());

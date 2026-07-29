@@ -1,11 +1,16 @@
 //! Shared test-selection plumbing for `run`, `status`, and `collect --diff`.
 //!
 //! Reachability classification, per-sha diff collection, the selection
-//! computation itself, and the human-facing notices/summaries. The three
-//! callers all walk the same path: classify stored `collect_sha`s, gather
-//! per-sha changed line ranges, list tests via nextest, look up overlaps for
-//! known tests, and union with tests added since the last `collect`. This
-//! module owns the whole flow so the callers can't drift apart.
+//! computation itself, and the human-facing notices/summaries — the pieces
+//! every selection walks: classify stored `collect_sha`s, gather per-sha
+//! changed line ranges, look up overlaps for known tests, and union with
+//! tests added since the last `collect`.
+//!
+//! The pieces live here; the order they're called in does not. `run` and
+//! `status` reach them through [`crate::plan`], which is what keeps those two
+//! agreeing. `collect --diff` composes them differently — it has already
+//! listed tests for its own purposes and wants a selection to rerun, not to
+//! report — so it calls [`select_with_reach`] directly.
 //!
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
@@ -22,7 +27,9 @@ use anyhow::Result;
 
 use crate::collect::Listing;
 use crate::db::{Db, HitKind, HitReason, TestId};
-use crate::project::{git_changed_line_ranges, relation_to_head, LineRange, ShaRelation};
+use crate::project::{
+    git_added_files_since, git_changed_line_ranges, relation_to_head, LineRange, ShaRelation,
+};
 
 /// Result of the selection computation.
 pub(crate) struct Selection {
@@ -30,6 +37,8 @@ pub(crate) struct Selection {
     /// Excludes `#[ignore]`d tests: their coverage rows can persist from
     /// an earlier (non-ignored) collect, but `nextest run` would skip them
     /// — same all-ignored-selection rationale as [`new_tests`].
+    ///
+    /// [`new_tests`]: Self::new_tests
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
@@ -43,6 +52,15 @@ pub(crate) struct Selection {
     /// them so consumers can tell the difference between "added in this
     /// PR" and "anchor sha got rebased away".
     pub(crate) stranded_tests: BTreeSet<TestId>,
+    /// Reachable-known tests force-selected by a `[workspace.metadata.affected]` rule —
+    /// a changed input (snapshot, doc, template) matched a rule's globs and
+    /// coverage couldn't link it to the test. Disjoint from [`affected`]
+    /// (a test pulled in by both counts as `affected`) and from
+    /// `new`/`stranded` (those aren't reachable-known); these would have been
+    /// *skipped* without the rule. Excludes `#[ignore]`d tests.
+    ///
+    /// [`affected`]: Self::affected
+    pub(crate) config_tests: BTreeSet<TestId>,
     /// Distinct test count tracked under the current fingerprint at
     /// reachable shas. The "tests we could have selected from" denominator.
     pub(crate) reachable_known_count: usize,
@@ -56,19 +74,21 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
-    /// Union of affected, stranded, and new tests — what nextest will be
-    /// asked to run.
+    /// Union of affected, stranded, new, and config-rule tests — what nextest
+    /// will be asked to run.
     pub(crate) fn selected(&self) -> BTreeSet<TestId> {
         let mut out = self.affected.clone();
         out.extend(self.new_tests.iter().cloned());
         out.extend(self.stranded_tests.iter().cloned());
+        out.extend(self.config_tests.iter().cloned());
         out
     }
 
-    /// Known tests not selected this round.
+    /// Known tests not selected this round. Both `affected` and `config_tests`
+    /// are reachable-known and selected, so both reduce the skipped count.
     pub(crate) fn skipped(&self) -> usize {
         self.reachable_known_count
-            .saturating_sub(self.affected.len())
+            .saturating_sub(self.affected.len() + self.config_tests.len())
     }
 }
 
@@ -77,7 +97,7 @@ impl Selection {
 /// dominated by `Full`'s per-test reason vectors, so the default is
 /// bounded; `Full` is opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum DiagnosticDetail {
+pub(crate) enum DiagnosticDetail {
     /// Per-file/per-kind aggregate counters only.
     Summary,
     /// Per-test reason vectors plus the per-file aggregates.
@@ -98,25 +118,29 @@ pub(crate) struct SelectionDiagnostics {
 /// Counts are deduplicated by strongest reason: a test with both a
 /// LineOverlap hit and a CrateRootSentinel hit on the same file counts
 /// once, classified by the strongest reason
-/// (LineOverlap > StructuralBackstop > CrateRootSentinel). Per-file
-/// counts therefore sum to `total_unique_tests`, making the diagnostic
-/// arithmetic clean.
+/// (LineOverlap > StructuralBackstop > ConfigRule > CrateRootSentinel).
+/// Per-file counts therefore sum to `total_unique_tests`, making the
+/// diagnostic arithmetic clean.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileReasonCounts {
     pub(crate) line_overlap: usize,
     pub(crate) structural_backstop: usize,
     pub(crate) crate_root_sentinel: usize,
+    pub(crate) config_rule: usize,
     pub(crate) total_unique_tests: usize,
 }
 
 /// Strongest-reason ordering. Used to dedupe per-test reasons when
 /// rolling up to per-file counts: a test counts ONCE per file, by its
-/// strongest reason.
+/// strongest reason. ConfigRule ranks below the coverage-derived reasons
+/// (its file has no coverage rows, so in practice it never co-occurs with
+/// them on the same file) but above the bare sentinel.
 fn strongest(a: HitKind, b: HitKind) -> HitKind {
     fn rank(k: HitKind) -> u8 {
         match k {
-            HitKind::LineOverlap => 2,
-            HitKind::StructuralBackstop => 1,
+            HitKind::LineOverlap => 3,
+            HitKind::StructuralBackstop => 2,
+            HitKind::ConfigRule => 1,
             HitKind::CrateRootSentinel => 0,
         }
     }
@@ -226,12 +250,15 @@ pub(crate) fn changed_ranges_per_sha(
 
 /// Compute selection given a pre-built listing and a `Reachability`.
 ///
-/// Bundles the two steps that always happen together — per-sha diff query
-/// and the selection compute — so the three callers (`run`, `status`,
-/// `collect --diff`) don't each open-code the pair. Caller stays
-/// responsible for handling `reach.reachable.is_empty()` upstream:
-/// `run`/`status` widen to all tests there, `collect --diff` bails. Those
-/// policies and their notices differ, so they don't belong in here.
+/// Bundles the per-sha diff query with the selection compute for the caller
+/// that only wants the answer: `collect --diff`. [`crate::plan`] runs the
+/// same pair by hand because it needs the intermediate ranges again when
+/// building the report, and re-deriving them would mean a second `git diff
+/// -U0` per reachable sha.
+///
+/// Caller stays responsible for handling `reach.reachable.is_empty()`
+/// upstream: `run`/`status` widen to all tests there, `collect --diff` bails.
+/// Those policies and their notices differ, so they don't belong in here.
 pub(crate) fn select_with_reach(
     project_root: &Path,
     db: &Db,
@@ -241,12 +268,16 @@ pub(crate) fn select_with_reach(
     detail: DiagnosticDetail,
 ) -> Result<Selection> {
     let changed_ranges_by_sha = changed_ranges_per_sha(project_root, &reach.reachable)?;
+    // `collect --diff` recollects coverage for changed Rust code; config rules
+    // select tests to *run* despite absent coverage, which is a `run`/`status`
+    // concern. Pass no config hits here.
     compute(
         db,
         fingerprint,
         &reach.reachable,
         &changed_ranges_by_sha,
         listing,
+        &BTreeMap::new(),
         detail,
     )
 }
@@ -262,6 +293,7 @@ pub(crate) fn select_with_precomputed_ranges(
     listing: &Listing,
     reach: &Reachability,
     changed_ranges_by_sha: &ChangedRangesBySha,
+    config_hits: &BTreeMap<String, BTreeSet<TestId>>,
     detail: DiagnosticDetail,
 ) -> Result<Selection> {
     compute(
@@ -270,8 +302,34 @@ pub(crate) fn select_with_precomputed_ranges(
         &reach.reachable,
         changed_ranges_by_sha,
         listing,
+        config_hits,
         detail,
     )
+}
+
+/// Union of all paths that changed between the working tree and any reachable
+/// `collect_sha` — for matching against `[workspace.metadata.affected]` rule globs.
+///
+/// Modified files come from the per-sha diff already computed for selection;
+/// added files (which `git diff -U0` omits — they have no OLD side) come from
+/// [`git_added_files_since`]; working-tree changes (uncommitted, staged,
+/// untracked) come from `working_tree_files`. Without the added-files source,
+/// a PR that adds a brand-new `.snap`/doc with no modified sibling would slip
+/// through.
+pub(crate) fn changed_paths_since(
+    project_root: &Path,
+    reach: &Reachability,
+    changed_ranges_by_sha: &ChangedRangesBySha,
+    working_tree_files: &[String],
+) -> Result<BTreeSet<String>> {
+    let mut paths: BTreeSet<String> = working_tree_files.iter().cloned().collect();
+    for by_file in changed_ranges_by_sha.values() {
+        paths.extend(by_file.keys().cloned());
+    }
+    for sha in &reach.reachable {
+        paths.extend(git_added_files_since(project_root, sha)?);
+    }
+    Ok(paths)
 }
 
 /// Compute the selection from a pre-built nextest listing and per-sha changed
@@ -305,6 +363,7 @@ pub(crate) fn compute(
     reachable_shas: &BTreeSet<String>,
     changed_ranges_by_sha: &ChangedRangesBySha,
     listing: &Listing,
+    config_hits: &BTreeMap<String, BTreeSet<TestId>>,
     detail: DiagnosticDetail,
 ) -> Result<Selection> {
     // Mark this fingerprint as recently used so the next collect's LRU
@@ -343,8 +402,7 @@ pub(crate) fn compute(
     // In `Full` mode we additionally retain the per-test vector for the
     // JSON report to consume.
     let mut affected = BTreeSet::new();
-    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> =
-        BTreeMap::new();
+    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> = BTreeMap::new();
     let mut per_test_reasons: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
     let retain_per_test = matches!(detail, DiagnosticDetail::Full);
     for (collect_sha, ranges_by_file) in changed_ranges_by_sha {
@@ -352,8 +410,7 @@ pub(crate) fn compute(
             if hunks.is_empty() {
                 continue;
             }
-            let hits =
-                db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
+            let hits = db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
                 if listing.ignored.contains(&hit.test_id) {
                     // Coverage rows from a previous (non-ignored) collect
@@ -384,6 +441,44 @@ pub(crate) fn compute(
         }
     }
 
+    // Declarative input rules: a changed (typically non-Rust) input matched a
+    // `[workspace.metadata.affected]` rule. Coverage can't link these inputs to tests, so
+    // the rule supplies the edge. A reachable-known test that isn't already
+    // `affected` would otherwise be skipped — rescue it as a `config_test`.
+    // New/stranded matches already run; ignored ones stay skipped by nextest.
+    let mut config_tests = BTreeSet::new();
+    for (path, tests) in config_hits {
+        for test in tests {
+            if listing.ignored.contains(test)
+                || affected.contains(test)
+                || !reachable_known.contains(test)
+            {
+                continue;
+            }
+            config_tests.insert(test.clone());
+            strongest_per_file_test
+                .entry(path.clone())
+                .or_default()
+                .entry(test.clone())
+                .and_modify(|k| *k = strongest(*k, HitKind::ConfigRule))
+                .or_insert(HitKind::ConfigRule);
+            if retain_per_test {
+                // Config reasons name the triggering input path; they have no
+                // sha-anchored coverage hunk, so those fields are left empty.
+                per_test_reasons
+                    .entry(test.clone())
+                    .or_default()
+                    .push(HitReason {
+                        collect_sha: String::new(),
+                        file: path.clone(),
+                        kind: HitKind::ConfigRule,
+                        matched_hunk: (0, 0),
+                        stored_range: None,
+                    });
+            }
+        }
+    }
+
     let per_file = aggregate_per_file_counts(&strongest_per_file_test);
     let diagnostics = SelectionDiagnostics {
         per_file,
@@ -394,6 +489,7 @@ pub(crate) fn compute(
         affected,
         new_tests,
         stranded_tests,
+        config_tests,
         reachable_known_count,
         listed,
         diagnostics,
@@ -414,6 +510,7 @@ fn aggregate_per_file_counts(
                 HitKind::LineOverlap => counts.line_overlap += 1,
                 HitKind::StructuralBackstop => counts.structural_backstop += 1,
                 HitKind::CrateRootSentinel => counts.crate_root_sentinel += 1,
+                HitKind::ConfigRule => counts.config_rule += 1,
             }
             counts.total_unique_tests += 1;
         }
@@ -429,10 +526,11 @@ fn aggregate_per_file_counts(
 pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> String {
     let selected = sel.selected();
     let mut out = format!(
-        "{} tests {verb} ({} affected + {} new + {} stranded, \
+        "{} tests {verb} ({} affected + {} config + {} new + {} stranded, \
          {} skipped of {} reachable-known)",
         selected.len(),
         sel.affected.len(),
+        sel.config_tests.len(),
         sel.new_tests.len(),
         sel.stranded_tests.len(),
         sel.skipped(),
@@ -445,6 +543,8 @@ pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> Stri
                 " (new)"
             } else if sel.stranded_tests.contains(t) {
                 " (stranded)"
+            } else if sel.config_tests.contains(t) {
+                " (config)"
             } else {
                 ""
             };
@@ -468,6 +568,7 @@ mod tests {
         affected: &[TestId],
         new_tests: &[TestId],
         stranded_tests: &[TestId],
+        config_tests: &[TestId],
         reachable_known_count: usize,
     ) -> Selection {
         let listed: BTreeSet<TestId> = affected
@@ -475,11 +576,13 @@ mod tests {
             .cloned()
             .chain(new_tests.iter().cloned())
             .chain(stranded_tests.iter().cloned())
+            .chain(config_tests.iter().cloned())
             .collect();
         Selection {
             affected: affected.iter().cloned().collect(),
             new_tests: new_tests.iter().cloned().collect(),
             stranded_tests: stranded_tests.iter().cloned().collect(),
+            config_tests: config_tests.iter().cloned().collect(),
             reachable_known_count,
             listed,
             diagnostics: SelectionDiagnostics {
@@ -495,42 +598,48 @@ mod tests {
             &[tid("crate_a", "test_a"), tid("crate_a", "test_b")],
             &[tid("crate_a", "test_c")],
             &[],
+            &[],
             5,
         );
         let out = format_summary(&sel, "to run", false);
         assert_eq!(
             out,
-            "3 tests to run (2 affected + 1 new + 0 stranded, \
+            "3 tests to run (2 affected + 0 config + 1 new + 0 stranded, \
              3 skipped of 5 reachable-known) — pass -v to list"
         );
     }
 
     #[test]
-    fn summary_verbose_tags_new_and_stranded() {
+    fn summary_verbose_tags_categories() {
         let sel = selection_with(
             &[tid("crate_a", "test_a")],
             &[tid("crate_a", "test_b")],
             &[tid("crate_a", "test_c")],
-            4,
+            &[tid("crate_a", "test_d")],
+            5,
         );
         let out = format_summary(&sel, "would run", true);
         assert_eq!(
             out,
-            "3 tests would run (1 affected + 1 new + 1 stranded, \
-             3 skipped of 4 reachable-known):\n  \
+            "4 tests would run (1 affected + 1 config + 1 new + 1 stranded, \
+             3 skipped of 5 reachable-known):\n  \
              crate_a::test_a\n  \
              crate_a::test_b (new)\n  \
-             crate_a::test_c (stranded)"
+             crate_a::test_c (stranded)\n  \
+             crate_a::test_d (config)"
         );
     }
 
     #[test]
-    fn skipped_saturates_when_all_known_selected() {
+    fn skipped_subtracts_affected_and_config() {
+        // 2 affected + 1 config, all reachable-known → all 3 selected, none
+        // skipped.
         let sel = selection_with(
             &[tid("crate_a", "a"), tid("crate_a", "b")],
             &[],
             &[],
-            2,
+            &[tid("crate_a", "c")],
+            3,
         );
         assert_eq!(sel.skipped(), 0);
     }
@@ -539,12 +648,36 @@ mod tests {
     fn strongest_reason_orders_line_then_backstop_then_sentinel() {
         // Pairwise: stronger arg returned regardless of position.
         for (a, b, expected) in [
-            (HitKind::LineOverlap, HitKind::CrateRootSentinel, HitKind::LineOverlap),
-            (HitKind::CrateRootSentinel, HitKind::LineOverlap, HitKind::LineOverlap),
-            (HitKind::StructuralBackstop, HitKind::CrateRootSentinel, HitKind::StructuralBackstop),
-            (HitKind::CrateRootSentinel, HitKind::StructuralBackstop, HitKind::StructuralBackstop),
-            (HitKind::LineOverlap, HitKind::StructuralBackstop, HitKind::LineOverlap),
-            (HitKind::StructuralBackstop, HitKind::LineOverlap, HitKind::LineOverlap),
+            (
+                HitKind::LineOverlap,
+                HitKind::CrateRootSentinel,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::CrateRootSentinel,
+                HitKind::LineOverlap,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::StructuralBackstop,
+                HitKind::CrateRootSentinel,
+                HitKind::StructuralBackstop,
+            ),
+            (
+                HitKind::CrateRootSentinel,
+                HitKind::StructuralBackstop,
+                HitKind::StructuralBackstop,
+            ),
+            (
+                HitKind::LineOverlap,
+                HitKind::StructuralBackstop,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::StructuralBackstop,
+                HitKind::LineOverlap,
+                HitKind::LineOverlap,
+            ),
         ] {
             assert_eq!(strongest(a, b), expected, "{a:?} vs {b:?}");
         }

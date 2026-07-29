@@ -4,9 +4,11 @@
 //! then queries git for changed files to select which tests to rerun.
 
 mod collect;
+mod config;
 mod coverage;
 mod db;
 mod fingerprint;
+mod plan;
 mod project;
 mod report;
 mod run;
@@ -26,7 +28,7 @@ use clap::{Parser, Subcommand};
     bin_name = "cargo affected",
     version,
     disable_help_subcommand = true,
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Print extra output: pipeline internals during `collect`, every
@@ -97,6 +99,13 @@ enum Action {
         /// Detail level for the report's selection section.
         #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
         report_detail: selection::DiagnosticDetail,
+        /// Extra args forwarded to the `cargo nextest list` this uses to
+        /// enumerate tests. Must be preceded by `--` (e.g. `cargo affected
+        /// status -- --features foo`). Pass whatever you'd pass `run`: the
+        /// flags decide which tests get built, so a dry run listing a
+        /// feature-less build under-reports against `run -- --features foo`.
+        #[arg(last = true)]
+        nextest_args: Vec<String>,
     },
     /// Clear stored coverage data from target/affected/coverage.db.
     Clean,
@@ -190,8 +199,14 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         Action::Status {
             report_json,
             report_detail,
+            nextest_args,
         } => {
-            status::status(verbose, report_json.as_deref(), report_detail)?;
+            status::status(
+                verbose,
+                report_json.as_deref(),
+                report_detail,
+                &nextest_args,
+            )?;
             Ok(0)
         }
         Action::Clean => {
@@ -270,6 +285,17 @@ mod tests {
     }
 
     #[test]
+    fn status_accepts_explicit_double_dash_separator() {
+        // `status` predicts `run`, so it takes the same passthrough — the
+        // build flags decide which tests exist to be predicted about.
+        let cli = parse(&["status", "--", "--features", "foo"]);
+        let Action::Status { nextest_args, .. } = cli.action else {
+            panic!("expected Status");
+        };
+        assert_eq!(nextest_args, vec!["--features", "foo"]);
+    }
+
+    #[test]
     fn run_keeps_global_verbose_for_cargo_affected() {
         // Without `--`, `--verbose` is unambiguously cargo-affected's global
         // flag — the strict parse stops nextest from stealing it.
@@ -306,7 +332,10 @@ mod tests {
     fn known_run_flags_parse_before_double_dash() {
         // Subcommand-owned flags still parse normally before `--`.
         let cli = parse(&["run", "--all", "--", "--features", "foo"]);
-        let Action::Run { all, nextest_args, .. } = cli.action else {
+        let Action::Run {
+            all, nextest_args, ..
+        } = cli.action
+        else {
             panic!("expected Run");
         };
         assert!(all);

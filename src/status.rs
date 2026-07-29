@@ -1,23 +1,24 @@
 //! Status reporting: show stored coverage data and what would run for current changes.
 //!
-//! Mirrors `run`'s contract: reports "would run all tests" with an
-//! explanation when the cache offers nothing usable (no data, fingerprint
-//! mismatch, or every stored `collect_sha` unreachable). Partial divergence
-//! proceeds with the reachable subset, same as `run`.
+//! This is the conditional-tense rendering of [`crate::plan`]; `run` is the
+//! present-tense one. Both reach the selection through the same call, so
+//! "would run all tests" here and "running all tests" there answer to one
+//! decision rather than two implementations that have to be kept agreeing.
 //!
-//! Like `run`, can write a structured JSON diagnostic report via
-//! `--report-json <PATH>`. Unlike `run`, never invokes nextest — only
-//! lists tests via `nextest list` and never executes them.
+//! What's genuinely this command's own: a database inventory on stdout (path,
+//! last collect, tracked tests, stored regions, collect shas) and the fact
+//! that it stops at `nextest list` and never executes anything.
 
 use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::{nextest_list, require_nextest};
-use crate::db::{db_path, warn_untracked_rs_files, Db, StoredFingerprintRow};
-use crate::fingerprint::{self, Fingerprint};
-use crate::project::{find_project_root, git_changed_files, ShaRelation};
-use crate::report::{self, CacheStatus, FullSuiteInputs, Report, SelectionInputs};
+use crate::collect::{cargo_build_args, require_nextest};
+use crate::db::{db_path, warn_untracked_rs_files, Db};
+use crate::fingerprint;
+use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
+use crate::project::{find_project_root, git_changed_files};
+use crate::report::{self, CacheStatus};
 use crate::selection::{self, DiagnosticDetail};
 
 /// Entry point for `cargo affected status`.
@@ -25,12 +26,18 @@ use crate::selection::{self, DiagnosticDetail};
 /// Reports "would run all tests" (with an explanation) when the cache
 /// offers nothing usable — no coverage, fingerprint mismatch, or every
 /// stored `collect_sha` unreachable. Partial divergence proceeds with the
-/// reachable subset and surfaces stranded tests, mirroring `run` so the
-/// dry-run accurately predicts what `run` would do.
-pub fn status(
+/// reachable subset and surfaces stranded tests.
+///
+/// The prediction comes from [`crate::plan::plan`], the same call `run`
+/// makes, so "what would run" can't drift from what runs. `nextest_args`
+/// therefore matters here as much as it does for `run`: it decides which
+/// tests get built, and a dry run listing a feature-less build would
+/// under-report against a `run -- --features …`.
+pub(crate) fn status(
     verbose: bool,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,
+    nextest_args: &[String],
 ) -> Result<()> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
@@ -45,7 +52,8 @@ pub fn status(
             // No DB at all → still emit a partial report naming
             // MissNoCoverage so consumers get a parseable artifact.
             let fingerprint = fingerprint::compute(&project)?;
-            write_full_suite(
+            plan::write_full_suite_report(
+                "status",
                 CacheStatus::MissNoCoverage,
                 Some(fingerprint),
                 vec![],
@@ -53,107 +61,105 @@ pub fn status(
                 report_path,
             )?;
         }
-        eprintln!("{}", report::summary_line(CacheStatus::MissNoCoverage, None, 0, 0));
+        eprintln!(
+            "{}",
+            report::summary_line(CacheStatus::MissNoCoverage, None, 0, 0)
+        );
         return Ok(());
     }
 
     let fingerprint = fingerprint::compute(&project)?;
     let db = Db::open(project_root)?;
-    let stored = if report_json.is_some() {
-        db.stored_fingerprint_snapshots()?
-    } else {
-        Vec::new()
-    };
+    let Assessment {
+        test_count,
+        collect_shas,
+        stored,
+        state,
+    } = plan::assess(project_root, &db, &fingerprint, report_json.is_some())?;
 
-    let known_count = db.test_count(&fingerprint.hex)?;
-    let region_count = db.region_count(&fingerprint.hex)?;
     let last_collected = db.last_collected()?.unwrap_or_else(|| "never".to_string());
-    let collect_shas = db.collect_shas(&fingerprint.hex)?;
-
     let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
 
-    if known_count == 0 {
-        // Fetch stored snapshots on demand for the diff line if --report-json
-        // didn't already force the read; cheap relative to the rest of status.
-        let stored = if stored.is_empty() {
-            db.stored_fingerprint_snapshots()?
-        } else {
-            stored
-        };
-        let (status, reason) = if !stored.is_empty() {
-            let snapshots = report::snapshots_from(stored.clone());
-            let differing =
-                report::closest_stored_diff_labels(&fingerprint.components, &snapshots);
-            (
-                CacheStatus::MissFingerprint,
-                format!(
-                    "no coverage data for the current environment{}",
-                    report::fingerprint_miss_clause(&differing),
-                ),
-            )
-        } else {
-            (CacheStatus::MissNoCoverage, "no coverage data yet".to_string())
-        };
+    // The inventory heads the output either way; what follows it depends on
+    // whether any of it turned out to be usable. Nothing tracked means there
+    // are no regions or shas to count, so those queries don't run.
+    if test_count == 0 {
+        println!(
+            "coverage database: {}\nlast collected: {last_collected}",
+            rel_path.display(),
+        );
+    } else {
         println!(
             "coverage database: {}\n\
              last collected: {last_collected}\n\
-             {reason} — would run all tests; run `cargo affected collect` to enable selection",
+             tests tracked: {test_count}\n\
+             regions stored: {}",
             rel_path.display(),
+            db.region_count(&fingerprint.hex)?,
         );
-        if let Some(report_path) = report_json {
-            write_full_suite(status, Some(fingerprint), stored, vec![], report_path)?;
-        }
-        eprintln!("{}", report::summary_line(status, None, 0, 0));
-        return Ok(());
+        let mut sha_list: Vec<&str> = collect_shas.iter().map(String::as_str).collect();
+        sha_list.sort();
+        println!("collect shas: {}", sha_list.join(", "));
     }
 
-    println!(
-        "coverage database: {}\n\
-         last collected: {last_collected}\n\
-         tests tracked: {known_count}\n\
-         regions stored: {region_count}",
-        rel_path.display(),
-    );
-    let mut sha_list: Vec<&str> = collect_shas.iter().map(String::as_str).collect();
-    sha_list.sort();
-    println!("collect shas: {}", sha_list.join(", "));
-
-    let reach = selection::check_shas_reachable(project_root, &collect_shas)?;
-    if !reach.missing.is_empty() {
-        let stale_rows = db.region_count_at_shas(&fingerprint.hex, &reach.missing)?;
-        println!(
-            "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
-            selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
-            if reach.missing.len() == 1 { "" } else { "s" },
-        );
-    }
-    if reach.reachable.is_empty() {
-        println!(
-            "\nnote: no reachable collect_sha for the current environment — \
-             would run all tests; run `cargo affected collect` to re-anchor"
-        );
-        if let Some(report_path) = report_json {
-            let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
-            let collect_sha_snapshots = report::collect_sha_snapshots(&reach, &row_counts);
-            write_full_suite(
-                CacheStatus::MissNoReachableSha,
-                Some(fingerprint),
-                stored,
-                collect_sha_snapshots,
-                report_path,
-            )?;
+    if let Some(reach) = state.reachability() {
+        if !reach.missing.is_empty() {
+            let stale_rows = db.region_count_at_shas(&fingerprint.hex, &reach.missing)?;
+            println!(
+                "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
+                selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
+                if reach.missing.len() == 1 { "" } else { "s" },
+            );
         }
-        eprintln!(
-            "{}",
-            report::summary_line(
-                CacheStatus::MissNoReachableSha,
-                None,
-                reach.missing.len(),
-                0,
-            )
-        );
-        return Ok(());
     }
+
+    let reach = match state {
+        CacheState::Usable(reach) => reach,
+        CacheState::Miss(miss) => {
+            let status = miss.status();
+            let (collect_sha_snapshots, missing) = match &miss {
+                CacheMiss::NoCoverage => {
+                    println!(
+                        "no coverage data yet — would run all tests; \
+                         run `cargo affected collect` to enable selection"
+                    );
+                    (Vec::new(), 0)
+                }
+                CacheMiss::Fingerprint { differing } => {
+                    println!(
+                        "no coverage data for the current environment{} — would run \
+                         all tests; run `cargo affected collect` to enable selection",
+                        report::fingerprint_miss_clause(differing),
+                    );
+                    (Vec::new(), 0)
+                }
+                CacheMiss::NoReachableSha(reach) => {
+                    println!(
+                        "\nnote: no reachable collect_sha for the current environment — \
+                         would run all tests; run `cargo affected collect` to re-anchor"
+                    );
+                    let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
+                    (
+                        report::collect_sha_snapshots(reach, &row_counts),
+                        reach.missing.len(),
+                    )
+                }
+            };
+            if let Some(report_path) = report_json {
+                plan::write_full_suite_report(
+                    "status",
+                    status,
+                    Some(fingerprint),
+                    stored,
+                    collect_sha_snapshots,
+                    report_path,
+                )?;
+            }
+            eprintln!("{}", report::summary_line(status, None, missing, 0));
+            return Ok(());
+        }
+    };
+
     if reach.max_commits_ahead > 0 {
         println!(
             "\nnote: {} commit(s) since collect — \
@@ -175,57 +181,37 @@ pub fn status(
 
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");
-    // `status` takes no passthrough args, so there are no build flags to
-    // thread through — list the default build.
-    let listing = nextest_list(project_root, None, None, &[])?;
-    let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
-    let sel = selection::select_with_precomputed_ranges(
+    let plan = plan::plan(
+        &project,
         &db,
         &fingerprint.hex,
-        &listing,
         &reach,
-        &changed_ranges,
+        &changed_files,
+        &cargo_build_args(nextest_args),
         detail,
     )?;
+    let sel = &plan.selection;
 
-    let status = if reach.per_sha.values().all(|r| matches!(r, ShaRelation::Equal)) {
-        CacheStatus::HitExact
-    } else {
-        CacheStatus::HitWithDivergence
-    };
-
-    // Per-changed-file diagnostics + per-sha snapshots are report-only:
-    // they cost extra git diffs and SQLite queries that status itself
-    // doesn't need.
     if let Some(report_path) = report_json {
-        let row_counts = db.row_counts_by_sha(&fingerprint.hex)?;
-        let collect_sha_snapshots = report::collect_sha_snapshots(&reach, &row_counts);
-        let changed_files_input = report::build_changed_file_inputs(
-            project_root,
-            &db,
-            &fingerprint.hex,
-            &reach,
-            &changed_ranges,
-            &changed_files,
+        plan::write_selection_report(
+            SelectionReport {
+                command: "status",
+                project: &project,
+                db: &db,
+                fingerprint: &fingerprint,
+                stored,
+                reach: &reach,
+                plan: &plan,
+                changed_files: &changed_files,
+            },
+            report_path,
         )?;
-        let inputs = SelectionInputs {
-            command: "status",
-            current_fingerprint: fingerprint.hex.clone(),
-            current_components: fingerprint.components.clone(),
-            stored_fingerprints: report::snapshots_from(stored),
-            collect_shas: collect_sha_snapshots,
-            status,
-            selection: &sel,
-            changed_files: changed_files_input,
-            include_changed_files: true,
-        };
-        Report::build_selection(inputs).write_json(report_path)?;
     }
 
     eprintln!(
         "{}",
         report::summary_line(
-            status,
+            plan.status,
             Some((sel.selected().len(), sel.reachable_known_count)),
             reach.missing.len(),
             reach.max_commits_ahead,
@@ -241,28 +227,7 @@ pub fn status(
         return Ok(());
     }
 
-    println!("\n{}", selection::format_summary(&sel, "would run", verbose));
+    println!("\n{}", selection::format_summary(sel, "would run", verbose));
 
     Ok(())
-}
-
-/// Build and write a full-suite report from the given fingerprint and
-/// stored snapshots. Mirrors run.rs's helper of the same name; both
-/// callers compose the inputs identically.
-fn write_full_suite(
-    status: CacheStatus,
-    fingerprint: Option<Fingerprint>,
-    stored: Vec<StoredFingerprintRow>,
-    collect_shas: Vec<crate::report::CollectShaSnapshot>,
-    path: &Path,
-) -> Result<()> {
-    let inputs = FullSuiteInputs {
-        command: "status",
-        current_fingerprint: fingerprint.as_ref().map(|f| f.hex.clone()),
-        current_components: fingerprint.map(|f| f.components),
-        stored_fingerprints: report::snapshots_from(stored),
-        collect_shas,
-        status,
-    };
-    Report::build_full_suite(inputs).write_json(path)
 }
