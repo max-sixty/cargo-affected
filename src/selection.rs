@@ -40,8 +40,6 @@ pub(crate) struct Selection {
     /// the project's own `default-filter` excludes. `nextest run` would
     /// skip every one of them; selecting them anyway can collapse the
     /// effective set to nothing and trip nextest's "no tests to run" exit.
-    ///
-    /// [`new_tests`]: Self::new_tests
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
@@ -50,6 +48,8 @@ pub(crate) struct Selection {
     /// [`affected`] above: an `#[ignore]`d or filter-excluded test would
     /// otherwise read as `(new)` forever, since it never runs and never
     /// gains a coverage row.
+    ///
+    /// [`affected`]: Self::affected
     pub(crate) new_tests: BTreeSet<TestId>,
     /// Tests present in the nextest listing AND in the DB, but only
     /// anchored at currently-missing collect_shas. Functionally identical
