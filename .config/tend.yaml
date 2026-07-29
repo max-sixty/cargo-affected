@@ -1,0 +1,5 @@
+bot_name: cargo-affected-bot
+workflows:
+  ci-fix:
+    watched_workflows:
+    - ci

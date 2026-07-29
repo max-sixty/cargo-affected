@@ -111,11 +111,7 @@ fn write_three_one_test_modules(dir: &std::path::Path, crate_name: &str) {
 
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("lib.rs"),
-        "pub mod a;\npub mod b;\npub mod c;\n",
-    )
-    .unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
     for (file, name) in [("a.rs", "a"), ("b.rs", "b"), ("c.rs", "c")] {
         std::fs::write(
             src.join(file),
@@ -219,7 +215,10 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     all_shas.sort();
     let mut expected = vec![sha0, sha1, sha2];
     expected.sort();
-    assert_eq!(all_shas, expected, "three distinct collect_shas should coexist");
+    assert_eq!(
+        all_shas, expected,
+        "three distinct collect_shas should coexist"
+    );
 }
 
 #[test]
@@ -514,11 +513,72 @@ fn diff_collect_prunes_deleted_tests() {
     );
 }
 
+/// An `#[ignore]`d test is skipped by `cargo nextest run` but still appears
+/// in `cargo nextest list`. `--diff`'s prune compares the listing against
+/// the DB to drop renamed/deleted tests — it must NOT drop a merely-ignored
+/// test, whose stored coverage is still valid. (New-test detection excludes
+/// ignored tests, but they stay in `listing.tests` precisely so the prune
+/// keeps their rows.)
+#[test]
+fn diff_collect_keeps_ignored_test_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_ignored_rows");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Edit `add`'s body so test_add is rerun (a non-ignored test must run,
+    // or `--diff` would have no profraw to extract), and mark test_multiply
+    // `#[ignore]` — it stays listed, so the prune must keep its rows.
+    replace_in_file(&dir.join("src/math.rs"), "a + b", "a + b + 0");
+    replace_in_file(
+        &dir.join("src/math.rs"),
+        "    #[test]\n    fn test_multiply()",
+        "    #[test]\n    #[ignore]\n    fn test_multiply()",
+    );
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "ignore test_multiply"]);
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert!(
+        diff.status.success(),
+        "collect --diff failed: stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+    let combined = combined_output(&diff);
+    assert!(
+        !combined.contains("pruned"),
+        "an ignored test must not be pruned, got:\n{combined}"
+    );
+
+    // DB invariant: test_multiply's rows survive the prune.
+    let db_path = dir.join("target/affected/coverage.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let surviving: Vec<String> = conn
+        .prepare("SELECT DISTINCT test_name FROM test_regions")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        surviving.iter().any(|t| t == "math::tests::test_multiply"),
+        "ignored test_multiply's rows should remain, got: {surviving:?}",
+    );
+}
+
 /// All-phantom selection: every selected test exists in the DB but has been
 /// removed from the nextest listing. The structural-edit backstop pulls
 /// both math.rs tests into `affected`; both are now absent from the
 /// listing, so the nextest filter matches nothing and the runner shim
-/// never fires. `handle_no_profraw_dirs` should recognize this as the
+/// never fires. `handle_no_results` should recognize this as the
 /// expected "filter matched nothing real" case (rather than a runner
 /// shim failure) and prune the stale rows.
 #[test]
