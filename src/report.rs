@@ -90,7 +90,7 @@ pub(crate) enum CacheStatus {
 
 impl CacheStatus {
     /// Stable kebab-case string for the stderr summary line (reached via
-    /// the [`Display`] impl). The serde derive independently produces the
+    /// the [`std::fmt::Display`] impl). The serde derive independently produces the
     /// same kebab-case encoding for JSON; these are two mappings that must
     /// agree, and `cache_status_as_str_matches_serde` guards that they do.
     pub(crate) fn as_str(self) -> &'static str {
