@@ -111,11 +111,7 @@ fn write_three_one_test_modules(dir: &std::path::Path, crate_name: &str) {
 
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("lib.rs"),
-        "pub mod a;\npub mod b;\npub mod c;\n",
-    )
-    .unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
     for (file, name) in [("a.rs", "a"), ("b.rs", "b"), ("c.rs", "c")] {
         std::fs::write(
             src.join(file),
@@ -219,7 +215,10 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     all_shas.sort();
     let mut expected = vec![sha0, sha1, sha2];
     expected.sort();
-    assert_eq!(all_shas, expected, "three distinct collect_shas should coexist");
+    assert_eq!(
+        all_shas, expected,
+        "three distinct collect_shas should coexist"
+    );
 }
 
 #[test]
