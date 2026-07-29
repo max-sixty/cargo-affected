@@ -172,7 +172,11 @@ fn workspace_collect_finds_all_tests_across_targets() {
             .map(|r| r.unwrap())
             .collect()
     };
-    for expected in ["test_math_add", "test_math_integration", "test_strings_greet"] {
+    for expected in [
+        "test_math_add",
+        "test_math_integration",
+        "test_strings_greet",
+    ] {
         assert!(
             test_names.iter().any(|t| t.contains(expected)),
             "expected {expected} in DB, got: {test_names:?}"

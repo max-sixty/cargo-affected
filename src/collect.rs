@@ -2,10 +2,12 @@
 //!
 //! Delegates build and test execution to `cargo nextest run`. We insert a
 //! small runner shim (`cargo-affected runner-shim`) via
-//! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at
-//! a per-test subdirectory before `exec`ing the real test binary. After
-//! nextest finishes we walk those subdirectories, merge profraws, export
-//! coverage, and write per-(test, file) line ranges to SQLite.
+//! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at a
+//! per-test subdirectory, runs the real test binary, and turns its profile
+//! into line ranges on the spot. Each binary's function map — the expensive,
+//! test-invariant half of that translation — is exported once, before the run.
+//! After nextest finishes we read the per-test results back and write
+//! per-(test, file) line ranges to SQLite.
 //!
 //! We use the `--config` array form rather than the
 //! `CARGO_TARGET_<TRIPLE>_RUNNER` env var because cargo only
@@ -31,17 +33,21 @@
 //!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
 //! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
 //!    git error surfaces before we spend time on coverage parsing.
-//! 5. **Inside the runner shim**: each test's shim (`cargo-affected
+//! 5. Export each participating binary's coverage map **once**, with
+//!    `llvm-cov export` against an empty profile, and leave it under
+//!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
+//!    and it doesn't vary per test — see [`write_function_maps`].
+//! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
-//!    profraw with `llvm-profdata`, exports with `llvm-cov`, parses hit
-//!    ranges, writes a small per-test result file under
+//!    profraw to text with `llvm-profdata`, joins the functions it names
+//!    against the binary's map, writes a small per-test result file under
 //!    `CARGO_AFFECTED_RESULTS_DIR`, and **deletes the per-test profraw dir
 //!    before exiting**. Extraction runs in the process that ran the test, so
 //!    peak disk usage is bounded by nextest's own concurrency
 //!    (O(test-threads × per-test bundle) instead of O(whole-suite)) with no
 //!    external watcher or completion heuristic — the completion signal is the
 //!    test process exiting. See [`crate::shim`].
-//! 6. After nextest exits, read the per-test result files and store mappings
+//! 7. After nextest exits, read the per-test result files and store mappings
 //!    + collect_sha in the DB keyed by (binary_id, test_name).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,7 +57,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
-use crate::coverage::HitRange;
+use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{
@@ -68,7 +74,7 @@ use crate::shim::{self, TestOutcome, TestResult};
 /// new HEAD. Other tests' rows stay put. Errors out if there's no prior
 /// collect for the current environment, or if any stored sha is no longer
 /// reachable from HEAD.
-pub fn collect(
+pub(crate) fn collect(
     diff: bool,
     verbose: bool,
     allow_dirty: bool,
@@ -147,13 +153,16 @@ pub fn collect(
         }
     }
 
-    // Profraw bundles and the per-test result files the shim writes both live
-    // under target/affected/ alongside the DB, each PID-suffixed so concurrent
-    // `collect` invocations don't wipe each other's staging.
+    // Profraw bundles, the per-binary function maps and the per-test result
+    // files the shim writes all live under target/affected/ alongside the DB,
+    // each PID-suffixed so concurrent `collect` invocations don't wipe each
+    // other's staging.
     let pid = std::process::id();
     let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
     let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
-    for dir in [&profraw_dir, &results_dir] {
+    let function_maps_dir =
+        affected_dir(project_root).join(format!("{FUNCTION_MAPS_DIR_PREFIX}{pid}"));
+    for dir in [&profraw_dir, &results_dir, &function_maps_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
                 .with_context(|| format!("failed to clean {}", dir.display()))?;
@@ -180,14 +189,13 @@ pub fn collect(
             );
         }
     }
-    let crate_root_ranges_by_binary_id: BTreeMap<String, BTreeSet<HitRange>> =
-        crate_root_sentinels
-            .into_iter()
-            .map(|(binary_id, paths)| {
-                let ranges = paths.into_iter().map(HitRange::sentinel).collect();
-                (binary_id, ranges)
-            })
-            .collect();
+    let crate_root_ranges_by_binary_id: BTreeMap<String, BTreeSet<HitRange>> = crate_root_sentinels
+        .into_iter()
+        .map(|(binary_id, paths)| {
+            let ranges = paths.into_iter().map(HitRange::sentinel).collect();
+            (binary_id, ranges)
+        })
+        .collect();
 
     let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     if !rustflags.is_empty() {
@@ -234,11 +242,7 @@ pub fn collect(
         match plan_diff_collect(project_root, &db, env_fingerprint, &listing)? {
             DiffOutcome::Plan(plan) => Some(plan),
             DiffOutcome::NothingToRecollect { listed } => {
-                let pruned = db.prune_missing_tests(env_fingerprint, &listed)?;
-                if pruned > 0 {
-                    let s = if pruned == 1 { "" } else { "s" };
-                    eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-                }
+                prune_and_report(&mut db, env_fingerprint, &listed)?;
                 eprintln!(
                     "done. nothing to recollect — no affected tests and no new tests \
                      ({:.1}s total)",
@@ -250,6 +254,20 @@ pub fn collect(
     } else {
         None
     };
+
+    // Resolve the binary half of extraction before any test runs. Only the
+    // binaries this run will actually touch need a map — a `--diff` collect
+    // rerunning three tests shouldn't pay to export a whole workspace.
+    let mapped = binaries_for_run(&listing, diff_plan.as_ref());
+    let s = if mapped.len() == 1 { "y" } else { "ies" };
+    eprintln!("exporting coverage maps for {} binary{s}...", mapped.len());
+    write_function_maps(
+        &function_maps_dir,
+        &mapped,
+        &llvm_profdata,
+        &llvm_cov,
+        &canonical_root,
+    )?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
     // test writes to its own per-test profraw directory.
@@ -276,14 +294,13 @@ pub fn collect(
         .arg("--no-tests=warn")
         .env("RUSTFLAGS", &rustflags)
         // The runner shim extracts each test's coverage in-process and writes
-        // a result file; it needs the staging locations, the LLVM tools, and
-        // the canonical root (for path-relative range filtering). Names are
-        // shared constants so the setter here can't drift from the reader.
+        // a result file; it needs the staging locations, llvm-profdata, and
+        // the function maps exported above. Names are shared constants so the
+        // setter here can't drift from the reader.
         .env(shim::ENV_PROFRAW_BASE, &profraw_dir)
         .env(shim::ENV_RESULTS_DIR, &results_dir)
         .env(shim::ENV_LLVM_PROFDATA, &llvm_profdata)
-        .env(shim::ENV_LLVM_COV, &llvm_cov)
-        .env(shim::ENV_CANONICAL_ROOT, &canonical_root)
+        .env(shim::ENV_FUNCTION_MAPS_DIR, &function_maps_dir)
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
@@ -318,7 +335,7 @@ pub fn collect(
             nextest_exit,
             &results_dir,
         )?;
-        remove_staging_dirs(&profraw_dir, &results_dir)?;
+        remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
         return Ok(exit);
     }
 
@@ -390,11 +407,7 @@ pub fn collect(
             &collect_sha,
             &mappings,
         )?;
-        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
+        prune_and_report(&mut db, env_fingerprint, &plan.listed)?;
     } else {
         eprintln!(
             "storing coverage for {} tests ({region_count} ranges)...",
@@ -421,7 +434,7 @@ pub fn collect(
         region_count,
         total_elapsed.as_secs_f64(),
     );
-    remove_staging_dirs(&profraw_dir, &results_dir)?;
+    remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
     Ok(nextest_exit)
 }
 
@@ -430,14 +443,162 @@ pub fn collect(
 /// success-path teardown, and the `clean` sweep so the three can't drift.
 const PROFRAW_DIR_PREFIX: &str = "profraw-";
 const RESULTS_DIR_PREFIX: &str = "results-";
+const FUNCTION_MAPS_DIR_PREFIX: &str = "function-maps-";
 
-/// Drop the per-collect profraw and results staging directories. The shim has
-/// already removed each per-test profraw bundle as it finished; what remains
-/// here is the bookkeeping shell — empty per-binary parent dirs and the small
-/// result files we just consumed. Only called from the success paths — failed
-/// collects keep whatever's still on disk for debugging.
-fn remove_staging_dirs(profraw_dir: &Path, results_dir: &Path) -> Result<()> {
-    for dir in [profraw_dir, results_dir] {
+/// All of them, for the sweeps that don't care which is which. Adding a
+/// staging dir means adding it here, or `clean` silently stops reclaiming it.
+const STAGING_DIR_PREFIXES: &[&str] = &[
+    PROFRAW_DIR_PREFIX,
+    RESULTS_DIR_PREFIX,
+    FUNCTION_MAPS_DIR_PREFIX,
+];
+
+/// The binaries whose tests this run will execute, and so the ones needing a
+/// coverage map.
+///
+/// Both branches key off testcases rather than binaries, which also excludes
+/// the testless ones nextest lists anyway — a lib target holding only
+/// constants compiles to a test binary with no instrumented code at all, and
+/// `llvm-cov export` rejects a binary with no coverage map.
+///
+/// A full collect runs every listed test. A `--diff` collect runs only the
+/// selected ones, whose selection can include "phantoms" (tests still in the
+/// DB but gone from the listing) with no binary left to export.
+///
+/// A user filter in the post-`--` passthrough can narrow the run further, and
+/// isn't accounted for here — nextest owns filterset evaluation. The cost of
+/// over-answering is one export per unused binary, bounded by the binary count
+/// rather than the test count.
+fn binaries_for_run<'a>(
+    listing: &'a Listing,
+    diff_plan: Option<&DiffPlan>,
+) -> Vec<&'a BinaryEntry> {
+    let wanted: BTreeSet<&str> = match diff_plan {
+        Some(plan) => plan
+            .selected
+            .iter()
+            .filter(|test| plan.listed.contains(test))
+            .map(|test| test.binary_id.as_str())
+            .collect(),
+        None => listing.tests.iter().map(|t| t.binary_id.as_str()).collect(),
+    };
+    listing
+        .binaries
+        .iter()
+        .filter(|b| wanted.contains(b.binary_id.as_str()))
+        .collect()
+}
+
+/// Export each binary's function map into `function_maps_dir`, where the
+/// runner shim reads it back (see [`shim::map_path`] for the naming).
+///
+/// The export is run against a deliberately empty profile: `llvm-cov export`
+/// needs one, but every count it produces is discarded here. What survives is
+/// the part of its output that the profile can't change — which functions the
+/// binary contains and which source lines each occupies. That is the expensive
+/// part (34 MB of JSON for a 63,000-function test binary, most of it
+/// dependencies) and the part that is identical for every test in the binary,
+/// which is the whole reason it's hoisted out of the per-test path.
+///
+/// Each map is stamped with the binary it came from, so the shim can tell a
+/// map apart from one built for an earlier build of the same file — cargo's
+/// hash suffix can't, being metadata-derived. See [`coverage::BinaryStamp`].
+///
+/// Failures bail rather than degrade, including a map that comes back empty:
+/// a binary running tests always has instrumented project code, so no
+/// functions under the project root means the paths didn't line up
+/// (`--remap-path-prefix`, a root that isn't a prefix of the sources) and
+/// every test in that binary would silently collect nothing but crate-root
+/// sentinels. Better to say so before running the suite than after.
+fn write_function_maps(
+    function_maps_dir: &Path,
+    binaries: &[&BinaryEntry],
+    llvm_profdata: &Path,
+    llvm_cov: &Path,
+    canonical_root: &Path,
+) -> Result<()> {
+    // An empty text profile merges into a valid profile containing no records,
+    // which is exactly what "report every function as unexecuted" needs.
+    let proftext = function_maps_dir.join("empty.proftext");
+    let profdata = function_maps_dir.join("empty.profdata");
+    std::fs::write(&proftext, "").context("failed to write the empty profile")?;
+    let merge = Command::new(llvm_profdata)
+        .arg("merge")
+        .arg(&proftext)
+        .arg("-o")
+        .arg(&profdata)
+        .output()
+        .context("failed to run llvm-profdata merge")?;
+    if !merge.status.success() {
+        bail!(
+            "llvm-profdata merge failed to build an empty profile: {}",
+            String::from_utf8_lossy(&merge.stderr).trim(),
+        );
+    }
+
+    for binary in binaries {
+        // POSIX ERE — no negative lookahead, so the regex enumerates prefixes
+        // to drop. It shrinks `files[]` but leaves `functions[]` (the bulk of
+        // the JSON) intact; `coverage::build_function_map` filters
+        // authoritatively via `strip_prefix(canonical_root)`.
+        let export = Command::new(llvm_cov)
+            .arg("export")
+            .arg("--format=text")
+            .arg(format!("--instr-profile={}", profdata.display()))
+            .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
+            .arg(&binary.binary_path)
+            .output()
+            .with_context(|| format!("failed to run llvm-cov export for {}", binary.binary_id))?;
+        if !export.status.success() {
+            bail!(
+                "llvm-cov export failed for {}: {}",
+                binary.binary_id,
+                String::from_utf8_lossy(&export.stderr).trim(),
+            );
+        }
+        let json = String::from_utf8_lossy(&export.stdout);
+        let functions = coverage::build_function_map(&json, canonical_root)
+            .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
+        if functions.is_empty() {
+            bail!(
+                "{} has no instrumented functions under {} — every test in it \
+                 would collect nothing. Check that the project root is a \
+                 prefix of the paths the compiler recorded (a \
+                 --remap-path-prefix in RUSTFLAGS is the usual cause).",
+                binary.binary_id,
+                canonical_root.display(),
+            );
+        }
+        let map = coverage::BinaryFunctionMap {
+            binary: coverage::BinaryStamp::of(&binary.binary_path)?,
+            functions,
+        };
+        let path = shim::map_path(function_maps_dir, &binary.binary_path).with_context(|| {
+            format!(
+                "{} has no file name to key its map by",
+                binary.binary_path.display(),
+            )
+        })?;
+        std::fs::write(&path, serde_json::to_vec(&map)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
+    // Leave the directory holding nothing but maps, so anything that later
+    // walks it doesn't have to know about the scaffolding.
+    for scratch in [&proftext, &profdata] {
+        std::fs::remove_file(scratch)
+            .with_context(|| format!("failed to remove {}", scratch.display()))?;
+    }
+    Ok(())
+}
+
+/// Drop this collect's staging directories. The shim has already removed each
+/// per-test profraw bundle as it finished; what remains here is the
+/// bookkeeping shell — empty per-binary parent dirs, the small result files we
+/// just consumed, and the function maps. Only called from the success paths —
+/// failed collects keep whatever's still on disk for debugging.
+fn remove_staging_dirs(dirs: &[&Path]) -> Result<()> {
+    for dir in dirs {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
                 .with_context(|| format!("failed to remove {}", dir.display()))?;
@@ -446,11 +607,11 @@ fn remove_staging_dirs(profraw_dir: &Path, results_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove every leftover `profraw-*` / `results-*` staging dir under
-/// `target/affected/`. A successful `collect` removes its own, but a crashed
-/// or cancelled run — or a shim SIGKILL'd mid-extraction before its own
-/// cleanup — can orphan bundles (potentially the multi-GB profraw set this
-/// design exists to bound). `clean` reclaims them. Returns the count removed.
+/// Remove every leftover staging dir under `target/affected/`. A successful
+/// `collect` removes its own, but a crashed or cancelled run — or a shim
+/// SIGKILL'd mid-extraction before its own cleanup — can orphan bundles
+/// (potentially the multi-GB profraw set this design exists to bound).
+/// `clean` reclaims them. Returns the count removed.
 ///
 /// Only invoked from `clean` (an explicit, destructive user command), never at
 /// collect startup: the PID suffix lets concurrent collects coexist, and a
@@ -467,9 +628,7 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
             && path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| {
-                    n.starts_with(PROFRAW_DIR_PREFIX) || n.starts_with(RESULTS_DIR_PREFIX)
-                });
+                .is_some_and(|n| STAGING_DIR_PREFIXES.iter().any(|p| n.starts_with(p)));
         if is_staging {
             std::fs::remove_dir_all(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
@@ -484,7 +643,7 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
 /// levels of walking find them all. Sorted by `(binary_id, test_name)` so the
 /// skip log and stored rows come out in a stable order.
 ///
-/// An unreadable or unparseable result file is skipped with a warning, not a
+/// An unreadable or unparsable result file is skipped with a warning, not a
 /// hard error: the shim writes atomically (`.tmp` + rename), so a torn file
 /// shouldn't occur, but if one does (e.g. the shim was SIGKILL'd at just the
 /// wrong moment, or the disk filled), losing one test's coverage — it
@@ -547,7 +706,10 @@ impl DiffPlan {
     /// current listing). Used to distinguish the all-phantoms case from a
     /// runner-shim failure when extraction yields no results.
     fn live_selected_count(&self) -> usize {
-        self.selected.iter().filter(|t| self.listed.contains(t)).count()
+        self.selected
+            .iter()
+            .filter(|t| self.listed.contains(t))
+            .count()
     }
 }
 
@@ -560,9 +722,7 @@ enum DiffOutcome {
     Plan(DiffPlan),
     /// Nothing to recollect — no affected tests, no new tests. Caller still
     /// runs prune so renamed/deleted tests' rows go away.
-    NothingToRecollect {
-        listed: BTreeSet<TestId>,
-    },
+    NothingToRecollect { listed: BTreeSet<TestId> },
 }
 
 /// Run the diff-mode preflight + selection. Read-only against `db` — any
@@ -621,7 +781,10 @@ fn plan_diff_collect(
         return Ok(DiffOutcome::NothingToRecollect { listed: sel.listed });
     }
 
-    eprintln!("\n{}\n", selection::format_summary(&sel, "to recollect", false));
+    eprintln!(
+        "\n{}\n",
+        selection::format_summary(&sel, "to recollect", false)
+    );
     Ok(DiffOutcome::Plan(DiffPlan {
         selected,
         listed: sel.listed,
@@ -675,11 +838,7 @@ fn handle_no_results(
             "no tests rerun: every selected test is absent from the current \
              nextest listing (renamed or deleted between collects)"
         );
-        let pruned = db.prune_missing_tests(env_fingerprint, &plan.listed)?;
-        if pruned > 0 {
-            let s = if pruned == 1 { "" } else { "s" };
-            eprintln!("pruned {pruned} test{s} no longer present in nextest list");
-        }
+        prune_and_report(db, env_fingerprint, &plan.listed)?;
         return Ok(0);
     }
 
@@ -757,8 +916,7 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to read {}", project_config.display()))
+            return Err(e).with_context(|| format!("failed to read {}", project_config.display()))
         }
     };
     let mut doc: toml_edit::DocumentMut = existing
@@ -894,13 +1052,13 @@ pub(crate) struct Listing {
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
-/// One binary in nextest's listing. Carried for the suite-level count
-/// surfaced in collect's progress output; the runner shim sources binary_id
+/// One binary in nextest's listing. `binary_path` is where its coverage map
+/// comes from and what names the map file; the runner shim sources binary_id
 /// directly from `NEXTEST_BINARY_ID` at test time.
 #[derive(Debug, Clone)]
 pub(crate) struct BinaryEntry {
-    #[allow(dead_code)]
     pub(crate) binary_id: String,
+    pub(crate) binary_path: PathBuf,
 }
 
 /// Enumerate all tests via `cargo nextest list --message-format json`.
@@ -956,7 +1114,10 @@ pub(crate) fn nextest_list(
         .wait_with_output()
         .context("failed to wait for cargo nextest list")?;
     if !output.status.success() {
-        bail!("cargo nextest list failed (exit {:?})", output.status.code());
+        bail!(
+            "cargo nextest list failed (exit {:?})",
+            output.status.code()
+        );
     }
 
     let stdout = std::str::from_utf8(&output.stdout)
@@ -974,8 +1135,13 @@ pub(crate) fn nextest_list(
                 .and_then(|v| v.as_str())
                 .context("nextest list entry missing binary-id")?
                 .to_string();
+            let binary_path = suite
+                .get("binary-path")
+                .and_then(|v| v.as_str())
+                .context("nextest list entry missing binary-path")?;
             binaries.push(BinaryEntry {
                 binary_id: binary_id.clone(),
+                binary_path: PathBuf::from(binary_path),
             });
             let Some(cases) = suite.get("testcases").and_then(|v| v.as_object()) else {
                 continue;
@@ -1019,7 +1185,11 @@ pub(crate) fn require_nextest(project_root: &Path) -> Result<()> {
     };
     // `cargo nextest --version` prints `cargo-nextest 0.9.132 (...)`. Pull
     // out the second whitespace-separated field on the first line.
-    let line = std::str::from_utf8(&stdout).unwrap_or_default().lines().next().unwrap_or("");
+    let line = std::str::from_utf8(&stdout)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("");
     let version = line.split_whitespace().nth(1).unwrap_or("");
     if !nextest_version_at_least(version, MIN_NEXTEST_VERSION) {
         bail!(
@@ -1037,10 +1207,11 @@ const MIN_NEXTEST_VERSION: &str = "0.9.116";
 
 /// Compare `actual` >= `required` using semver-ish dotted-number ordering.
 /// Trailing pre-release/build metadata after `-` or `+` is ignored.
-/// Conservative: any unparseable version is treated as too old.
+/// Conservative: any unparsable version is treated as too old.
 fn nextest_version_at_least(actual: &str, required: &str) -> bool {
     fn parts(v: &str) -> Option<Vec<u64>> {
-        v.split(['-', '+']).next()?
+        v.split(['-', '+'])
+            .next()?
             .split('.')
             .map(|p| p.parse().ok())
             .collect()
@@ -1049,6 +1220,21 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
         (Some(a), Some(r)) => a >= r,
         _ => false,
     }
+}
+
+/// Drop rows for tests that have vanished from the nextest listing, and say
+/// how many went.
+///
+/// Three paths reach this same point from different directions — a `--diff`
+/// with nothing to recollect, a `--diff` after its run, and the no-results
+/// handler — and they are all reporting one fact, so they report it one way.
+fn prune_and_report(db: &mut Db, env_fingerprint: &str, listed: &BTreeSet<TestId>) -> Result<()> {
+    let pruned = db.prune_missing_tests(env_fingerprint, listed)?;
+    if pruned > 0 {
+        let s = if pruned == 1 { "" } else { "s" };
+        eprintln!("pruned {pruned} test{s} no longer present in nextest list");
+    }
+    Ok(())
 }
 
 /// Find an LLVM tool by name.
@@ -1137,6 +1323,73 @@ fn current_target() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
+        Listing {
+            tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
+            ignored: BTreeSet::new(),
+            binaries: binaries
+                .iter()
+                .map(|(id, path)| BinaryEntry {
+                    binary_id: id.to_string(),
+                    binary_path: PathBuf::from(path),
+                })
+                .collect(),
+        }
+    }
+
+    /// A full collect maps every binary that has a test to run — and only
+    /// those. A lib target holding no tests compiles to a binary with no
+    /// coverage map at all, which `llvm-cov export` rejects outright.
+    #[test]
+    fn binaries_for_run_skips_testless_binaries() {
+        let listing = listing(
+            &[
+                ("sample", "deps/sample-1"),
+                ("sample::golden", "deps/golden-2"),
+            ],
+            &[("sample::golden", "golden_matches")],
+        );
+        let mapped: Vec<&str> = binaries_for_run(&listing, None)
+            .iter()
+            .map(|b| b.binary_id.as_str())
+            .collect();
+        assert_eq!(mapped, ["sample::golden"]);
+    }
+
+    /// A `--diff` collect maps only the binaries its selection will reach —
+    /// the point of doing this per run rather than per workspace. Phantoms
+    /// (selected but no longer listed) contribute no binary.
+    #[test]
+    fn binaries_for_run_narrows_to_the_diff_selection() {
+        let listing = listing(
+            &[
+                ("crate-a", "deps/crate_a-1"),
+                ("crate-b", "deps/crate_b-2"),
+                ("crate-c", "deps/crate_c-3"),
+            ],
+            &[
+                ("crate-a", "test_one"),
+                ("crate-b", "test_two"),
+                ("crate-c", "test_three"),
+            ],
+        );
+        let plan = DiffPlan {
+            selected: [
+                TestId::new("crate-a", "test_one"),
+                // Phantom: in the DB, gone from the listing.
+                TestId::new("crate-c", "test_renamed_away"),
+            ]
+            .into_iter()
+            .collect(),
+            listed: listing.tests.iter().cloned().collect(),
+        };
+        let mapped: Vec<&str> = binaries_for_run(&listing, Some(&plan))
+            .iter()
+            .map(|b| b.binary_id.as_str())
+            .collect();
+        assert_eq!(mapped, ["crate-a"]);
+    }
 
     #[test]
     fn filter_expr_empty_matches_nothing() {
@@ -1273,7 +1526,9 @@ mod tests {
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         // Our selection landed under [profile.default].
         assert_eq!(
-            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            doc["profile"]["default"]["default-filter"]
+                .as_str()
+                .unwrap(),
             "binary_id(=x) & test(=y)",
         );
         // The project's own settings survived untouched.
@@ -1285,7 +1540,10 @@ mod tests {
         assert_eq!(doc["profile"]["ci"]["retries"].as_integer().unwrap(), 2);
         assert!(doc["scripts"]["setup"]["build-bins"]["command"].is_array());
         assert_eq!(
-            doc["profile"]["default"]["scripts"].as_array_of_tables().unwrap().len(),
+            doc["profile"]["default"]["scripts"]
+                .as_array_of_tables()
+                .unwrap()
+                .len(),
             1,
         );
     }
@@ -1307,7 +1565,9 @@ mod tests {
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
-            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            doc["profile"]["default"]["default-filter"]
+                .as_str()
+                .unwrap(),
             "(test(=y)) & (not test(slow))",
         );
     }
@@ -1328,7 +1588,9 @@ mod tests {
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
-            doc["profile"]["default"]["default-filter"].as_str().unwrap(),
+            doc["profile"]["default"]["default-filter"]
+                .as_str()
+                .unwrap(),
             "test(=solo)",
         );
     }
@@ -1377,7 +1639,7 @@ mod tests {
         // Pre-release / build metadata after `-`/`+` is ignored.
         assert!(nextest_version_at_least("0.9.132-dev", "0.9.116"));
         assert!(nextest_version_at_least("0.9.116+sha.abc", "0.9.116"));
-        // Unparseable: conservative — treat as too old.
+        // Unparsable: conservative — treat as too old.
         assert!(!nextest_version_at_least("garbage", "0.9.116"));
         assert!(!nextest_version_at_least("", "0.9.116"));
     }
@@ -1406,8 +1668,8 @@ mod tests {
         assert_eq!(got[0].test_name, "t_ok");
     }
 
-    /// `clean` removes leftover `profraw-*`/`results-*` staging dirs but leaves
-    /// everything else under target/affected/ (the DB, the build dir) alone.
+    /// `clean` removes every leftover staging dir but leaves everything else
+    /// under target/affected/ (the DB, the build dir) alone.
     #[test]
     fn clean_staging_dirs_removes_only_staging() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1415,13 +1677,15 @@ mod tests {
         let affected = root.join("target").join("affected");
         std::fs::create_dir_all(affected.join("profraw-123")).unwrap();
         std::fs::create_dir_all(affected.join("results-456")).unwrap();
+        std::fs::create_dir_all(affected.join("function-maps-789")).unwrap();
         std::fs::create_dir_all(affected.join("build")).unwrap();
         std::fs::write(affected.join("coverage.db"), b"db").unwrap();
 
         let removed = clean_staging_dirs(root).unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(!affected.join("profraw-123").exists());
         assert!(!affected.join("results-456").exists());
+        assert!(!affected.join("function-maps-789").exists());
         assert!(affected.join("build").exists(), "build dir preserved");
         assert!(affected.join("coverage.db").exists(), "DB preserved");
     }

@@ -33,8 +33,44 @@ jobs:
     - name: 💰 Cache
       uses: Swatinem/rust-cache@v2
 
+    - name: 🎨 Format
+      run: cargo fmt --check
+
     - name: 🔍 Clippy
       run: cargo clippy --all-targets -- -D warnings
+
+    # Broken intra-doc links compile fine and fail nothing else, so the only
+    # thing standing between a `[`Foo`]` typo and a dead reference is this gate.
+    - name: 📚 Docs
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: cargo doc --no-deps --document-private-items
+
+  # `rust-version` in Cargo.toml is a promise to everyone installing from
+  # crates.io, and nothing else in this workflow builds with anything but
+  # current stable — so without this the declared MSRV drifts upward silently
+  # and breaks installs that CI never sees.
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: 📂 Checkout code
+      uses: actions/checkout@v6
+
+    - name: 💰 Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        # Own cache — `cargo msrv verify` builds with older toolchains whose
+        # rustc hash never matches the shared (stable) cache.
+        cache-bin: "false"
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - uses: baptiste0928/cargo-install@v3
+      with:
+        crate: cargo-msrv
+        version: "=0.19.3"
+
+    - name: Verify minimum rust version
+      run: cargo msrv verify
 
   test:
     strategy:
