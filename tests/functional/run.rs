@@ -105,10 +105,7 @@ fn run_forwards_fail_fast_flags_to_nextest() {
 
     // Default fail-fast: nextest cancels after the first failure. With
     // --test-threads=1 the second test never starts.
-    let default = cargo_affected(
-        dir,
-        &["affected", "run", "--", "--test-threads=1"],
-    );
+    let default = cargo_affected(dir, &["affected", "run", "--", "--test-threads=1"]);
     assert!(
         !default.status.success(),
         "default run should fail when tests fail",
@@ -129,7 +126,13 @@ fn run_forwards_fail_fast_flags_to_nextest() {
     // failure. Pass-through proof — cargo-affected adds nothing on top.
     let nff = cargo_affected(
         dir,
-        &["affected", "run", "--", "--test-threads=1", "--no-fail-fast"],
+        &[
+            "affected",
+            "run",
+            "--",
+            "--test-threads=1",
+            "--no-fail-fast",
+        ],
     );
     assert!(
         !nff.status.success(),
