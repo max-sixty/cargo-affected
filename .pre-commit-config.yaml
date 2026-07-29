@@ -1,0 +1,43 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+        # rustfmt owns Rust files.
+        exclude: '.*\.rs$'
+  # pre-commit autoupdate reverts to mutable v1 tag; update manually
+  - repo: https://github.com/crate-ci/typos
+    rev: v1
+    hooks:
+      - id: typos
+        # https://github.com/crate-ci/typos/issues/347
+        pass_filenames: false
+  - repo: https://github.com/r0x0d/pre-commit-rust
+    rev: v1.0.1
+    hooks:
+      - id: fmt
+      - id: clippy
+        args: ["--all-targets", "--", "-D", "warnings"]
+  - repo: local
+    hooks:
+      - id: cargo-lock
+        name: cargo-lock
+        description: Ensure Cargo.lock is in sync with Cargo.toml
+        language: system
+        entry: cargo check --locked
+        pass_filenames: false
+        files: (Cargo\.toml|Cargo\.lock)$
+      - id: no-dbg
+        name: no-dbg
+        description: We shouldn't merge code with `dbg!` in
+        language: pygrep
+        types: ["rust"]
+        entry: "dbg!"
+
+ci:
+  # pre-commit.ci doesn't have a Rust toolchain, so skip Rust-specific hooks.
+  skip: [fmt, clippy, cargo-lock]
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"
