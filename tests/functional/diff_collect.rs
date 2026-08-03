@@ -10,8 +10,10 @@
 //! deleted/renamed tests while keeping merely-ignored ones, recovering from
 //! an all-phantom selection, and short-circuiting a clean tree. A few `run`
 //! cases live here too, since they exercise the multi-sha state `--diff`
-//! creates: a sibling sha is reachable rather than fatal (#9), and a single
-//! diverged sha only strands its own tests instead of widening the run.
+//! creates: a sibling sha is reachable rather than fatal (#9), and a sha
+//! that has dropped out of the object database strands only the tests
+//! anchored there instead of widening the run. (Divergence alone strands
+//! nothing — reachability is `git cat-file -e`, not ancestry.)
 //! The one hard error covered is the "fail loudly" no-prior-collect path.
 
 use crate::{
