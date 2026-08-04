@@ -1066,6 +1066,11 @@ pub(crate) struct Listing {
     /// Other reasons (`string`, `default-filter`) are left out too — they are
     /// not this filterset's verdict, and leaving them in `tests` keeps the
     /// error on the over-selecting side.
+    ///
+    /// The flip side: `ignored` wins over `expression` when both apply, so an
+    /// ignored test the filterset *also* rejects is absent from here. A caller
+    /// reading this as "the filterset's tests are `tests` minus this set" has
+    /// to subtract [`Listing::ignored`] as well — see `resolve_config_hits`.
     pub(crate) filterset_mismatched: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
 }

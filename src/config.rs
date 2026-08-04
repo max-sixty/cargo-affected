@@ -197,10 +197,19 @@ pub(crate) fn resolve_config_hits(
         // the filterset's actual result is the listing minus what it rejected.
         // Reading `tests` alone would force-select every test in the workspace
         // for any rule whose glob matched.
+        //
+        // Ignored tests come out too. nextest reports `ignored` as the mismatch
+        // *reason* in preference to `expression`, so an `#[ignore]`d test that
+        // the filterset also rejects is tagged `mismatch`/`ignored` and never
+        // lands in `filterset_mismatched` — without this, any single ignored
+        // test in the workspace would make every rule's resolved set non-empty
+        // and silence the typo'd-filterset warning below. They also can't be
+        // the answer: `nextest run` skips them, so force-selecting one selects
+        // nothing that runs.
         let tests: BTreeSet<TestId> = listing
             .tests
             .iter()
-            .filter(|t| !listing.filterset_mismatched.contains(t))
+            .filter(|t| !listing.filterset_mismatched.contains(t) && !listing.ignored.contains(t))
             .cloned()
             .collect();
         if tests.is_empty() {

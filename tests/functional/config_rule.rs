@@ -308,11 +308,23 @@ fn config_rule_filterset_narrows_to_named_tests() {
 /// Unreachable until the filterset was actually honoured: `nextest list -E`
 /// enumerates every testcase, so the resolved set was never empty in a
 /// workspace with at least one test.
+///
+/// The crate carries an `#[ignore]`d test on purpose. nextest reports
+/// `ignored` as the mismatch *reason* in preference to `expression`, so an
+/// ignored test is never tagged as filterset-rejected — resolving the rule by
+/// "listing minus filterset-rejected" alone leaves it in, the set is non-empty,
+/// and this warning goes quiet again in any workspace with a single ignored
+/// test.
 #[test]
 fn config_rule_warns_when_filterset_matches_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_golden_project(dir);
+    std::fs::write(
+        dir.join("tests").join("ignored.rs"),
+        "#[test]\n#[ignore]\nfn ignored_test() {}\n",
+    )
+    .unwrap();
     // Syntactically valid filterset; nextest accepts it and returns zero tests.
     add_affected_rule(dir, "\"golden.txt\"", "test(=no_such_test_anywhere)");
     init_git_with_initial_commit(dir);
