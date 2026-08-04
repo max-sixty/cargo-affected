@@ -10,10 +10,11 @@
 //! with `cargo nextest list -E`, so it speaks the full nextest filter language.
 //!
 //! The rules ride in the manifest cargo-affected already loads via `cargo
-//! metadata`, so there's no extra file to read. The trade-off is that the
-//! manifest is fingerprinted: editing a rule changes the coverage-cache key, so
-//! the next run re-collects. No rules → the tool behaves exactly as before, with
-//! no extra `nextest list` invocation.
+//! metadata`, so there's no extra file to read. Manifests are fingerprinted,
+//! but [`crate::fingerprint`] strips `[*.metadata]` before hashing — cargo
+//! ignores it for builds — so editing a rule is cache-neutral and you can
+//! iterate on rules without re-collecting. No rules → the tool behaves exactly
+//! as before, with no extra `nextest list` invocation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -159,6 +160,8 @@ pub(crate) fn config_rule_hits(
 /// For each rule with at least one matching changed path, `cargo nextest list
 /// -E <filterset>` resolves the filterset to concrete tests — using the same
 /// build flags as the run, so the listing matches what nextest will build.
+/// `-E` tags rather than filters (see [`crate::collect::Listing`]), so the
+/// rule's tests are the listing minus the testcases the filterset rejected.
 /// Keying on the changed path lets the JSON report attribute the selection to
 /// the file that triggered it. Rules with no matching path cost nothing (no
 /// nextest invocation), so a Rust-only diff is byte-for-byte the prior
@@ -190,7 +193,16 @@ pub(crate) fn resolve_config_hits(
                     rule.filterset
                 )
             })?;
-        let tests: BTreeSet<TestId> = listing.tests.into_iter().collect();
+        // `nextest list -E` enumerates everything and tags each testcase, so
+        // the filterset's actual result is the listing minus what it rejected.
+        // Reading `tests` alone would force-select every test in the workspace
+        // for any rule whose glob matched.
+        let tests: BTreeSet<TestId> = listing
+            .tests
+            .iter()
+            .filter(|t| !listing.filterset_mismatched.contains(t))
+            .cloned()
+            .collect();
         if tests.is_empty() {
             eprintln!(
                 "warning: {TABLE} rule matched {} but its filterset ({:?}) \

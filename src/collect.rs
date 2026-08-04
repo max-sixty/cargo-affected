@@ -1038,7 +1038,8 @@ pub(crate) fn cargo_build_args(nextest_args: &[String]) -> Vec<String> {
 }
 
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
-/// pair, the subset that is ignored, plus per-binary metadata.
+/// pair, the subset that is ignored, the subset the listing's own filterset
+/// rejected, plus per-binary metadata.
 pub(crate) struct Listing {
     /// Every testcase nextest enumerated, ignored or not. The complete set —
     /// `collect --diff` prunes DB rows against it, so a merely-ignored test
@@ -1049,6 +1050,23 @@ pub(crate) struct Listing {
     /// are skipped by `cargo nextest run`, so they never gain coverage;
     /// new-test detection must exclude them or they read as "new" forever.
     pub(crate) ignored: BTreeSet<TestId>,
+    /// Subset of `tests` that the `filter_expr` passed to this listing
+    /// rejected — nextest tags those `filter-match: { status: "mismatch",
+    /// reason: "expression" }`. Empty when no filterset was passed.
+    ///
+    /// `cargo nextest list -E <expr>` does *not* drop non-matching testcases
+    /// from `testcases`; it lists everything and tags each one. Reading
+    /// `tests` alone therefore treats "every test in the workspace" as the
+    /// filterset's result, which is why this subset has to be carried
+    /// separately rather than folded into `tests`.
+    ///
+    /// Keyed on `reason`, not on `status`: nextest reports an `#[ignore]`d
+    /// test as `mismatch`/`ignored` even with no `-E` at all, so keying on
+    /// `status` would silently pull ignored tests in here on every listing.
+    /// Other reasons (`string`, `default-filter`) are left out too — they are
+    /// not this filterset's verdict, and leaving them in `tests` keeps the
+    /// error on the over-selecting side.
+    pub(crate) filterset_mismatched: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
@@ -1077,9 +1095,11 @@ pub(crate) struct BinaryEntry {
 /// enumerates a different test set than the run builds and new-test
 /// detection ("listed minus DB") becomes unsound.
 ///
-/// `filter_expr`, when set, passes `-E <expr>` so the listing is restricted to
+/// `filter_expr`, when set, passes `-E <expr>` so the listing can name the
 /// tests matching a nextest filterset — used to resolve `[workspace.metadata.affected]`
-/// rules to concrete tests. Leave `None` for a full listing.
+/// rules to concrete tests. Leave `None` for a full listing. Note that `-E`
+/// does not *restrict* what nextest lists: rejected testcases still appear in
+/// `tests`, tagged, and surface as [`Listing::filterset_mismatched`].
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
@@ -1127,6 +1147,7 @@ pub(crate) fn nextest_list(
 
     let mut tests = BTreeSet::new();
     let mut ignored = BTreeSet::new();
+    let mut filterset_mismatched = BTreeSet::new();
     let mut binaries = Vec::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
@@ -1155,6 +1176,9 @@ pub(crate) fn nextest_list(
                 if is_ignored {
                     ignored.insert(test_id.clone());
                 }
+                if filter_expression_rejected(case) {
+                    filterset_mismatched.insert(test_id.clone());
+                }
                 tests.insert(test_id);
             }
         }
@@ -1162,8 +1186,22 @@ pub(crate) fn nextest_list(
     Ok(Listing {
         tests: tests.into_iter().collect(),
         ignored,
+        filterset_mismatched,
         binaries,
     })
+}
+
+/// Whether nextest rejected this testcase because of the `-E` filterset —
+/// `filter-match: { status: "mismatch", reason: "expression" }`.
+///
+/// Absent `filter-match` reads as "not rejected": older nextest versions
+/// that don't emit the field must not have every test read as excluded.
+fn filter_expression_rejected(case: &serde_json::Value) -> bool {
+    let Some(fm) = case.get("filter-match") else {
+        return false;
+    };
+    fm.get("status").and_then(|v| v.as_str()) == Some("mismatch")
+        && fm.get("reason").and_then(|v| v.as_str()) == Some("expression")
 }
 
 /// Ensure `cargo nextest` is available and recent enough that it sets
@@ -1328,6 +1366,7 @@ mod tests {
         Listing {
             tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
             ignored: BTreeSet::new(),
+            filterset_mismatched: BTreeSet::new(),
             binaries: binaries
                 .iter()
                 .map(|(id, path)| BinaryEntry {
