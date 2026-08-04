@@ -1,5 +1,4 @@
 bot_name: cargo-affected-bot
-harness: claude-interactive
 workflows:
   ci-fix:
     watched_workflows:
