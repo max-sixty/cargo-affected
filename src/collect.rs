@@ -1206,8 +1206,9 @@ fn filter_expression_rejected(case: &serde_json::Value) -> Result<bool> {
     let fm = case
         .get("filter-match")
         .context("nextest list testcase missing `filter-match`")?;
-    Ok(fm.get("status").and_then(|v| v.as_str()) == Some("mismatch")
-        && fm.get("reason").and_then(|v| v.as_str()) == Some("expression"))
+    let status = fm.get("status").and_then(|v| v.as_str());
+    let reason = fm.get("reason").and_then(|v| v.as_str());
+    Ok(status == Some("mismatch") && reason == Some("expression"))
 }
 
 /// Ensure `cargo nextest` is available and recent enough that it sets
