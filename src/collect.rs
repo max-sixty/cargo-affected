@@ -1181,7 +1181,7 @@ pub(crate) fn nextest_list(
                 if is_ignored {
                     ignored.insert(test_id.clone());
                 }
-                if filter_expression_rejected(case) {
+                if filter_expression_rejected(case)? {
                     filterset_mismatched.insert(test_id.clone());
                 }
                 tests.insert(test_id);
@@ -1199,14 +1199,15 @@ pub(crate) fn nextest_list(
 /// Whether nextest rejected this testcase because of the `-E` filterset —
 /// `filter-match: { status: "mismatch", reason: "expression" }`.
 ///
-/// Absent `filter-match` reads as "not rejected": older nextest versions
-/// that don't emit the field must not have every test read as excluded.
-fn filter_expression_rejected(case: &serde_json::Value) -> bool {
-    let Some(fm) = case.get("filter-match") else {
-        return false;
-    };
-    fm.get("status").and_then(|v| v.as_str()) == Some("mismatch")
-        && fm.get("reason").and_then(|v| v.as_str()) == Some("expression")
+/// A missing `filter-match` is an error rather than "not rejected": swallowing
+/// it would silently restore the whole-workspace over-selection this guards
+/// against. `require_nextest` gates on a version that always emits the field.
+fn filter_expression_rejected(case: &serde_json::Value) -> Result<bool> {
+    let fm = case
+        .get("filter-match")
+        .context("nextest list testcase missing `filter-match`")?;
+    Ok(fm.get("status").and_then(|v| v.as_str()) == Some("mismatch")
+        && fm.get("reason").and_then(|v| v.as_str()) == Some("expression"))
 }
 
 /// Ensure `cargo nextest` is available and recent enough that it sets

@@ -57,61 +57,6 @@ fn golden_matches() {
     .unwrap();
 }
 
-/// Same shape as [`write_golden_project`] but with a **second, unrelated**
-/// test alongside `golden_matches`. One test is not enough to see whether a
-/// rule's filterset is honoured: with a single-test crate, "the tests the
-/// filterset names" and "every test in the workspace" are the same set, so an
-/// implementation that ignored the filterset entirely would still look right.
-fn write_two_test_golden_project(dir: &Path) {
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        r#"[package]
-name = "config-rule-narrow-sample"
-version = "0.1.0"
-edition = "2021"
-"#,
-    )
-    .unwrap();
-    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
-
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("lib.rs"),
-        "pub const GREETING: &str = \"hello\";\npub fn unrelated() -> i32 {\n    7\n}\n",
-    )
-    .unwrap();
-
-    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
-
-    let tests = dir.join("tests");
-    std::fs::create_dir_all(&tests).unwrap();
-    std::fs::write(
-        tests.join("golden.rs"),
-        r#"#[test]
-fn golden_matches() {
-    let expected = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
-    )
-    .unwrap();
-    assert_eq!(config_rule_narrow_sample::GREETING, expected.trim());
-}
-"#,
-    )
-    .unwrap();
-    // Reads nothing on disk, so no rule and no coverage row ever links it to
-    // `golden.txt`.
-    std::fs::write(
-        tests.join("unrelated.rs"),
-        r#"#[test]
-fn unrelated_test() {
-    assert_eq!(config_rule_narrow_sample::unrelated(), 7);
-}
-"#,
-    )
-    .unwrap();
-}
-
 /// Append a `[[package.metadata.affected.rule]]` to the sample crate's
 /// Cargo.toml. `globs` is the TOML array body (e.g. `"golden.txt"`).
 fn add_affected_rule(dir: &Path, globs: &str, filterset: &str) {
@@ -264,7 +209,17 @@ fn config_rule_bogus_filterset_fails_loudly() {
 fn config_rule_filterset_narrows_to_named_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_two_test_golden_project(dir);
+    write_golden_project(dir);
+    // A **second, unrelated** test. One test is not enough to see whether a
+    // rule's filterset is honoured: with a single-test crate, "the tests the
+    // filterset names" and "every test in the workspace" are the same set, so
+    // an implementation that ignored the filterset entirely would still look
+    // right. It reads nothing on disk, so nothing links it to `golden.txt`.
+    std::fs::write(
+        dir.join("tests").join("unrelated.rs"),
+        "#[test]\nfn unrelated_test() {\n    assert_eq!(config_rule_sample::GREETING, \"hello\");\n}\n",
+    )
+    .unwrap();
     add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);
 
