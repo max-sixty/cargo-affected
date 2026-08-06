@@ -66,6 +66,22 @@ fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
 }
 
+/// Distinct `binary_id`s the database holds for the `builds` test. Two crates
+/// each ship one, so anything other than two means the shim merged or dropped
+/// a target.
+fn builds_binary_ids(dir: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(dir.join("target/affected/coverage.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT binary_id FROM test_regions WHERE test_name = 'builds'")
+        .unwrap();
+    let ids = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    ids
+}
+
 #[test]
 fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -93,15 +109,7 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     // whole point of the fix. If the shim merged them, only one binary_id
     // would appear (and one set of regions would silently overwrite the
     // other).
-    let db = dir.join("target/affected/coverage.db");
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let ids: Vec<String> = conn
-        .prepare("SELECT DISTINCT binary_id FROM test_regions WHERE test_name = 'builds'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let ids = builds_binary_ids(dir);
     assert_eq!(
         ids.len(),
         2,
@@ -167,6 +175,16 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     assert!(
         !recollect_stderr.contains("produced no coverage"),
         "post-edit collect must not drop a test's coverage; stderr:\n{recollect_stderr}"
+    );
+    // Re-check the database, not just stderr. The assertion above greps a
+    // `collect` message, so a reword of it would silently retire the guard —
+    // exactly the drift this scenario has already suffered once. The row
+    // check pins the property itself.
+    let ids = builds_binary_ids(dir);
+    assert_eq!(
+        ids.len(),
+        2,
+        "post-edit collect must keep both binary_ids for `builds`, got {ids:?}"
     );
 
     git(dir, &["checkout", "--", "mock-stub/src/lib.rs"]);
