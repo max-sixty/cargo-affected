@@ -112,13 +112,15 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
         "collect failed: stderr=\n{stderr}\nstdout=\n{}",
         String::from_utf8_lossy(&collect.stdout)
     );
+    // Every test must produce coverage. A `binary_id` the shim can't resolve
+    // is a *soft* failure — that test lands as `Skipped` and collect still
+    // exits 0 on the other binary's rows — so the exit status above proves
+    // nothing on its own. `collect` prints this line for any skip, which is
+    // the only signal that distinguishes "both targets extracted" from "one
+    // silently dropped".
     assert!(
-        !stderr.contains("failed to resolve binary_id"),
-        "shim must not bail on lib+bin same-basename: stderr=\n{stderr}",
-    );
-    assert!(
-        !stderr.contains("basename fallback ambiguous"),
-        "marker probe must disambiguate lib+bin: stderr=\n{stderr}",
+        !stderr.contains("produced no coverage"),
+        "lib+bin same-basename must not cost a target its coverage: stderr=\n{stderr}",
     );
 
     // Both targets must land under their own binary_ids — nextest's
@@ -151,7 +153,7 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
         "second collect failed: {combined}"
     );
     assert!(
-        !combined.contains("failed to resolve binary_id"),
+        !combined.contains("produced no coverage"),
         "second collect must not regress: {combined}",
     );
 }

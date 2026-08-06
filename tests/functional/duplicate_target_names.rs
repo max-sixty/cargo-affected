@@ -80,9 +80,13 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         "collect failed: stderr=\n{collect_stderr}\nstdout=\n{}",
         String::from_utf8_lossy(&collect.stdout)
     );
+    // A `binary_id` the shim can't resolve is a *soft* failure: that test
+    // lands as `Skipped` and collect still exits 0 on whatever the other
+    // binary produced, so `status.success()` above doesn't cover it.
+    // `collect` prints this line for any skip.
     assert!(
-        !collect_stderr.contains("failed to resolve binary_id"),
-        "shim must not error on duplicate-basename binaries; stderr:\n{collect_stderr}"
+        !collect_stderr.contains("produced no coverage"),
+        "duplicate-basename binaries must not cost a test its coverage; stderr:\n{collect_stderr}"
     );
 
     // Both crates' `builds` test must land under DISTINCT binary_ids — the
@@ -161,8 +165,8 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         String::from_utf8_lossy(&recollect.stdout)
     );
     assert!(
-        !recollect_stderr.contains("failed to resolve binary_id"),
-        "shim must not error on the post-edit collect; stderr:\n{recollect_stderr}"
+        !recollect_stderr.contains("produced no coverage"),
+        "post-edit collect must not drop a test's coverage; stderr:\n{recollect_stderr}"
     );
 
     git(dir, &["checkout", "--", "mock-stub/src/lib.rs"]);
