@@ -818,7 +818,6 @@ fn reason_entry(r: &HitReason) -> ReasonEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{HitKind, HitReason, TestId};
     use crate::project::ShaRelation;
 
     fn fp_component(label: &str, hash: &str) -> FingerprintComponent {
