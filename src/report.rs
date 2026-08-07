@@ -252,7 +252,8 @@ pub(crate) struct ReasonEntry {
     pub(crate) file: String,
     pub(crate) kind: ReasonKind,
     /// `[line_start, line_end]` of the stored row that matched. `None`
-    /// for `structural_backstop` (no row matched by definition).
+    /// for `structural_backstop` and `config_rule` — neither is anchored
+    /// to a coverage row, by definition.
     pub(crate) stored_range: Option<[i64; 2]>,
     /// `[start, end]` of the diff hunk that triggered selection.
     pub(crate) matched_hunk: [i64; 2],
@@ -294,9 +295,6 @@ pub(crate) struct SelectionInputs<'a> {
     pub(crate) status: CacheStatus,
     pub(crate) selection: &'a Selection,
     pub(crate) changed_files: Vec<ChangedFileInput>,
-    /// `false` collapses to `selection.changed_files = None` (no diff
-    /// anchor was usable).
-    pub(crate) include_changed_files: bool,
 }
 
 /// Inputs for [`Report::build_full_suite`] — the partial-report path for
@@ -486,14 +484,12 @@ impl Report {
             mode: SelectionMode::Selection,
         };
 
-        let changed_files = if inputs.include_changed_files {
-            Some(build_changed_files_entries(
-                &inputs.changed_files,
-                &selection.diagnostics.per_file,
-            ))
-        } else {
-            None
-        };
+        // Selection mode always has a usable diff anchor, so this is always
+        // `Some`; the `null` shape belongs to `build_full_suite`.
+        let changed_files = Some(build_changed_files_entries(
+            &inputs.changed_files,
+            &selection.diagnostics.per_file,
+        ));
 
         let selected_tests = selection.diagnostics.per_test.as_ref().map(|per_test| {
             build_selected_tests(
@@ -822,6 +818,7 @@ fn reason_entry(r: &HitReason) -> ReasonEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{HitKind, HitReason, TestId};
     use crate::project::ShaRelation;
 
     fn fp_component(label: &str, hash: &str) -> FingerprintComponent {
@@ -951,6 +948,50 @@ mod tests {
         assert_eq!(entries[1].commits_ahead, Some(6));
         assert_eq!(entries[2].relation, ShaRelationKind::Missing);
         assert_eq!(entries[2].commits_ahead, None);
+    }
+
+    /// A `config_rule` reason names the triggering input rather than a
+    /// coverage hunk: `stored_range` is null, `collect_sha` is empty and
+    /// `matched_hunk` is `[0, 0]`. `selection.rs` fills those three fields by
+    /// hand, so nothing else pins the encoding the v1 schema documents.
+    #[test]
+    fn config_rule_reason_carries_no_coverage_anchor() {
+        let test = TestId::new("sample::tests", "reads_snapshot");
+        let per_test: BTreeMap<TestId, Vec<HitReason>> = [(
+            test.clone(),
+            vec![HitReason {
+                collect_sha: String::new(),
+                file: "tests/snapshots/x.snap".to_string(),
+                kind: HitKind::ConfigRule,
+                matched_hunk: (0, 0),
+                stored_range: None,
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let config_tests: BTreeSet<TestId> = [test].into_iter().collect();
+
+        let entries = build_selected_tests(
+            &BTreeSet::new(),
+            &config_tests,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &per_test,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, SelectedTestKind::ConfigRule);
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["reasons"][0]["kind"], "config_rule");
+        assert!(
+            json["reasons"][0]["stored_range"].is_null(),
+            "config_rule matches no coverage row, so stored_range must be null"
+        );
+        assert_eq!(json["reasons"][0]["collect_sha"], "");
+        assert_eq!(
+            json["reasons"][0]["matched_hunk"],
+            serde_json::json!([0, 0])
+        );
     }
 
     /// Build a minimal full-suite report and verify the shape callers
