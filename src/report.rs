@@ -89,9 +89,10 @@ pub(crate) enum CacheStatus {
 }
 
 impl CacheStatus {
-    /// Stable kebab-case string used by the JSON serializer and the
-    /// stderr summary line. One canonical mapping; the serde derive
-    /// uses the same encoding.
+    /// Stable kebab-case string for the stderr summary line (reached via
+    /// the [`std::fmt::Display`] impl). The serde derive independently produces the
+    /// same kebab-case encoding for JSON; these are two mappings that must
+    /// agree, and `cache_status_as_str_matches_serde` guards that they do.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::HitExact => "hit-exact",
@@ -835,6 +836,31 @@ mod tests {
     fn cache_status_serializes_kebab_case() {
         let json = serde_json::to_string(&CacheStatus::HitWithDivergence).unwrap();
         assert_eq!(json, "\"hit-with-divergence\"");
+    }
+
+    /// `as_str` (stderr summary, via `Display`) and the serde derive (JSON)
+    /// are two independent kebab-case mappings that must produce the same
+    /// string for every variant. Guard the whole set so renaming one
+    /// encoding without the other fails loudly instead of silently drifting.
+    #[test]
+    fn cache_status_as_str_matches_serde() {
+        for status in [
+            CacheStatus::HitExact,
+            CacheStatus::HitWithDivergence,
+            CacheStatus::MissFingerprint,
+            CacheStatus::MissNoCoverage,
+            CacheStatus::MissNoReachableSha,
+            CacheStatus::ForcedAll,
+        ] {
+            let serde = serde_json::to_string(&status).unwrap();
+            assert_eq!(
+                serde,
+                format!("\"{}\"", status.as_str()),
+                "as_str and serde disagree for {status:?}",
+            );
+            // Display routes through as_str — keep it in the same guard.
+            assert_eq!(status.to_string(), status.as_str());
+        }
     }
 
     /// Stored fingerprint diff against current: differing labels are
