@@ -222,7 +222,27 @@ pub(crate) fn run(
 
     eprintln!("\n{}\n", selection::format_summary(sel, "to run", verbose));
 
-    let tests: Vec<TestId> = selected.into_iter().collect();
+    // Phantoms — selected but gone from the listing — can't be run, and
+    // naming them in the filterset only widens the gap between what we asked
+    // for and what nextest matched. Hand it the live subset; if that leaves
+    // nothing, there is no run to make and nextest would exit 4 on a stale
+    // cache rather than on a failing test.
+    let live = sel.live_selected();
+    if live.len() < selected.len() {
+        eprintln!(
+            "{}",
+            selection::phantom_notice(selected.len() - live.len(), "will be skipped")
+        );
+    }
+    if live.is_empty() {
+        eprintln!(
+            "no tests to run: every selected test is absent from the current \
+             nextest listing"
+        );
+        return Ok(0);
+    }
+
+    let tests: Vec<TestId> = live.into_iter().collect();
     run_tests(project_root, Some(&tests), nextest_args)
 }
 
