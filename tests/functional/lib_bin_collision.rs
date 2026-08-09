@@ -118,7 +118,7 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
     );
     assert!(
         !stderr.contains("basename fallback ambiguous"),
-        "marker probe must disambiguate lib+bin: stderr=\n{stderr}",
+        "NEXTEST_BINARY_ID must disambiguate lib+bin: stderr=\n{stderr}",
     );
 
     // Both targets must land under their own binary_ids — nextest's
@@ -141,9 +141,9 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
         "expected bin binary_id in {ids:?}",
     );
 
-    // A second collect drives the pre-run listing through the same probe
-    // path again — confirms it stays stable run-to-run, not just on a
-    // cold target/.
+    // A second collect drives the pre-run listing through the same
+    // binary_id resolution again — confirms it stays stable run-to-run,
+    // not just on a cold target/.
     let recollect = cargo_affected_stripped(dir, &["affected", "collect"]);
     let combined = combined_output(&recollect);
     assert!(
