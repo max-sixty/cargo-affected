@@ -5,7 +5,7 @@
 //! commands carried their own copies of the listing/diff/config/selection
 //! pipeline and their own report assembly, each annotated with a comment
 //! saying it mirrored the other. It had already drifted: `run` listed tests
-//! with the caller's build flags (`cargo_build_args(nextest_args)`) while
+//! with the caller's build flags (`args_for_listing(nextest_args)`) while
 //! `status` listed with none, so on any project with feature-gated tests the
 //! dry run predicted a different test set than the real one, silently and in
 //! the safe-looking direction (fewer tests listed → fewer reported).
@@ -176,9 +176,11 @@ pub(crate) struct Plan {
 /// List tests, diff against every reachable `collect_sha`, apply
 /// `[workspace.metadata.affected]` rules, and select.
 ///
-/// `build_args` must be the same flags the caller will hand `nextest run`
-/// (via `cargo_build_args`), so new-test detection compares against the test
-/// set that will actually be built rather than a feature-less one.
+/// `build_args` must be the same args the caller will hand `nextest run`
+/// (via `args_for_listing` — build flags plus positional/`-E` filters, with
+/// run-only flags dropped), so new-test detection compares against the test
+/// set that will actually be built and admitted rather than a feature-less,
+/// filter-less one.
 pub(crate) fn plan(
     project: &ProjectRoot,
     db: &Db,

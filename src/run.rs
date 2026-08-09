@@ -28,7 +28,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::collect::{
-    cargo_build_args, nextest_filter_expr, require_nextest, write_nextest_config,
+    args_for_listing, nextest_filter_expr, require_nextest, write_nextest_config,
 };
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
@@ -167,10 +167,14 @@ pub(crate) fn run(
     }
 
     eprintln!("checking for new tests...");
-    // The same cargo build flags `run_tests` hands to `nextest run`, so
+    // List with the same args `run_tests` hands to `nextest run`, so
     // new-test detection compares against the test set the run actually
-    // builds — not a feature-less one.
-    let build_args = cargo_build_args(nextest_args);
+    // builds and admits — not a feature-less, filter-less one. Run-only
+    // flags (`--retries`, `--no-fail-fast`, …) are dropped because `list`
+    // rejects them; positional substring filters and `-E` filtersets pass
+    // through so each testcase is tagged with the same `filter-match`
+    // status `nextest run` will apply.
+    let build_args = args_for_listing(nextest_args);
     let plan = plan::plan(
         &project,
         &db,
