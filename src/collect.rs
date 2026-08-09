@@ -218,9 +218,9 @@ pub(crate) fn collect(
         None,
     )?;
     eprintln!(
-        "found {} tests across {} binaries",
+        "found {} tests across {}",
         listing.tests.len(),
-        listing.binaries.len()
+        binaries_phrase(listing.binaries.len())
     );
     let fingerprint = fingerprint::compute(&project)?;
     let env_fingerprint = &fingerprint.hex;
@@ -259,8 +259,10 @@ pub(crate) fn collect(
     // binaries this run will actually touch need a map — a `--diff` collect
     // rerunning three tests shouldn't pay to export a whole workspace.
     let mapped = binaries_for_run(&listing, diff_plan.as_ref());
-    let s = if mapped.len() == 1 { "y" } else { "ies" };
-    eprintln!("exporting coverage maps for {} binary{s}...", mapped.len());
+    eprintln!(
+        "exporting coverage maps for {}...",
+        binaries_phrase(mapped.len())
+    );
     write_function_maps(
         &function_maps_dir,
         &mapped,
@@ -452,6 +454,13 @@ const STAGING_DIR_PREFIXES: &[&str] = &[
     RESULTS_DIR_PREFIX,
     FUNCTION_MAPS_DIR_PREFIX,
 ];
+
+/// "1 binary" / "2 binaries". The plural split lands mid-word, so this can't
+/// be a suffix interpolated after the noun the way `{n} test{s}` can — doing
+/// that is what produced "1 binaryy" in the map-export line.
+fn binaries_phrase(n: usize) -> String {
+    format!("{n} binar{}", if n == 1 { "y" } else { "ies" })
+}
 
 /// The binaries whose tests this run will execute, and so the ones needing a
 /// coverage map.
@@ -1323,6 +1332,13 @@ fn current_target() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binaries_phrase_splits_the_noun_not_the_suffix() {
+        assert_eq!(binaries_phrase(0), "0 binaries");
+        assert_eq!(binaries_phrase(1), "1 binary");
+        assert_eq!(binaries_phrase(2), "2 binaries");
+    }
 
     fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
         Listing {
