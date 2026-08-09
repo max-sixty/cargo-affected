@@ -2,15 +2,18 @@
 //!
 //! Two crates each ship `tests/builds.rs` — same cargo target name, so the
 //! produced binaries are `target/debug/deps/builds-<hash1>` and
-//! `target/debug/deps/builds-<hash2>`. The basename is ambiguous; only the
-//! `(package, target, kind)` triple cargo emits in its JSON identifies them
-//! uniquely.
+//! `target/debug/deps/builds-<hash2>`. The basename is ambiguous; nextest
+//! exposes the unambiguous `<package>::<target>` form to the runner shim
+//! via `NEXTEST_BINARY_ID`.
 //!
-//! `-C debuginfo=0` is set throughout. Many CI configs strip debug info, and
-//! it removes the source-path strings the older runner-shim's "byte-marker"
-//! fallback used to fingerprint each binary. This scenario asserts the
-//! triple-based lookup handles the duplicate-basename + stripped-debuginfo
-//! combination — the failure mode worktrunk hit in CI before the fix.
+//! `-C debuginfo=0` is set throughout. Many CI configs strip debug info,
+//! and stripping removes the source-path strings an earlier shim version
+//! used to fingerprint each binary when basenames collided. The current
+//! shim reads `NEXTEST_BINARY_ID` straight from the env per test, so
+//! basename collisions no longer matter for resolution; this scenario
+//! pins that property against regression — duplicate-basename plus
+//! stripped-debuginfo was the failure mode worktrunk hit in CI before
+//! the fix.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -54,8 +57,9 @@ edition = "2021"
     }
 }
 
-/// Run cargo-affected with `RUSTFLAGS='-C debuginfo=0'` so the embedded
-/// source paths the old marker fallback relied on aren't there to cheat with.
+/// Run cargo-affected with `RUSTFLAGS='-C debuginfo=0'` to mirror the
+/// stripped-binary CI environment that originally tripped the
+/// duplicate-basename bug, not just the debug-info-rich default.
 fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
     let bin = env!("CARGO_BIN_EXE_cargo-affected");
     Command::new(bin)
@@ -118,8 +122,9 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     // Force a rebuild of one crate's `builds` binary by editing its lib —
     // cargo re-hashes that binary, leaving the other unchanged. Under the
     // old shim this was the worst-case path: ambiguous basename, debuginfo
-    // stripped, partial rebuild. Under the new shim the pre-run listing
-    // refreshes paths, so the lookup remains exact.
+    // stripped, partial rebuild. The current shim sources `binary_id`
+    // from `NEXTEST_BINARY_ID` rather than the binary path, so hash
+    // shifts don't affect the lookup at all.
     replace_in_file(
         &dir.join("mock-stub/src/lib.rs"),
         "pub fn touch() {}",
@@ -147,10 +152,11 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     );
 
     // A second collect after the edit exercises the full pipeline again —
-    // pre-run listing must still produce a working binary_map. Commit the
-    // edit first so collect's clean-tree gate is satisfied; the gate exists
-    // because stored ranges would otherwise be filed under HEAD but reflect
-    // the dirty working tree.
+    // every test invocation must surface its `binary_id` via the env so the
+    // shim can route profraws correctly. Commit the edit first so collect's
+    // clean-tree gate is satisfied; the gate exists because stored ranges
+    // would otherwise be filed under HEAD but reflect the dirty working
+    // tree.
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-q", "-m", "edit mock-stub touch"]);
     let recollect = cargo_affected_stripped(dir, &["affected", "collect"]);
