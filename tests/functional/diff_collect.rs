@@ -4,9 +4,16 @@
 //! at their original sha.
 //!
 //! This file exercises the headline guarantee — multiple shas can coexist
-//! in `test_regions` for the same fingerprint after `--diff` — plus the
-//! two error paths the project's "fail loudly" stance demands: no prior
-//! collect, and a stored sha no longer reachable from HEAD.
+//! in `test_regions` for the same fingerprint after `--diff` — along with
+//! the row-maintenance and selection behaviors built on it: re-anchoring
+//! only affected tests, accumulating distinct shas across rounds, pruning
+//! deleted/renamed tests while keeping merely-ignored ones, recovering from
+//! an all-phantom selection, and short-circuiting a clean tree. A few `run`
+//! cases live here too, since they exercise the multi-sha state `--diff`
+//! creates: a sibling sha is reachable rather than fatal (#9), and a
+//! selection spanning several shas stays narrow instead of widening to the
+//! whole suite.
+//! The one hard error covered is the "fail loudly" no-prior-collect path.
 
 use crate::{
     cargo_affected, combined_output, git, git_head, init_git_with_initial_commit, replace_in_file,
