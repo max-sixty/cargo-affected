@@ -157,7 +157,8 @@ pub(crate) struct TestHit {
 /// Why a test was selected. The triple (`file`, `matched_hunk`, `kind`)
 /// describes one path through the selection logic; `stored_range` names the
 /// row that matched (absent for [`HitKind::StructuralBackstop`], where the
-/// whole point is that nothing matched).
+/// whole point is that nothing matched, and for [`HitKind::ConfigRule`],
+/// which is anchored to a config rule rather than to coverage).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HitReason {
     /// `collect_sha` the diff was anchored against. Hunks live in this
@@ -170,7 +171,8 @@ pub(crate) struct HitReason {
     /// The diff hunk that triggered the selection. Inclusive `(start, end)`.
     pub(crate) matched_hunk: (i64, i64),
     /// The stored row that overlapped the hunk. `None` when [`HitKind::StructuralBackstop`]
-    /// fired (no row overlapped — the test was pulled in by file-presence alone).
+    /// fired (no row overlapped — the test was pulled in by file-presence alone),
+    /// and for [`HitKind::ConfigRule`], which isn't anchored to coverage at all.
     pub(crate) stored_range: Option<(i64, i64)>,
 }
 
