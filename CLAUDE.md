@@ -36,6 +36,7 @@ fastest of several serial runs; see the file's module docs for why.
 - `plan.rs` — The decision `run` and `status` share, held in one place so a dry run can't predict something other than what runs: list tests, diff against every reachable `collect_sha`, apply config rules, select, classify `hit-exact` vs `hit-with-divergence`, and assemble either report shape. It was two hand-maintained copies annotated "mirrors the other", and they had drifted — `run` listed with the caller's build flags while `status` listed with none, so a feature-gated test was invisible to `status` and visible to `run`. `run.rs` and `status.rs` now hold only what differs for real: which stream, which tense, and whether anything gets executed at the end.
 - `run.rs` — `collect_shas` → reachability → [`plan`] → `nextest run` against the generated filter config. Widens to all tests only when every sha is diverged.
 - `status.rs` — The conditional-tense rendering of the same plan, plus a database inventory on stdout. Takes the same post-`--` passthrough as `run`, because the build flags decide which tests exist to predict about.
+- `report.rs` — Structured JSON diagnostic report (`--report-json`) for `run` / `status`. Versioned `SCHEMA_VERSION` (currently 1). Also powers the human-facing cache-miss line that names the fingerprint components differing from the closest stored snapshot.
 
 ## Principles
 
