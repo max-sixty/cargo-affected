@@ -157,6 +157,164 @@ fn config_rule_rescues_committed_added_input() {
     );
 }
 
+/// A bogus filterset in `[*.metadata.affected]` that nextest's parser rejects
+/// must error end-to-end, not get swallowed into a silent skip. The "fail
+/// loudly" principle (CLAUDE.md) is load-bearing here: a typo'd filterset that
+/// silently selected zero tests would re-open the very gap the rule exists to
+/// close.
+#[test]
+fn config_rule_bogus_filterset_fails_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_golden_project(dir);
+    // `&&` is a binary operator with no operands — nextest's filterset parser
+    // rejects it.
+    add_affected_rule(dir, "\"golden.txt\"", "&&");
+    init_git_with_initial_commit(dir);
+
+    // Seed coverage. `collect` doesn't resolve filtersets (no diff yet) so the
+    // bogus rule doesn't block the cache.
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    // Touch the rule's input. Resolution now happens — and must fail.
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+
+    let out = cargo_affected(dir, &["affected", "status", "-v"]);
+    let combined = combined_output(&out);
+    assert!(
+        !out.status.success(),
+        "expected failure for bogus filterset, got success: {combined}"
+    );
+    assert!(
+        combined.contains("filterset"),
+        "error must name the offending filterset: {combined}"
+    );
+}
+
+/// A rule's `filterset` must narrow the selection to the tests it names.
+///
+/// `cargo nextest list -E <expr>` lists *every* testcase and tags each with
+/// `filter-match`, rather than emitting only the matches. Reading the listing
+/// without consulting that tag made every rule force-select the whole
+/// workspace the moment one of its globs matched — safe, but it silently
+/// discards the entire speedup on any diff that touches a configured input,
+/// and it made the "filterset selected no tests" warning unreachable in any
+/// workspace with at least one test.
+#[test]
+fn config_rule_filterset_narrows_to_named_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_golden_project(dir);
+    // A **second, unrelated** test. One test is not enough to see whether a
+    // rule's filterset is honoured: with a single-test crate, "the tests the
+    // filterset names" and "every test in the workspace" are the same set, so
+    // an implementation that ignored the filterset entirely would still look
+    // right. It reads nothing on disk, so nothing links it to `golden.txt`.
+    std::fs::write(
+        dir.join("tests").join("unrelated.rs"),
+        "#[test]\nfn unrelated_test() {\n    assert_eq!(config_rule_sample::GREETING, \"hello\");\n}\n",
+    )
+    .unwrap();
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    // Only the non-Rust input changes: coverage selects nothing, so every
+    // selected test comes from the rule.
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+
+    let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
+    assert!(
+        out.contains("golden_matches (config)"),
+        "the filterset names golden_matches, so it must be config-selected: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_test"),
+        "unrelated_test is outside the rule's filterset and must NOT be \
+         selected — the filterset is being ignored: {out}"
+    );
+    assert!(
+        out.contains("1 config"),
+        "exactly one test matches the filterset: {out}"
+    );
+    assert!(
+        out.contains("selection=1/2"),
+        "expected 1 of 2 tests selected: {out}"
+    );
+}
+
+/// A rule whose filterset is *valid* but resolves to zero tests must surface a
+/// warning. The fast path already returns `Ok(())` for an empty rule set; the
+/// risk is a typo'd test name (a valid filterset that simply matches nothing)
+/// silently selecting nothing for the changed input. The warning is the
+/// signal that the rule is no longer doing its job.
+///
+/// Unreachable until the filterset was actually honoured: `nextest list -E`
+/// enumerates every testcase, so the resolved set was never empty in a
+/// workspace with at least one test.
+///
+/// The crate carries an `#[ignore]`d test on purpose. nextest reports
+/// `ignored` as the mismatch *reason* in preference to `expression`, so an
+/// ignored test is never tagged as filterset-rejected — resolving the rule by
+/// "listing minus filterset-rejected" alone leaves it in, the set is non-empty,
+/// and this warning goes quiet again in any workspace with a single ignored
+/// test.
+#[test]
+fn config_rule_warns_when_filterset_matches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_golden_project(dir);
+    std::fs::write(
+        dir.join("tests").join("ignored.rs"),
+        "#[test]\n#[ignore]\nfn ignored_test() {}\n",
+    )
+    .unwrap();
+    // Syntactically valid filterset; nextest accepts it and returns zero tests.
+    add_affected_rule(dir, "\"golden.txt\"", "test(=no_such_test_anywhere)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+
+    let out = cargo_affected(dir, &["affected", "status", "-v"]);
+    let combined = combined_output(&out);
+    // The command itself succeeds — an empty match isn't a hard error — but
+    // the warning must be visible so a typo can't silently reopen the gap.
+    assert!(
+        out.status.success(),
+        "an empty match is not a hard error: {combined}"
+    );
+    assert!(
+        combined.contains("selected no tests"),
+        "expected the no-tests warning to fire: {combined}"
+    );
+    assert!(
+        combined.contains("golden.txt"),
+        "warning should name the matched path: {combined}"
+    );
+    assert!(
+        combined.contains("selection=0/1"),
+        "an empty filterset must contribute nothing to the selection: {combined}"
+    );
+}
+
 /// A rule that matches no changed path must be inert: a Rust-only edit takes
 /// the exact pre-rule path, with no config category and no extra selection.
 #[test]
