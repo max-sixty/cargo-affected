@@ -63,3 +63,45 @@ that window that started a session — [`31266801931`](https://github.com/max-si
 at `16:22Z` — was inside the hidden half, and surfaced only because Step 2's
 `token-report.sh` fetches with `--limit 100`. Runs that leave no artifact (a
 red pre-flight, a runner-acquisition failure) have no such second chance.
+
+## Anchor the review-runs window at the predecessor run, not `now - 24h`
+
+`review-runs` computes `SINCE` as `now - 24h`, evaluated when the *agent* runs
+the command — which is the run's own start plus container boot and skill
+loading. The predecessor started at *its* cron time, earlier by however much
+drift it saw. So a strict 24-hour window opens **after** the predecessor and
+clips everything in between, and the clip is not a coin flip: it widens with
+each minute of this session's startup latency and each minute of the
+predecessor's negative drift. Anchor on the predecessor's start instead:
+
+```bash
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+PREV_START=$(gh api "repos/$REPO/actions/workflows/tend-review-runs.yaml/runs?status=completed&per_page=10" \
+  --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .created_at] | max // empty")
+SINCE=${PREV_START:-$(date -u -d '25 hours ago' +%Y-%m-%dT%H:%M:%SZ)}
+```
+
+Excluding `$GITHUB_RUN_ID` matters — this run is `completed` from the API's
+point of view only after it ends, but a resumed or re-run attempt can surface
+it early, and anchoring on itself would collapse the window to zero.
+
+Step 2 takes whole hours, so derive them from the same anchor rather than
+passing a literal `24`:
+
+```bash
+HOURS=$(( ( $(date -u +%s) - $(date -u -d "$SINCE" +%s) + 3599 ) / 3600 ))
+"/home/tend-sandbox/tend-marketplace/plugins/tend-ci-runner/scripts/token-report.sh" "$HOURS" > /tmp/token-report.json
+```
+
+Measured on 2026-08-10: the predecessor
+[`31302553802`](https://github.com/max-sixty/cargo-affected/actions/runs/31302553802)
+started `08:02:16Z`; this run started `08:16:49Z` and its first `now - 24h`
+resolved to `08:18:19Z`. Seven runs sat in that 16-minute band, two of them
+full sessions the audit exists to read — `tend-review`
+[`31302992086`](https://github.com/max-sixty/cargo-affected/actions/runs/31302992086)
+($1.57, the review that shaped this very PR) and `tend-mention`
+[`31303194553`](https://github.com/max-sixty/cargo-affected/actions/runs/31303194553)
+($1.40). The band grows during the session: a later `date -u -d '24 hours ago'`
+in the same run resolved to `08:23:54Z`, by then hiding 15 runs. Step 2 hides
+them too, because `token-report.sh 24` measures from its own invocation — so
+unlike a dropped page, there is no second listing that recovers them.
