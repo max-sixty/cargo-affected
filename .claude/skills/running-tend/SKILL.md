@@ -76,12 +76,27 @@ predecessor's negative drift. Anchor on the predecessor's start instead:
 
 ```bash
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
-PREV_START=$(gh api "repos/$REPO/actions/workflows/tend-review-runs.yaml/runs?status=completed&per_page=10" \
+PREV_START=$(gh api "repos/$REPO/actions/workflows/tend-review-runs.yaml/runs?status=success&per_page=10" \
   --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .created_at] | max // empty")
 SINCE=${PREV_START:-$(date -u -d '25 hours ago' +%Y-%m-%dT%H:%M:%SZ)}
 ```
 
-Excluding `$GITHUB_RUN_ID` matters — this run is `completed` from the API's
+`status=success`, not `status=completed`: a predecessor that died before it
+audited anything — a `startup_failure`, a runner-acquisition failure, a manual
+cancel — is still `completed`, so anchoring on it skips the day that run never
+covered. That is the same silent clip this rule exists to close, reached
+through a red predecessor rather than through drift, and it is the one case
+where the anchor would be *worse* than `now - 24h`. It is not hypothetical:
+`tend-review-runs` has three `failure` runs already
+([`25425083988`](https://github.com/max-sixty/cargo-affected/actions/runs/25425083988),
+[`25485397409`](https://github.com/max-sixty/cargo-affected/actions/runs/25485397409),
+[`25544958919`](https://github.com/max-sixty/cargo-affected/actions/runs/25544958919),
+2026-05-06 through 05-08). Anchoring at the last run that actually finished an
+audit widens the window to cover the missed day instead; the cost is
+re-reporting a day when a run dies *after* posting its tracker comment, which
+Step 5's dedup absorbs.
+
+Excluding `$GITHUB_RUN_ID` matters — this run is `success` from the API's
 point of view only after it ends, but a resumed or re-run attempt can surface
 it early, and anchoring on itself would collapse the window to zero.
 
@@ -90,7 +105,7 @@ passing a literal `24`:
 
 ```bash
 HOURS=$(( ( $(date -u +%s) - $(date -u -d "$SINCE" +%s) + 3599 ) / 3600 ))
-"/home/tend-sandbox/tend-marketplace/plugins/tend-ci-runner/scripts/token-report.sh" "$HOURS" > /tmp/token-report.json
+"${CLAUDE_PLUGIN_ROOT}/scripts/token-report.sh" "$HOURS" > /tmp/token-report.json
 ```
 
 Measured on 2026-08-10: the predecessor
