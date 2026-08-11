@@ -58,8 +58,7 @@ fn clean_then_status_reports_no_coverage() {
     assert!(post.status.success());
     let post_stdout = String::from_utf8_lossy(&post.stdout);
     assert!(
-        post_stdout.contains("no coverage data yet")
-            || post_stdout.contains("no coverage data found"),
+        post_stdout.contains("no coverage data yet"),
         "post-clean status should report no coverage, got:\n{post_stdout}"
     );
     assert!(
