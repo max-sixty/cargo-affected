@@ -66,6 +66,11 @@ red pre-flight, a runner-acquisition failure) have no such second chance.
 
 ## Anchor the review-runs window at the predecessor run, not `now - 24h`
 
+Fixed upstream in [max-sixty/tend#939](https://github.com/max-sixty/tend/pull/939)
+(merged 2026-08-12, after `0.1.14`), so drop this section once this repo's pin
+moves past the release that carries it. The recipes below match what landed
+there.
+
 `review-runs` computes `SINCE` as `now - 24h`, evaluated when the *agent* runs
 the command — which is the run's own start plus container boot and skill
 loading. The predecessor started at *its* cron time, earlier by however much
@@ -76,10 +81,23 @@ predecessor's negative drift. Anchor on the predecessor's start instead:
 
 ```bash
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
-PREV_START=$(gh api "repos/$REPO/actions/workflows/tend-review-runs.yaml/runs?status=success&per_page=10" \
-  --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .created_at] | max // empty")
+WF_ID=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id')
+PREV_START=$(gh api "repos/$REPO/actions/workflows/$WF_ID/runs?status=success&per_page=10" \
+  --jq "[.workflow_runs[] | select(.id != ${GITHUB_RUN_ID:-0}) | .created_at] | max // empty")
 SINCE=${PREV_START:-$(date -u -d '25 hours ago' +%Y-%m-%dT%H:%M:%SZ)}
+FLOOR=$(date -u -d '49 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+if [[ "$SINCE" < "$FLOOR" ]]; then SINCE=$FLOOR; fi
+echo "$SINCE" > /tmp/review-runs-since
 ```
+
+Derive the workflow id from `$GITHUB_RUN_ID` rather than naming the file: the
+id is what the run itself reports, so it survives a workflow rename that a
+hardcoded `tend-review-runs.yaml` would not — and a wrong file name doesn't
+error, it returns no runs and drops silently through to the duration fallback.
+The 49h clamp bounds a stale anchor: after an outage, or on the first run of a
+fresh repo, the predecessor can be days back, and without a floor the window
+pulls in a week. One skipped day still recovers; Step 5's dedup absorbs
+whatever a widened window reports twice.
 
 `status=success`, not `status=completed`: a predecessor that died before it
 audited anything — a `startup_failure`, a runner-acquisition failure, a manual
@@ -101,12 +119,23 @@ point of view only after it ends, but a resumed or re-run attempt can surface
 it early, and anchoring on itself would collapse the window to zero.
 
 Step 2 takes whole hours, so derive them from the same anchor rather than
-passing a literal `24`:
+passing a literal `24`. Read the anchor back from the file rather than reusing
+`$SINCE` — each Bash call is its own shell, so a variable set in Step 1 is
+empty by Step 2, and `date -u -d ""` returns today's midnight with exit 0
+rather than failing. That silently makes `HOURS` the hours since midnight,
+which near the top of the day is a *narrower* window than the literal `24` this
+rule replaces:
 
 ```bash
+SINCE=$(cat /tmp/review-runs-since)
 HOURS=$(( ( $(date -u +%s) - $(date -u -d "$SINCE" +%s) + 3599 ) / 3600 ))
 "${CLAUDE_PLUGIN_ROOT}/scripts/token-report.sh" "$HOURS" > /tmp/token-report.json
 ```
+
+Any later step that windows on `$SINCE` — Step 4's `closedAt` filter on bot PR
+dispositions — re-reads it the same way. An empty string there compares less
+than every non-null timestamp, so the filter stops windowing at all instead of
+erroring.
 
 Measured on 2026-08-10: the predecessor
 [`31302553802`](https://github.com/max-sixty/cargo-affected/actions/runs/31302553802)
