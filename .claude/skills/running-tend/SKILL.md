@@ -43,17 +43,35 @@ runs of that workflow alone. The GitHub API returns 30 per page by default and
 `review-runs` Step 1 asks for no more, so the unpaged query silently returns
 only the newest ~12 hours and reports that as the day:
 
+`$SINCE` here is the anchored window opening from the rule below, read back
+from `/tmp/review-runs-since` — not a fresh `now - 24h`.
+
 ```bash
-gh api --paginate "repos/$REPO/actions/workflows/$workflow/runs?created=>=$SINCE&status=completed&per_page=100" \
-  --jq '.workflow_runs[] | {databaseId: .id, conclusion, createdAt: .created_at, name: .name}'
+# Over-fetch by a day and window on completion: a run created before $SINCE may
+# still have been running at the predecessor's census, so `status=completed`
+# dropped it there and a `created` filter would drop it again here.
+FETCH_FROM=$(date -u -d "$SINCE - 24 hours" +%Y-%m-%dT%H:%M:%SZ)
+gh api --paginate "repos/$REPO/actions/workflows/$workflow/runs?created=>=$FETCH_FROM&status=completed&per_page=100" \
+  --jq ".workflow_runs[] | select(.updated_at >= \"$SINCE\") | {databaseId: .id, conclusion, createdAt: .created_at, updatedAt: .updated_at, name: .name}"
 ```
 
+Completion is the axis that tiles: consecutive windows butt against each other
+without a seam, where `created` leaves one. The floor is a run's whole
+lifetime, not its job cap — `created_at` starts at queue time, and a
+`cancel-in-progress: false` group can hold a run queued for hours before its
+execution begins. This repo's longest completed run is `tend-review`
+[`25516847093`](https://github.com/max-sixty/cargo-affected/actions/runs/25516847093)
+at 20h47m, which is exactly the near-timeout shape Step 3 exists to find.
+
 Cross-check the row count against `.total_count`, which is the one symptom of a
-dropped page visible without re-querying. It needs its own call — the projection
-above discards it, and `--paginate` re-applies the filter per page:
+dropped page visible without re-querying. It counts the wider `$FETCH_FROM`
+fetch, so it bounds the census from above rather than matching it — but a
+census landing on a round page boundary (30, 100) is still the signature of a
+page that was never followed. It needs its own call — the projection above
+discards it, and `--paginate` re-applies the filter per page:
 
 ```bash
-gh api "repos/$REPO/actions/workflows/$workflow/runs?created=>=$SINCE&status=completed&per_page=1" \
+gh api "repos/$REPO/actions/workflows/$workflow/runs?created=>=$FETCH_FROM&status=completed&per_page=1" \
   --jq '.total_count'
 ```
 
