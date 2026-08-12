@@ -43,13 +43,19 @@ runs of that workflow alone. The GitHub API returns 30 per page by default and
 `review-runs` Step 1 asks for no more, so the unpaged query silently returns
 only the newest ~12 hours and reports that as the day:
 
-`$SINCE` here is the anchored window opening from the rule below, read back
-from `/tmp/review-runs-since` — not a fresh `now - 24h`.
+`$SINCE` is the anchored window opening that `review-runs` Step 1 writes to
+`/tmp/review-runs-since` — not a fresh `now - 24h`. Both blocks below re-read
+it rather than inheriting it: each Bash call is its own shell, and an empty
+`$SINCE` here does not fail loudly. `date -u -d " - 24 hours"` parses as a
+relative offset from *now* and exits 0, so `FETCH_FROM` silently becomes the
+un-anchored `now - 24h` these rules exist to replace, and
+`select(.updated_at >= "")` admits every row instead of trimming.
 
 ```bash
 # Over-fetch by a day and window on completion: a run created before $SINCE may
 # still have been running at the predecessor's census, so `status=completed`
 # dropped it there and a `created` filter would drop it again here.
+SINCE=$(cat /tmp/review-runs-since)
 FETCH_FROM=$(date -u -d "$SINCE - 24 hours" +%Y-%m-%dT%H:%M:%SZ)
 gh api --paginate "repos/$REPO/actions/workflows/$workflow/runs?created=>=$FETCH_FROM&status=completed&per_page=100" \
   --jq ".workflow_runs[] | select(.updated_at >= \"$SINCE\") | {databaseId: .id, conclusion, createdAt: .created_at, updatedAt: .updated_at, name: .name}"
@@ -68,9 +74,13 @@ dropped page visible without re-querying. It counts the wider `$FETCH_FROM`
 fetch, so it bounds the census from above rather than matching it — but a
 census landing on a round page boundary (30, 100) is still the signature of a
 page that was never followed. It needs its own call — the projection above
-discards it, and `--paginate` re-applies the filter per page:
+discards it, and `--paginate` re-applies the filter per page. Derive the floor
+from the anchor file again — an unset `$FETCH_FROM` sends `created=>=`, which
+the API answers `0` rather than rejecting, so the cross-check reports zero
+against a non-empty census and inverts the signal it exists to give:
 
 ```bash
+FETCH_FROM=$(date -u -d "$(cat /tmp/review-runs-since) - 24 hours" +%Y-%m-%dT%H:%M:%SZ)
 gh api "repos/$REPO/actions/workflows/$workflow/runs?created=>=$FETCH_FROM&status=completed&per_page=1" \
   --jq '.total_count'
 ```
