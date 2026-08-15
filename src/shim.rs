@@ -322,9 +322,13 @@ pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBu
 /// Written atomically — to a `.tmp` sibling, then renamed — so the reader
 /// (`collect::read_results`) only ever sees a complete file. Extraction runs
 /// inside nextest's per-test timeout budget, so the shim can be SIGKILL'd
-/// mid-write; a half-written `.json` would otherwise make the reader's parse
-/// fail and abort the whole collect. A killed write instead leaves only a
-/// `.tmp` file, which the reader ignores.
+/// mid-write. Either way that test loses this round's coverage and is
+/// re-selected on the next `--diff`; what atomicity buys is that the loss
+/// doesn't also *look* like corruption. A half-written `.json` is read,
+/// fails to parse, and warns `ignoring unreadable coverage result` — a
+/// data-integrity message for what is really just a killed process. A killed
+/// write instead leaves only a `.tmp`, which the reader skips on extension
+/// without a word.
 ///
 /// Best-effort: a failure here costs this test one collect (it's re-selected
 /// next `--diff`), so we warn rather than abort the test.
