@@ -44,11 +44,14 @@ instead:
    `docs/prose-sweep` off `main` and open one PR titled `docs: prose-accuracy
    sweep`, one bullet per fix naming the file it touches.
 
-Anything that changes behavior keeps its own PR — including an edit under
-`.claude/skills/`, which changes *this bot's* behavior even though its diff is
-pure markdown — as does anything that adds or edits a test or an assertion
-message. Those earn an individual review slot on their own merits. Within this
-prose-only scope the rule deliberately overrides the bundled **Atomic PRs**
+Anything that changes behavior keeps its own PR — including markdown that
+instructs a future run rather than describing the code: everything under
+`.claude/skills/`, and `CLAUDE.md`'s directive sections (Principles, Build and
+test, Manual testing), whose diffs are pure prose but change *this bot's*
+behavior — as does anything that adds or edits a test or an assertion message.
+Those earn an individual review slot on their own merits. `CLAUDE.md`'s
+descriptive prose — the Architecture module summaries, Workspace support —
+stays sweepable. Within this prose-only scope the rule deliberately overrides the bundled **Atomic PRs**
 guidance. If a prose fix corrects something that is actively misleading users
 today, still put it in the sweep, but say so in its bullet so it can be
 cherry-picked ahead of the rest.
