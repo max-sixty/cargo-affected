@@ -226,13 +226,18 @@ impl ProjectRoot {
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
                     if let Some(parsed) = parse_target(target, root) {
-                        // Lib src_path is recorded separately so non-lib
-                        // targets can pick it up via the "links to own lib"
-                        // rule even if the lib isn't itself a test target.
+                        // Recorded regardless of `runs_tests`, because the two
+                        // roles are independent: a `[lib] test = false` lib
+                        // builds no test harness of its own, but every other
+                        // target in the package — and every workspace package
+                        // that depends on it — still compiles against it. Its
+                        // crate root has to stay available to the "links to
+                        // own lib" and transitive-dep rules below, or a
+                        // structural edit there selects nothing.
                         if matches!(parsed.kind, TargetKind::Lib) {
                             lib_src.insert(name, parsed.src_path.clone());
                         }
-                        if parsed.is_test_runnable() {
+                        if parsed.runs_tests {
                             targets_by_pkg.entry(name).or_default().push(parsed);
                         }
                     }
@@ -312,27 +317,22 @@ struct TestTarget {
     kind: TargetKind,
     /// Path relative to the workspace root.
     src_path: Utf8PathBuf,
+    /// Cargo's `test` flag for this target — whether cargo builds a test
+    /// harness for it, so nextest gets a binary with tests in it. False for
+    /// `[lib] test = false` and its `[[bin]]`/`[[test]]` equivalents. Such a
+    /// target contributes no `binary_id` of its own but is still a
+    /// compile-time input to the ones that do.
+    runs_tests: bool,
 }
 
-impl TestTarget {
-    /// Whether this target produces a binary nextest would actually run.
-    /// Lib/proc-macro/bin/test all qualify; bench/example don't.
-    fn is_test_runnable(&self) -> bool {
-        matches!(
-            self.kind,
-            TargetKind::Lib | TargetKind::ProcMacro | TargetKind::Bin | TargetKind::Test
-        )
-    }
-}
-
+/// Parse one `cargo metadata` target into a [`TestTarget`], or `None` if it
+/// isn't a kind that can matter for sentinels — `custom-build`, `example` and
+/// `bench` are dropped here and nowhere else.
+///
+/// Cargo's `test` flag is carried through rather than filtered on: a target
+/// with `test = false` still compiles into its package's other targets, so
+/// dropping it here would lose its crate root as a sentinel.
 fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
-    let is_test = target
-        .get("test")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !is_test {
-        return None;
-    }
     let kinds: Vec<&str> = target
         .get("kind")
         .and_then(|v| v.as_array())
@@ -353,10 +353,15 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
     let src_path = to_db_relative(rel)?;
+    let runs_tests = target
+        .get("test")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Some(TestTarget {
         name,
         kind,
         src_path,
+        runs_tests,
     })
 }
 
@@ -1344,6 +1349,90 @@ mod tests {
         assert_eq!(
             map.get("utils").unwrap(),
             &[p("utils/src/lib.rs")].into_iter().collect::<BTreeSet<_>>(),
+        );
+
+        Ok(())
+    }
+
+    /// `[lib] test = false` makes cargo report `test: false` for the lib
+    /// target. The lib then has no tests of its own — but the package's
+    /// integration tests, and every workspace package that depends on it,
+    /// still compile against it, so its crate root must remain a sentinel for
+    /// those binaries.
+    ///
+    /// `parse_target` used to bail on `test: false`, which dropped the lib
+    /// before `lib_src` ever saw it: `math::integration` lost
+    /// `math/src/lib.rs` and `strings/src/lib.rs`, so a structural edit to
+    /// either (a new `mod`, a changed `use`) selected no test at all — silent
+    /// under-selection, with nothing downstream to catch it.
+    #[test]
+    fn lib_without_test_harness_still_seeds_sentinels() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = canonicalize_no_verbatim(dir.path())?;
+        let math_lib = root.join("math/src/lib.rs");
+        let math_int = root.join("math/tests/integration.rs");
+        let strings_lib = root.join("strings/src/lib.rs");
+        for f in [&math_lib, &math_int, &strings_lib] {
+            std::fs::create_dir_all(f.parent().unwrap())?;
+            std::fs::write(f, b"")?;
+        }
+
+        // Both libs opt out of their own test harness; only the integration
+        // target carries tests.
+        let metadata = serde_json::json!({
+            "workspace_root": root.to_string_lossy(),
+            "packages": [
+                {
+                    "name": "math",
+                    "manifest_path": root.join("math/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "math", "kind": ["lib"], "test": false,
+                         "src_path": math_lib.to_string_lossy()},
+                        {"name": "integration", "kind": ["test"], "test": true,
+                         "src_path": math_int.to_string_lossy()},
+                    ],
+                    "dependencies": [
+                        {"name": "strings", "kind": null, "source": null},
+                    ],
+                },
+                {
+                    "name": "strings",
+                    "manifest_path": root.join("strings/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "strings", "kind": ["lib"], "test": false,
+                         "src_path": strings_lib.to_string_lossy()},
+                    ],
+                    "dependencies": [],
+                },
+            ],
+        });
+
+        let project = ProjectRoot {
+            workspace_root: root.clone(),
+            manifest_paths: vec![],
+            metadata,
+        };
+        let map = project.crate_root_sentinels_by_binary_id()?;
+
+        let p = |s: &str| Utf8PathBuf::from(s);
+
+        // The harness-less libs produce no binary_id of their own...
+        assert!(
+            !map.contains_key("math"),
+            "lib with test = false has no test binary; got {map:?}"
+        );
+        assert!(!map.contains_key("strings"), "same for the dep's lib");
+
+        // ...but both crate roots still seed the integration target.
+        assert_eq!(
+            map.get("math::integration").unwrap(),
+            &[
+                p("math/src/lib.rs"),
+                p("math/tests/integration.rs"),
+                p("strings/src/lib.rs"),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         );
 
         Ok(())
