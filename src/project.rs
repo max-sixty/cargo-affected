@@ -325,9 +325,14 @@ struct TestTarget {
     runs_tests: bool,
 }
 
-/// Parse one `cargo metadata` target into a [`TestTarget`], or `None` if it
-/// isn't a kind that can matter for sentinels — `custom-build`, `example` and
-/// `bench` are dropped here and nowhere else.
+/// Parse one `cargo metadata` target into a [`TestTarget`], or `None` if its
+/// `kind` matches no arm below. This is the only place a target is dropped by
+/// kind, and it currently drops more than it means to: `custom-build`,
+/// `example` and `bench` are the intended exclusions, but the `lib` arm keys
+/// off the literal string, and cargo reports `kind` as the declared
+/// `crate-type` verbatim — `crate-type = ["rlib"]` surfaces as `["rlib"]`, not
+/// `["lib"]`, and falls through to `None`. Such a package loses its crate-root
+/// sentinels entirely. Pre-existing and tracked separately; see #73.
 ///
 /// Cargo's `test` flag is carried through rather than filtered on: a target
 /// with `test = false` still compiles into its package's other targets, so
