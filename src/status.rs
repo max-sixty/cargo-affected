@@ -223,7 +223,9 @@ pub(crate) fn status(
         // the "N commit(s) since collect" notice) or `changed_paths.all`
         // (which never empties again after a `collect --diff`).
         if plan.changed_paths.since_newest.is_empty() {
-            println!("\nno changes since the last collect and no new tests — nothing would run");
+            println!(
+                "\nno changes since the newest collect_sha and no new tests — nothing would run"
+            );
         } else {
             println!("\nno tests cover the changed lines and no new tests");
         }

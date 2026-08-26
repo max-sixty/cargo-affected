@@ -378,17 +378,21 @@ pub(crate) fn changed_paths_since(
 /// collect point the DB still knows about. `None` when nothing is reachable
 /// (`run`/`status` widen to the full suite there, so no caller asks).
 ///
-/// Ties (two collect points the same distance from HEAD, only reachable when
-/// one is a sibling rather than an ancestor) break by sha for determinism.
+/// `Equal` outranks every `Reachable` rather than sharing rank 0 with
+/// `commits_ahead: 0`. `git rev-list --count sha..HEAD` is also zero for a sha
+/// that is a *descendant* of HEAD or a sibling with no commits HEAD lacks, and
+/// those trees differ from HEAD's; a sha that IS HEAD is the one anchor that
+/// can't be behind. Remaining ties (two distinct shas at the same distance,
+/// which needs one of them to be a sibling) break by sha for determinism.
 fn newest_reachable_sha(reach: &Reachability) -> Option<&String> {
     reach
         .reachable
         .iter()
         .min_by_key(|sha| match reach.per_sha.get(*sha) {
-            Some(ShaRelation::Equal) => 0,
-            Some(ShaRelation::Reachable { commits_ahead }) => *commits_ahead,
+            Some(ShaRelation::Equal) => (0, 0),
+            Some(ShaRelation::Reachable { commits_ahead }) => (1, *commits_ahead),
             // Not in `reachable` by construction; treat as farthest.
-            Some(ShaRelation::Missing) | None => u32::MAX,
+            Some(ShaRelation::Missing) | None => (2, u32::MAX),
         })
 }
 
@@ -702,6 +706,30 @@ mod tests {
             3,
         );
         assert_eq!(sel.skipped(), 0);
+    }
+
+    /// `Equal` wins outright over a `Reachable` sha that is also zero commits
+    /// behind HEAD — a descendant of HEAD, or a sibling with no commits HEAD
+    /// lacks, both of which `git rev-list --count sha..HEAD` reports as 0. The
+    /// `zzz`/`aaa` naming makes the lexicographic tie-break pick the wrong one
+    /// if the two ever share a rank.
+    #[test]
+    fn newest_reachable_prefers_head_over_a_zero_distance_sibling() {
+        let reach = Reachability {
+            per_sha: [
+                (
+                    "aaa".to_string(),
+                    ShaRelation::Reachable { commits_ahead: 0 },
+                ),
+                ("zzz".to_string(), ShaRelation::Equal),
+            ]
+            .into_iter()
+            .collect(),
+            reachable: ["aaa".to_string(), "zzz".to_string()].into_iter().collect(),
+            missing: BTreeSet::new(),
+            max_commits_ahead: 0,
+        };
+        assert_eq!(newest_reachable_sha(&reach), Some(&"zzz".to_string()));
     }
 
     #[test]

@@ -249,7 +249,7 @@ fn run_reports_committed_uncovered_change_as_uncovered() {
             "expected {cmd} to report the committed README change as uncovered, got:\n{text}"
         );
         assert!(
-            !text.contains("no changes since the last collect"),
+            !text.contains("no changes since the newest collect_sha"),
             "expected {cmd} not to claim nothing changed, got:\n{text}"
         );
     }
@@ -321,7 +321,7 @@ fn run_after_diff_collect_reports_no_changes() {
         );
         let text = combined_output(&out);
         assert!(
-            text.contains("no changes since the last collect"),
+            text.contains("no changes since the newest collect_sha"),
             "expected {cmd} to report the post-`--diff` tree as unchanged, got:\n{text}"
         );
         assert!(

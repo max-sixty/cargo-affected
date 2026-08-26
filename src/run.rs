@@ -216,7 +216,7 @@ pub(crate) fn run(
         // collect has already accounted for, and this would claim nothing
         // covers them on every run until `clean`.
         if plan.changed_paths.since_newest.is_empty() {
-            eprintln!("no changes since the last collect and no new tests — nothing to run");
+            eprintln!("no changes since the newest collect_sha and no new tests — nothing to run");
         } else {
             eprintln!(
                 "no tests cover the changed lines and no new tests \
