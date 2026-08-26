@@ -308,7 +308,11 @@ pub(crate) fn select_with_precomputed_ranges(
 }
 
 /// Union of all paths that changed between the working tree and any reachable
-/// `collect_sha` — for matching against `[workspace.metadata.affected]` rule globs.
+/// `collect_sha`. Computed once in [`crate::plan::plan`] and carried on the
+/// `Plan` for its three consumers: `[workspace.metadata.affected]` rule-glob
+/// matching, the `--report-json` per-file entries, and `run`/`status`'
+/// empty-selection message, which distinguishes "nothing changed" from
+/// "nothing covers what changed".
 ///
 /// Modified files come from the per-sha diff already computed for selection;
 /// added files (which `git diff -U0` omits — they have no OLD side) come from
