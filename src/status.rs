@@ -217,10 +217,12 @@ pub(crate) fn status(
     );
 
     if sel.selected().is_empty() {
-        // See the matching arm in `run` — `changed_files` is the working tree
-        // alone, which would call a committed-but-uncollected change "no
-        // changes" one line under the "N commit(s) since collect" notice.
-        if plan.changed_paths.is_empty() {
+        // See the matching arm in `run` for why this is `since_newest` rather
+        // than either `changed_files` (the working tree alone, which would
+        // call a committed-but-uncollected change "no changes" one line under
+        // the "N commit(s) since collect" notice) or `changed_paths.all`
+        // (which never empties again after a `collect --diff`).
+        if plan.changed_paths.since_newest.is_empty() {
             println!("\nno changes since the last collect and no new tests — nothing would run");
         } else {
             println!("\nno tests cover the changed lines and no new tests");

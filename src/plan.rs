@@ -42,7 +42,9 @@ use crate::project::{ProjectRoot, ShaRelation};
 use crate::report::{
     self, CacheStatus, CollectShaSnapshot, FullSuiteInputs, Report, SelectionInputs,
 };
-use crate::selection::{self, ChangedRangesBySha, DiagnosticDetail, Reachability, Selection};
+use crate::selection::{
+    self, ChangedPaths, ChangedRangesBySha, DiagnosticDetail, Reachability, Selection,
+};
 
 /// Where the coverage cache stands for this environment, and what each
 /// standing carries.
@@ -168,18 +170,21 @@ pub(crate) fn assess(
 /// re-derives per-file hunks, and running `git diff -U0 <sha>` a second time
 /// per reachable sha is the exact waste this struct exists to avoid.
 ///
-/// `changed_paths` is the same idea one level up — every path that differs
-/// from any reachable `collect_sha` or from HEAD, unioned once (see
+/// `changed_paths` is the same idea one level up — the paths that differ from
+/// the reachable `collect_sha`s, gathered once (see
 /// [`selection::changed_paths_since`]). Three consumers want it and each used
 /// to derive its own: config rules built it internally, the report rebuilt it
 /// while assembling per-file entries, and `run`/`status` approximated it with
 /// the working-tree list alone — which is why a committed-but-uncollected
 /// change used to be reported as "no uncommitted changes … nothing to run".
+/// The first two want [`ChangedPaths::all`], the message wants
+/// [`ChangedPaths::since_newest`]; that split is the one distinction the
+/// three consumers genuinely disagree on, and it lives in one place.
 pub(crate) struct Plan {
     pub(crate) selection: Selection,
     pub(crate) status: CacheStatus,
     pub(crate) changed_ranges: ChangedRangesBySha,
-    pub(crate) changed_paths: BTreeSet<String>,
+    pub(crate) changed_paths: ChangedPaths,
 }
 
 /// List tests, diff against every reachable `collect_sha`, apply
@@ -205,7 +210,7 @@ pub(crate) fn plan(
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
     let changed_paths =
         selection::changed_paths_since(project_root, reach, &changed_ranges, changed_files)?;
-    let config_hits = config::config_rule_hits(project, build_args, &changed_paths)?;
+    let config_hits = config::config_rule_hits(project, build_args, &changed_paths.all)?;
     let selection = selection::select_with_precomputed_ranges(
         db,
         fingerprint_hex,
@@ -281,7 +286,7 @@ pub(crate) fn write_selection_report(inputs: SelectionReport, path: &Path) -> Re
             &fingerprint.hex,
             reach,
             &plan.changed_ranges,
-            &plan.changed_paths,
+            &plan.changed_paths.all,
         )?,
         include_changed_files: true,
     };

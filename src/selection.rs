@@ -307,17 +307,47 @@ pub(crate) fn select_with_precomputed_ranges(
     )
 }
 
-/// Union of all paths that changed between the working tree and any reachable
-/// `collect_sha`. Computed once in [`crate::plan::plan`] and carried on the
-/// `Plan` for its three consumers: `[workspace.metadata.affected]` rule-glob
-/// matching, the `--report-json` per-file entries, and `run`/`status`'
-/// empty-selection message, which distinguishes "nothing changed" from
-/// "nothing covers what changed".
+/// The paths that changed, in the two shapes selection's consumers need.
+///
+/// The two differ only once the DB holds more than one `collect_sha`, which
+/// is exactly what `collect --diff` produces: it re-anchors the tests it
+/// reran at the new HEAD and leaves the rest at their original sha. From
+/// then on the older sha stays reachable — its rows "linger until `cargo
+/// affected clean`" — so [`all`] permanently contains every path touched
+/// since that older anchor, including ones a `collect --diff` has already
+/// accounted for.
+///
+/// [`all`]: Self::all
+pub(crate) struct ChangedPaths {
+    /// Union across every reachable `collect_sha`. What selection itself
+    /// reasons about: a test anchored at the older sha has to be matched
+    /// against the diff from *that* sha, so `[workspace.metadata.affected]`
+    /// rule-glob matching uses this too — narrowing it would silently stop
+    /// selecting a config-rule test whose input changed before the newest
+    /// anchor (`collect --diff` never reruns config-rule tests, so those
+    /// rows are precisely the ones left behind). The `--report-json`
+    /// per-file entries use it for the same reason: they are keyed by sha.
+    pub(crate) all: BTreeSet<String>,
+    /// Paths changed relative to the reachable `collect_sha` closest to HEAD
+    /// — the most recent point at which any `collect` ran, so everything
+    /// older than it has already been through one. This is the set that
+    /// answers "did anything change that we have not been told about?",
+    /// which is the question `run`/`status`' empty-selection message asks.
+    /// Empty in the `collect --diff` steady state, where [`all`] is not.
+    ///
+    /// [`all`]: Self::all
+    pub(crate) since_newest: BTreeSet<String>,
+}
+
+/// Collect the paths that changed between the working tree and the reachable
+/// `collect_sha`s. Computed once in [`crate::plan::plan`] and carried on the
+/// `Plan`; see [`ChangedPaths`] for which consumer wants which shape.
 ///
 /// Modified files come from the per-sha diff already computed for selection;
 /// added files (which `git diff -U0` omits — they have no OLD side) come from
 /// [`git_added_files_since`]; working-tree changes (uncommitted, staged,
-/// untracked) come from `working_tree_files`. Without the added-files source,
+/// untracked) come from `working_tree_files` and belong to every sha's set,
+/// since they are changes relative to HEAD. Without the added-files source,
 /// a PR that adds a brand-new `.snap`/doc with no modified sibling would slip
 /// through.
 pub(crate) fn changed_paths_since(
@@ -325,15 +355,41 @@ pub(crate) fn changed_paths_since(
     reach: &Reachability,
     changed_ranges_by_sha: &ChangedRangesBySha,
     working_tree_files: &[String],
-) -> Result<BTreeSet<String>> {
-    let mut paths: BTreeSet<String> = working_tree_files.iter().cloned().collect();
-    for by_file in changed_ranges_by_sha.values() {
-        paths.extend(by_file.keys().cloned());
-    }
+) -> Result<ChangedPaths> {
+    let working: BTreeSet<String> = working_tree_files.iter().cloned().collect();
+    let newest = newest_reachable_sha(reach);
+    let mut all = working.clone();
+    let mut since_newest = working;
     for sha in &reach.reachable {
-        paths.extend(git_added_files_since(project_root, sha)?);
+        let mut per_sha: BTreeSet<String> = changed_ranges_by_sha
+            .get(sha)
+            .map(|by_file| by_file.keys().cloned().collect())
+            .unwrap_or_default();
+        per_sha.extend(git_added_files_since(project_root, sha)?);
+        if newest == Some(sha) {
+            since_newest.extend(per_sha.iter().cloned());
+        }
+        all.extend(per_sha);
     }
-    Ok(paths)
+    Ok(ChangedPaths { all, since_newest })
+}
+
+/// The reachable `collect_sha` fewest commits behind HEAD — the most recent
+/// collect point the DB still knows about. `None` when nothing is reachable
+/// (`run`/`status` widen to the full suite there, so no caller asks).
+///
+/// Ties (two collect points the same distance from HEAD, only reachable when
+/// one is a sibling rather than an ancestor) break by sha for determinism.
+fn newest_reachable_sha(reach: &Reachability) -> Option<&String> {
+    reach
+        .reachable
+        .iter()
+        .min_by_key(|sha| match reach.per_sha.get(*sha) {
+            Some(ShaRelation::Equal) => 0,
+            Some(ShaRelation::Reachable { commits_ahead }) => *commits_ahead,
+            // Not in `reachable` by construction; treat as farthest.
+            Some(ShaRelation::Missing) | None => u32::MAX,
+        })
 }
 
 /// Compute the selection from a pre-built nextest listing and per-sha changed

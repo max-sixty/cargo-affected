@@ -207,11 +207,15 @@ pub(crate) fn run(
 
     let selected = sel.selected();
     if selected.is_empty() {
-        // `plan.changed_paths`, not `changed_files`: the latter is the working
-        // tree alone, so a change committed since the last collect — the
+        // `since_newest`, not `changed_files`: the latter is the working tree
+        // alone, so a change committed since the last collect — the
         // `max_commits_ahead > 0` case narrated above — would land in the
-        // "nothing changed" arm and flatly contradict that notice.
-        if plan.changed_paths.is_empty() {
+        // "nothing changed" arm and flatly contradict that notice. Not
+        // `changed_paths.all` either: after a `collect --diff` the older
+        // anchor stays reachable, so the union permanently holds paths that
+        // collect has already accounted for, and this would claim nothing
+        // covers them on every run until `clean`.
+        if plan.changed_paths.since_newest.is_empty() {
             eprintln!("no changes since the last collect and no new tests — nothing to run");
         } else {
             eprintln!(
