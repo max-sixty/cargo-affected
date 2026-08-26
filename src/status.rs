@@ -196,13 +196,11 @@ pub(crate) fn status(
         plan::write_selection_report(
             SelectionReport {
                 command: "status",
-                project: &project,
                 db: &db,
                 fingerprint: &fingerprint,
                 stored,
                 reach: &reach,
                 plan: &plan,
-                changed_files: &changed_files,
             },
             report_path,
         )?;
@@ -219,8 +217,11 @@ pub(crate) fn status(
     );
 
     if sel.selected().is_empty() {
-        if changed_files.is_empty() {
-            println!("\nno uncommitted changes and no new tests — nothing would run");
+        // See the matching arm in `run` — `changed_files` is the working tree
+        // alone, which would call a committed-but-uncollected change "no
+        // changes" one line under the "N commit(s) since collect" notice.
+        if plan.changed_paths.is_empty() {
+            println!("\nno changes since the last collect and no new tests — nothing would run");
         } else {
             println!("\nno tests cover the changed lines and no new tests");
         }
