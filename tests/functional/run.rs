@@ -6,7 +6,7 @@
 //! chosen AND that they actually ran successfully.
 
 use crate::{
-    cargo_affected, combined_output, init_git_with_initial_commit, replace_in_file,
+    cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file,
     write_two_module_project,
 };
 
@@ -199,4 +199,134 @@ fn run_with_no_changes_reports_nothing_to_do() {
         stderr.contains("nothing to run"),
         "expected 'nothing to run' message on clean tree, got:\n{stderr}"
     );
+}
+
+/// A change *committed* since the last collect that no test covers must be
+/// reported as uncovered, not as an absence of changes.
+///
+/// The empty-selection message used to key off `git_changed_files` — the
+/// working tree alone — while selection itself diffs against `collect_sha`.
+/// With a clean tree and the change one commit back, that read as "no
+/// uncommitted changes … nothing to run" directly beneath the "1 commit(s)
+/// since collect" notice, hiding the one fact the user needed: a file changed
+/// and nothing tests it. `README.md` is the shape that makes it visible —
+/// non-Rust, so it has no coverage rows to hit and no structural backstop to
+/// over-select through, which is exactly the blind spot
+/// `[workspace.metadata.affected]` rules exist to close.
+#[test]
+fn run_reports_committed_uncovered_change_as_uncovered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_run_committed_uncovered");
+    std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Commit the edit, so `git status` is clean but HEAD is one commit ahead
+    // of the collect_sha.
+    std::fs::write(dir.join("README.md"), "hello world\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "edit README"]);
+
+    for (cmd, out) in [
+        ("run", cargo_affected(dir, &["affected", "run"])),
+        ("status", cargo_affected(dir, &["affected", "status"])),
+    ] {
+        assert!(
+            out.status.success(),
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = combined_output(&out);
+        assert!(
+            text.contains("no tests cover the changed lines"),
+            "expected {cmd} to report the committed README change as uncovered, got:\n{text}"
+        );
+        assert!(
+            !text.contains("no changes since the newest collect_sha"),
+            "expected {cmd} not to claim nothing changed, got:\n{text}"
+        );
+    }
+}
+
+/// The `collect --diff` steady state reports *no* changes — the counterpart to
+/// [`run_reports_committed_uncovered_change_as_uncovered`], and the reason the
+/// message can't key off the changed-path union.
+///
+/// `collect --diff` re-anchors only the tests it reran, so the older
+/// `collect_sha` stays reachable (its rows linger until `cargo affected
+/// clean`) and every path touched since it stays in the union permanently.
+/// Keying the message off that union told the user "no tests cover the changed
+/// lines … run `cargo affected collect`" on every clean-tree `run` after a
+/// `--diff` — for a file that *is* covered, by a test that had just been
+/// re-collected. `since_newest` diffs against the reachable sha closest to
+/// HEAD instead, which is empty here because the last collect was at HEAD.
+///
+/// This is CLAUDE.md's "Manual testing" sequence verbatim, so it is the state
+/// an incremental user sits in between edits.
+#[test]
+fn run_after_diff_collect_reports_no_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_run_after_diff_collect");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Edit and commit a covered function, then update only the affected rows.
+    // `test_greet` re-anchors at the new HEAD; `test_add` and `test_multiply`
+    // stay at the initial sha, which is what leaves two shas reachable.
+    //
+    // `strings.rs` rather than `math.rs` because `test_greet` is the only test
+    // with rows for it: once `--diff` moves those rows to the new sha, no test
+    // has a `strings.rs` row at the initial sha, so the structural backstop —
+    // "hunk overlaps no stored range, so select every test with rows for this
+    // file at this sha" — has nothing to fire on and the selection is genuinely
+    // empty. Editing `math.rs` would instead pull in `test_multiply`, still
+    // anchored at the initial sha, and never reach the message under test. The
+    // rewrite is behaviour-preserving so the `--diff` rerun stays green.
+    replace_in_file(
+        &dir.join("src/strings.rs"),
+        r#"format!("hello, {name}")"#,
+        r#"format!("hello, {}", name)"#,
+    );
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "rewrite greet"]);
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert!(
+        diff.status.success(),
+        "collect --diff failed: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+
+    for (cmd, out) in [
+        ("run", cargo_affected(dir, &["affected", "run"])),
+        ("status", cargo_affected(dir, &["affected", "status"])),
+    ] {
+        assert!(
+            out.status.success(),
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = combined_output(&out);
+        assert!(
+            text.contains("no changes since the newest collect_sha"),
+            "expected {cmd} to report the post-`--diff` tree as unchanged, got:\n{text}"
+        );
+        assert!(
+            !text.contains("no tests cover the changed lines"),
+            "expected {cmd} not to call the re-collected change uncovered, got:\n{text}"
+        );
+    }
 }
