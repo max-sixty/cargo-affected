@@ -58,5 +58,10 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           bot_name: cargo-affected-bot
           model: opus
+          sandbox_setup: |
+            rustup component add llvm-tools
+            test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
+            curl -sSfL https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+            cargo nextest --version
           prompt: >-
             ${{ format('/tend-ci-runner:review {0}', github.event.pull_request.number) }}

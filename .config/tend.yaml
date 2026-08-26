@@ -3,3 +3,15 @@ workflows:
   ci-fix:
     watched_workflows:
     - ci
+
+# The functional suite shells out to `cargo nextest` and to the `llvm-tools`
+# binaries (`llvm-profdata`, `llvm-cov`) — see CLAUDE.md. Neither ships with the
+# runner image, and a `setup:` install lands under the *runner's* home, which the
+# sandbox does not inherit, so they belong here. Each install is followed by an
+# assertion so a broken toolchain fails setup rather than surfacing mid-session,
+# per this repo's "fail loudly, no fallback paths" principle.
+sandbox_setup:
+  - rustup component add llvm-tools
+  - test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
+  - curl -sSfL https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+  - cargo nextest --version
