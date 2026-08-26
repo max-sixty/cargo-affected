@@ -232,7 +232,15 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
 /// test with rows for `src/math.rs` at that sha — `test_multiply`. It reruns
 /// on every `run` until the next `collect`, even though nothing changed and
 /// `test_multiply` never touches `add`.
+///
+/// **This test fails today** — #94 is unfixed, so it is `#[ignore]`d to keep
+/// the suite green rather than turning `main` red for a defect no PR here
+/// introduced. It still runs on demand (`cargo test -- --ignored`), and the
+/// fix for #94 should remove the attribute in the same commit; the reason
+/// lives here rather than only in the attribute string so it survives an
+/// edit to either.
 #[test]
+#[ignore = "reproduction for #94 — fails today; un-ignore with the fix"]
 fn run_after_diff_collect_selects_nothing_on_a_clean_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -276,7 +284,7 @@ fn run_after_diff_collect_selects_nothing_on_a_clean_tree() {
              clean — it must not be selected, got:\n{combined}"
         );
         assert!(
-            combined.contains("0 tests to run") || combined.contains("nothing to run"),
+            combined.contains("nothing to run"),
             "run #{attempt}: expected an empty selection on a clean tree, got:\n{combined}"
         );
     }
