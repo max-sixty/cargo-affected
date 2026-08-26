@@ -42,7 +42,7 @@ jobs:
           sandbox_setup: |
             rustup component add llvm-tools
             test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
-            curl -sSfL https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+            curl -sSfL https://get.nexte.st/0.9.132/linux | tar zxf - -C "$HOME/.cargo/bin"
             cargo nextest --version
           prompt: |
             /tend-ci-runner:weekly

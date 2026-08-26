@@ -10,8 +10,14 @@ workflows:
 # sandbox does not inherit, so they belong here. Each install is followed by an
 # assertion so a broken toolchain fails setup rather than surfacing mid-session,
 # per this repo's "fail loudly, no fallback paths" principle.
+#
+# The nextest version tracks the `=0.9.132` pin in `ci.yaml` — what agents
+# verify against nextest is nextest's own surface (the `list --message-format
+# json` schema, `filter-match.status`, the generated `default-filter` config),
+# so a sandbox on a newer release would let a session report "verified" against
+# a nextest CI never runs. Bump both together.
 sandbox_setup:
   - rustup component add llvm-tools
   - test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
-  - curl -sSfL https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+  - curl -sSfL https://get.nexte.st/0.9.132/linux | tar zxf - -C "$HOME/.cargo/bin"
   - cargo nextest --version
