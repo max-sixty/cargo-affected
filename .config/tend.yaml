@@ -15,7 +15,7 @@ workflows:
 # verify against nextest is nextest's own surface (the `list --message-format
 # json` schema, `filter-match.status`, the generated `default-filter` config),
 # so a sandbox on a newer release would let a session report "verified" against
-# a nextest CI never runs. Bump both together.
+# a nextest that CI never runs. Bump both together.
 sandbox_setup:
   - rustup component add llvm-tools
   - test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
