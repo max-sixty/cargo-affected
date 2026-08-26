@@ -1,4 +1,3 @@
 /target
 *.profraw
 .tmp/
-.claude/settings.local.json
