@@ -54,6 +54,11 @@ jobs:
     # added there is enforced without a second edit to this file.
     - name: 🐍 Python for pre-commit
       uses: actions/setup-python@v6
+      with:
+        # Without this the action installs nothing and the hooks run against
+        # whatever interpreter the runner image happens to ship — the one
+        # dependency of this job left outside the pinning the header describes.
+        python-version: "3.13"
 
     - name: 💰 pre-commit cache
       uses: actions/cache@v6
@@ -69,7 +74,11 @@ jobs:
         # in CI, as it was before this step existed.
         SKIP: fmt,clippy,cargo-lock
       run: |
-        python -m pip install pre-commit
+        # Pinned like `cargo-nextest` and `cargo-msrv` below: floating, this
+        # would be the one version in the job that can change between two runs
+        # of the same commit, landing a breaking release as a red `lint` on an
+        # unrelated PR. Moves by hand, as the other pins do.
+        python -m pip install pre-commit==4.6.2
         pre-commit run --all-files --show-diff-on-failure --color=always
 
   # `rust-version` in Cargo.toml is a promise to everyone installing from
