@@ -46,6 +46,32 @@ jobs:
         RUSTDOCFLAGS: -D warnings
       run: cargo doc --no-deps --document-private-items
 
+    # `typos` and `no-dbg` are declared in `.pre-commit-config.yaml` but had no
+    # gate anywhere: that file's `ci:` block configures pre-commit.ci, which is
+    # not installed on this repo, so those hooks only ever ran on a
+    # contributor's machine. Running the config here rather than restating
+    # individual hooks keeps `.pre-commit-config.yaml` the single list — a hook
+    # added there is enforced without a second edit to this file.
+    - name: 🐍 Python for pre-commit
+      uses: actions/setup-python@v6
+
+    - name: 💰 pre-commit cache
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/pre-commit
+        key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+    - name: 🪝 pre-commit
+      env:
+        # Mirrors the `ci.skip` list in `.pre-commit-config.yaml`: `fmt` and
+        # `clippy` duplicate the two steps above, and `cargo-lock` would add a
+        # second full build to this job. The lockfile therefore stays ungated
+        # in CI, as it was before this step existed.
+        SKIP: fmt,clippy,cargo-lock
+      run: |
+        python -m pip install pre-commit
+        pre-commit run --all-files --show-diff-on-failure --color=always
+
   # `rust-version` in Cargo.toml is a promise to everyone installing from
   # crates.io, and nothing else in this workflow builds with anything but
   # current stable — so without this the declared MSRV drifts upward silently
