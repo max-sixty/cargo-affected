@@ -38,6 +38,7 @@ mod remapped_paths;
 mod run;
 mod structural;
 mod workspace;
+mod wt_config;
 
 use std::path::Path;
 use std::process::{Command, Output};

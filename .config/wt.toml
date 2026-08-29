@@ -1,10 +1,14 @@
+# `pre-merge` must stay above the `[[post-merge]]` blocks. TOML binds a bare
+# key to the most recent table header, so a `pre-merge` written below them
+# lands *inside* the last `[[post-merge]]` entry — worktrunk then sees no
+# pre-merge hook at all and runs `cargo affected run` after the merge instead.
+pre-merge = "cargo affected run"
+
 [[post-merge]]
 install = "cargo install --path ."
 
 [[post-merge]]
 collect = "cargo affected collect"
-
-pre-merge = "cargo affected run"
 
 [post-start]
 copy = "wt step copy-ignored"
