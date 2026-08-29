@@ -13,11 +13,12 @@
 //! are valid TOML and valid worktrunk config. That is exactly the shape of
 //! failure this crate exists to avoid, so it gets a tripwire.
 
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, Table};
 
 /// Every hook key worktrunk reads at the root of a project config
-/// (`HooksConfig` in `worktrunk/src/config/hooks.rs`). A hook name showing up
-/// *inside* a `[[post-merge]]` entry means it was swallowed by the array.
+/// (`HooksConfig` in `worktrunk/src/config/hooks.rs`, whose `rename`s and
+/// `alias`es this mirrors). A hook name showing up *inside* another hook's
+/// table means it was swallowed by the header above it.
 const HOOK_KEYS: &[&str] = &[
     "pre-switch",
     "post-switch",
@@ -54,20 +55,29 @@ fn pre_merge_hook_is_at_the_document_root() {
 }
 
 #[test]
-fn no_hook_key_is_nested_inside_a_hook_array() {
+fn no_hook_key_is_nested_inside_another_hook() {
     let doc = wt_config();
     for (name, item) in doc.iter() {
-        let Item::ArrayOfTables(entries) = item else {
-            continue;
+        // Both header forms swallow a bare key written below them:
+        // `[[post-merge]]` binds it to the last array entry, `[post-start]`
+        // to the table. The plain-table case is the easier one to hit, since
+        // the last header in the file is the one an appended key lands in.
+        let tables: Vec<(String, &Table)> = match item {
+            Item::ArrayOfTables(entries) => entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| (format!("[[{name}]] entry {i}"), entry))
+                .collect(),
+            Item::Table(table) => vec![(format!("[{name}]"), table)],
+            _ => continue,
         };
-        for (i, entry) in entries.iter().enumerate() {
-            for nested in entry.iter().map(|(k, _)| k) {
+        for (header, table) in tables {
+            for nested in table.iter().map(|(k, _)| k) {
                 assert!(
                     !HOOK_KEYS.contains(&nested),
-                    "hook key `{nested}` is nested inside `[[{name}]]` entry \
-                     {i} — it was almost certainly meant as a root key and \
-                     got bound to the preceding table header. Move it above \
-                     the first `[[{name}]]` block.",
+                    "hook key `{nested}` is nested inside `{header}` — it was \
+                     almost certainly meant as a root key and got bound to the \
+                     preceding table header. Move it above the `{name}` block.",
                 );
             }
         }
