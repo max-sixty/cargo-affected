@@ -13,9 +13,11 @@
 //! combination — the failure mode worktrunk hit in CI before the fix.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
-use crate::{combined_output, git, init_git_with_initial_commit, replace_in_file};
+use crate::{
+    cargo_affected_with_env, combined_output, git, init_git_with_initial_commit, replace_in_file,
+};
 
 /// Two-member virtual workspace, both with `tests/builds.rs` containing a
 /// single `#[test] fn builds() {}`. Identical bodies on purpose — there's
@@ -57,13 +59,7 @@ edition = "2021"
 /// Run cargo-affected with `RUSTFLAGS='-C debuginfo=0'` so the embedded
 /// source paths the old marker fallback relied on aren't there to cheat with.
 fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
-    let bin = env!("CARGO_BIN_EXE_cargo-affected");
-    Command::new(bin)
-        .args(args)
-        .current_dir(dir)
-        .env("RUSTFLAGS", "-C debuginfo=0")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
+    cargo_affected_with_env(dir, args, &[("RUSTFLAGS", "-C debuginfo=0")])
 }
 
 #[test]

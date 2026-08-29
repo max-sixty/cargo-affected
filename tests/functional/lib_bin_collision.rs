@@ -15,9 +15,9 @@
 //! tripped the bug.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
-use crate::{combined_output, init_git_with_initial_commit};
+use crate::{cargo_affected_with_env, combined_output, init_git_with_initial_commit};
 
 /// Single-crate project with a `[lib]` and `[[bin]]` whose target names
 /// (`wt_perf` and `wt-perf`) both normalize to `wt_perf` after cargo's
@@ -89,13 +89,7 @@ mod tests {
 /// production-like stripped-binary case is exercised, not just the
 /// debug-info-rich default.
 fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
-    let bin = env!("CARGO_BIN_EXE_cargo-affected");
-    Command::new(bin)
-        .args(args)
-        .current_dir(dir)
-        .env("RUSTFLAGS", "-C debuginfo=0")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
+    cargo_affected_with_env(dir, args, &[("RUSTFLAGS", "-C debuginfo=0")])
 }
 
 #[test]
