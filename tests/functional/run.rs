@@ -44,8 +44,8 @@ fn run_executes_only_affected_tests() {
     // Selection summary line — verifies the run command picked exactly one
     // test (test_add) before handing off to nextest.
     assert!(
-        combined.contains("1 tests to run"),
-        "expected '1 tests to run' in run output, got:\n{combined}"
+        combined.contains("1 test to run"),
+        "expected '1 test to run' in run output, got:\n{combined}"
     );
     assert!(
         combined.contains("test_add"),

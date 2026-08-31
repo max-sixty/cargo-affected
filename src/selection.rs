@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::Listing;
+use crate::collect::{plural_s, Listing};
 use crate::db::{Db, HitKind, HitReason, TestId};
 use crate::project::{
     git_added_files_since, git_changed_line_ranges, relation_to_head, LineRange, ShaRelation,
@@ -526,9 +526,10 @@ fn aggregate_per_file_counts(
 pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> String {
     let selected = sel.selected();
     let mut out = format!(
-        "{} tests {verb} ({} affected + {} config + {} new + {} stranded, \
+        "{} test{} {verb} ({} affected + {} config + {} new + {} stranded, \
          {} skipped of {} reachable-known)",
         selected.len(),
+        plural_s(selected.len()),
         sel.affected.len(),
         sel.config_tests.len(),
         sel.new_tests.len(),
@@ -606,6 +607,20 @@ mod tests {
             out,
             "3 tests to run (2 affected + 0 config + 1 new + 0 stranded, \
              3 skipped of 5 reachable-known) — pass -v to list"
+        );
+    }
+
+    /// A one-test selection says "1 test", not "1 tests". This is the single
+    /// most-printed line in the tool, and the `-v` breakdown right next to it
+    /// already pluralizes correctly, so the mismatch was visible on any run
+    /// that selected exactly one test.
+    #[test]
+    fn summary_singular_test_count() {
+        let sel = selection_with(&[tid("crate_a", "test_a")], &[], &[], &[], 5);
+        let out = format_summary(&sel, "to run", false);
+        assert!(
+            out.starts_with("1 test to run ("),
+            "expected a singular noun for a one-test selection, got:\n{out}"
         );
     }
 

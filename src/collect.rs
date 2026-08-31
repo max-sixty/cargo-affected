@@ -218,8 +218,9 @@ pub(crate) fn collect(
         None,
     )?;
     eprintln!(
-        "found {} tests across {}",
+        "found {} test{} across {}",
         listing.tests.len(),
+        plural_s(listing.tests.len()),
         binaries_phrase(listing.binaries.len())
     );
     let fingerprint = fingerprint::compute(&project)?;
@@ -400,8 +401,10 @@ pub(crate) fn collect(
 
     if let Some(plan) = diff_plan {
         eprintln!(
-            "updating coverage for {} tests ({region_count} ranges)...",
-            mappings.len()
+            "updating coverage for {} test{} ({region_count} range{})...",
+            mappings.len(),
+            plural_s(mappings.len()),
+            plural_s(region_count),
         );
         db.update_coverage_for_tests(
             env_fingerprint,
@@ -412,8 +415,10 @@ pub(crate) fn collect(
         prune_and_report(&mut db, env_fingerprint, &plan.listed)?;
     } else {
         eprintln!(
-            "storing coverage for {} tests ({region_count} ranges)...",
-            mappings.len()
+            "storing coverage for {} test{} ({region_count} range{})...",
+            mappings.len(),
+            plural_s(mappings.len()),
+            plural_s(region_count),
         );
         db.store_coverage(
             env_fingerprint,
@@ -426,14 +431,16 @@ pub(crate) fn collect(
     let evicted = db.gc(env_fingerprint, FINGERPRINT_KEEP)?;
     if evicted > 0 {
         let kept = db.fingerprint_count()?;
-        let s = if evicted == 1 { "" } else { "s" };
+        let s = plural_s(evicted);
         eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
     eprintln!(
-        "done. {} tests, {} ranges stored in target/affected/coverage.db ({:.1}s total)",
+        "done. {} test{}, {} range{} stored in target/affected/coverage.db ({:.1}s total)",
         mappings.len(),
+        plural_s(mappings.len()),
         region_count,
+        plural_s(region_count),
         total_elapsed.as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
@@ -456,10 +463,21 @@ const STAGING_DIR_PREFIXES: &[&str] = &[
 ];
 
 /// "1 binary" / "2 binaries". The plural split lands mid-word, so this can't
-/// be a suffix interpolated after the noun the way `{n} test{s}` can — doing
+/// be a suffix interpolated after the noun the way [`plural_s`] does — doing
 /// that is what produced "1 binaryy" in the map-export line.
 fn binaries_phrase(n: usize) -> String {
     format!("{n} binar{}", if n == 1 { "y" } else { "ies" })
+}
+
+/// The `s` in `{n} test{s}` — empty at one, `"s"` otherwise. Only correct for
+/// nouns that pluralize by suffix; anything splitting mid-word (binary,
+/// binaries) needs its own phrase function.
+pub(crate) fn plural_s(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 /// The binaries whose tests this run will execute, and so the ones needing a
@@ -1240,7 +1258,7 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
 fn prune_and_report(db: &mut Db, env_fingerprint: &str, listed: &BTreeSet<TestId>) -> Result<()> {
     let pruned = db.prune_missing_tests(env_fingerprint, listed)?;
     if pruned > 0 {
-        let s = if pruned == 1 { "" } else { "s" };
+        let s = plural_s(pruned);
         eprintln!("pruned {pruned} test{s} no longer present in nextest list");
     }
     Ok(())
