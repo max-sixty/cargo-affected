@@ -178,14 +178,17 @@ in the same run resolved to `08:23:54Z`, by then hiding 15 runs. Step 2 hides
 them too, because `token-report.sh 24` measures from its own invocation — so
 unlike a dropped page, there is no second listing that recovers them.
 
-## `gh` list commands stop at 30 — pass `--limit` when the set is the answer
+## `gh` list commands truncate silently — pass `--limit` when the set is the answer
 
-`gh pr list`, `gh issue list`, and `gh run list` return 30 rows by default and
-say nothing when there are more. The response is well-formed, exits 0, and
-`--json` exposes no total to cross-check against, so the only defence is
-asking for a bound up front. This repo's open-PR queue passed 30 on
-2026-08-26 and has not come back down, so on this repo an unbounded
-`gh pr list --state open` is now *always* truncated:
+`gh pr list` and `gh issue list` return 30 rows by default and `gh run list`
+20; all say nothing when there are more. The response is well-formed, exits 0,
+and `--json` exposes no total to cross-check against, so the only defence is
+asking for a bound up front. Keep the two defaults apart, because the tell for
+a silent truncation is a row count landing exactly on one of them — a 20-row
+`gh run list` is already at its cap, and a session watching for 30 will never
+see it. This repo's open-PR queue passed 30 on 2026-08-26 and has not come
+back down, so on this repo an unbounded `gh pr list --state open` is now
+*always* truncated:
 
 ```bash
 gh pr list --state open --limit 100 --json number,author --jq 'length'
