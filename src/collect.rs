@@ -377,7 +377,7 @@ pub(crate) fn collect(
         );
     }
     if skipped > 0 {
-        let s = if skipped == 1 { "" } else { "s" };
+        let s = plural_s(skipped);
         eprintln!("{skipped} test{s} produced no coverage");
     }
     // Every test that ran produced no usable coverage. A real test always
@@ -392,7 +392,7 @@ pub(crate) fn collect(
             "nextest ran but coverage extraction yielded no ranges for any of \
              the {skipped} completed test{} (see the skip reasons above) — \
              refusing to overwrite stored coverage",
-            if skipped == 1 { "" } else { "s" },
+            plural_s(skipped),
         );
     }
 

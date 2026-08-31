@@ -190,7 +190,7 @@ pub(crate) struct Reachability {
 /// rerun as 'new'" for `status`. Returns the body without a trailing
 /// newline so callers can `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {
-    let plural = if missing.len() == 1 { "" } else { "s" };
+    let plural = plural_s(missing.len());
     let list = missing.iter().cloned().collect::<Vec<_>>().join(", ");
     format!(
         "note: {} collect_sha{plural} not in the repo ({list}) — \
