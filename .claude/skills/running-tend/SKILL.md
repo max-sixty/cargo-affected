@@ -177,3 +177,43 @@ full sessions the audit exists to read — `tend-review`
 in the same run resolved to `08:23:54Z`, by then hiding 15 runs. Step 2 hides
 them too, because `token-report.sh 24` measures from its own invocation — so
 unlike a dropped page, there is no second listing that recovers them.
+
+## `gh` list commands stop at 30 — pass `--limit` when the set is the answer
+
+`gh pr list`, `gh issue list`, and `gh run list` return 30 rows by default and
+say nothing when there are more. The response is well-formed, exits 0, and
+`--json` exposes no total to cross-check against, so the only defence is
+asking for a bound up front. This repo's open-PR queue passed 30 on
+2026-08-26 and has not come back down, so on this repo an unbounded
+`gh pr list --state open` is now *always* truncated:
+
+```bash
+gh pr list --state open --limit 100 --json number,author --jq 'length'
+```
+
+Two figures have already been published wrong. `tend-weekly`
+[`33303989079`](https://github.com/max-sixty/cargo-affected/actions/runs/33303989079)
+(2026-08-30) reported "all 29 open PRs are authored by `cargo-affected-bot`"
+from a list that stopped at 30 of 33; the 2026-08-29 nightly reported 32
+against the same 33 (recorded on tracker #73). Two more sessions —
+`tend-nightly` [`33297300065`](https://github.com/max-sixty/cargo-affected/actions/runs/33297300065)
+and [`33365823356`](https://github.com/max-sixty/cargo-affected/actions/runs/33365823356)
+— opened on "30 open bot PRs", noticed, and re-queried at `--limit 100`
+before publishing. Catching it costs turns; missing it publishes a wrong
+number.
+
+The count is the visible symptom, not the worst one. `gh pr list` returns
+newest-first, so truncation drops the *oldest* PRs — exactly the ones a
+duplicate is most likely to re-derive. Two of the pinned bundled dedup
+recipes are unbounded (`running-in-ci/SKILL.md:140`, the pre-branch "check
+for existing work" scan, and `:702`, the skill-PR dedup), and the
+pre-`gh pr create` recheck at `:165` passes `--limit 30` against
+`--state all`, which against this repo's 84 all-state PRs reaches back only
+to #66 (2026-07-23). A truncated read at any of those three does not produce
+a wrong figure — it produces a duplicate PR. Bound them at `--limit 200`
+here.
+
+Fixed upstream in tend `0.1.22`
+(`running-in-ci/references/grounded-analysis.md`, plus explicit `--limit`
+bounds at every listing site); this repo pins `0.1.14`. Drop this section
+once the pin moves past `0.1.22`.
