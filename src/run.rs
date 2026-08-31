@@ -28,7 +28,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::collect::{
-    cargo_build_args, nextest_filter_expr, require_nextest, write_nextest_config,
+    cargo_build_args, nextest_filter_expr, plural_s, require_nextest, write_nextest_config,
 };
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
@@ -260,7 +260,11 @@ fn run_tests(
     cmd.arg("nextest").arg("run");
     let filter_config = match tests {
         Some(ts) => {
-            eprintln!("running {} tests with nextest", ts.len());
+            eprintln!(
+                "running {} test{} with nextest",
+                ts.len(),
+                plural_s(ts.len())
+            );
             let config = write_nextest_config(project_root, &nextest_filter_expr(ts))?;
             cmd.arg("--config-file").arg(&config);
             Some(config)

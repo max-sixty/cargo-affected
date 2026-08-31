@@ -218,9 +218,10 @@ pub(crate) fn collect(
         None,
     )?;
     eprintln!(
-        "found {} tests across {} binaries",
+        "found {} test{} across {}",
         listing.tests.len(),
-        listing.binaries.len()
+        plural_s(listing.tests.len()),
+        binaries_phrase(listing.binaries.len())
     );
     let fingerprint = fingerprint::compute(&project)?;
     let env_fingerprint = &fingerprint.hex;
@@ -259,8 +260,10 @@ pub(crate) fn collect(
     // binaries this run will actually touch need a map — a `--diff` collect
     // rerunning three tests shouldn't pay to export a whole workspace.
     let mapped = binaries_for_run(&listing, diff_plan.as_ref());
-    let s = if mapped.len() == 1 { "y" } else { "ies" };
-    eprintln!("exporting coverage maps for {} binary{s}...", mapped.len());
+    eprintln!(
+        "exporting coverage maps for {}...",
+        binaries_phrase(mapped.len())
+    );
     write_function_maps(
         &function_maps_dir,
         &mapped,
@@ -374,7 +377,7 @@ pub(crate) fn collect(
         );
     }
     if skipped > 0 {
-        let s = if skipped == 1 { "" } else { "s" };
+        let s = plural_s(skipped);
         eprintln!("{skipped} test{s} produced no coverage");
     }
     // Every test that ran produced no usable coverage. A real test always
@@ -389,7 +392,7 @@ pub(crate) fn collect(
             "nextest ran but coverage extraction yielded no ranges for any of \
              the {skipped} completed test{} (see the skip reasons above) — \
              refusing to overwrite stored coverage",
-            if skipped == 1 { "" } else { "s" },
+            plural_s(skipped),
         );
     }
 
@@ -398,8 +401,10 @@ pub(crate) fn collect(
 
     if let Some(plan) = diff_plan {
         eprintln!(
-            "updating coverage for {} tests ({region_count} ranges)...",
-            mappings.len()
+            "updating coverage for {} test{} ({region_count} range{})...",
+            mappings.len(),
+            plural_s(mappings.len()),
+            plural_s(region_count),
         );
         db.update_coverage_for_tests(
             env_fingerprint,
@@ -410,8 +415,10 @@ pub(crate) fn collect(
         prune_and_report(&mut db, env_fingerprint, &plan.listed)?;
     } else {
         eprintln!(
-            "storing coverage for {} tests ({region_count} ranges)...",
-            mappings.len()
+            "storing coverage for {} test{} ({region_count} range{})...",
+            mappings.len(),
+            plural_s(mappings.len()),
+            plural_s(region_count),
         );
         db.store_coverage(
             env_fingerprint,
@@ -424,14 +431,16 @@ pub(crate) fn collect(
     let evicted = db.gc(env_fingerprint, FINGERPRINT_KEEP)?;
     if evicted > 0 {
         let kept = db.fingerprint_count()?;
-        let s = if evicted == 1 { "" } else { "s" };
+        let s = plural_s(evicted);
         eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
     eprintln!(
-        "done. {} tests, {} ranges stored in target/affected/coverage.db ({:.1}s total)",
+        "done. {} test{}, {} range{} stored in target/affected/coverage.db ({:.1}s total)",
         mappings.len(),
+        plural_s(mappings.len()),
         region_count,
+        plural_s(region_count),
         total_elapsed.as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
@@ -452,6 +461,24 @@ const STAGING_DIR_PREFIXES: &[&str] = &[
     RESULTS_DIR_PREFIX,
     FUNCTION_MAPS_DIR_PREFIX,
 ];
+
+/// "1 binary" / "2 binaries". The plural split lands mid-word, so this can't
+/// be a suffix interpolated after the noun the way [`plural_s`] does — doing
+/// that is what produced "1 binaryy" in the map-export line.
+fn binaries_phrase(n: usize) -> String {
+    format!("{n} binar{}", if n == 1 { "y" } else { "ies" })
+}
+
+/// The `s` in `{n} test{s}` — empty at one, `"s"` otherwise. Only correct for
+/// nouns that pluralize by suffix; anything splitting mid-word (binary,
+/// binaries) needs its own phrase function.
+pub(crate) fn plural_s(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
 
 /// The binaries whose tests this run will execute, and so the ones needing a
 /// coverage map.
@@ -1231,7 +1258,7 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
 fn prune_and_report(db: &mut Db, env_fingerprint: &str, listed: &BTreeSet<TestId>) -> Result<()> {
     let pruned = db.prune_missing_tests(env_fingerprint, listed)?;
     if pruned > 0 {
-        let s = if pruned == 1 { "" } else { "s" };
+        let s = plural_s(pruned);
         eprintln!("pruned {pruned} test{s} no longer present in nextest list");
     }
     Ok(())
@@ -1323,6 +1350,13 @@ fn current_target() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binaries_phrase_splits_the_noun_not_the_suffix() {
+        assert_eq!(binaries_phrase(0), "0 binaries");
+        assert_eq!(binaries_phrase(1), "1 binary");
+        assert_eq!(binaries_phrase(2), "2 binaries");
+    }
 
     fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
         Listing {
