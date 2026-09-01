@@ -16,8 +16,14 @@
 //! - `fingerprint_components` — `(env_fingerprint, label, content_hash)`. The
 //!   per-input decomposition of `env_fingerprint`, so a cache miss can be
 //!   reported as "this manifest differs, Cargo.lock and rustc match" rather
-//!   than as an opaque hash mismatch. Purely diagnostic: the composite hash
-//!   already encodes the same information.
+//!   than as an opaque hash mismatch. Its *content* is purely diagnostic —
+//!   the composite hash already encodes the same information — but its
+//!   *presence and shape* are load-bearing: `migrate_legacy_tables` drops
+//!   every coverage table when this table is missing while `test_regions`
+//!   exists, when its columns aren't `(env_fingerprint, label,
+//!   content_hash)`, or when a `test_regions` row's `env_fingerprint` has no
+//!   component rows. All three mean stored coverage can't answer "which
+//!   input differs?", so the next `collect` rebuilds from scratch.
 //!
 //! `collect_sha` lives per-row (rather than per-fingerprint) so `collect
 //! --diff` can leave unaffected tests anchored at their original sha while
@@ -91,14 +97,17 @@ CREATE TABLE IF NOT EXISTS test_regions (
     collect_sha TEXT NOT NULL,
     PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
 );
--- Serves the one selection-path query: the equality lookup on
--- (source_file, env_fingerprint, collect_sha) in `tests_covering_ranges`.
--- Range overlap is NOT pushed into SQL — that query pulls every row for the
--- triple once and walks them in Rust, because rows-per-file is small and
--- SQLite round-trips dominate the per-hunk cost (see the method's docs).
--- So the trailing `line_start, line_end` columns don't participate in the
--- lookup, and don't make the index covering either (the query also reads
--- binary_id and test_name). They are kept rather than dropped because
+-- Serves two equality lookups, both on the `run`/`status` path: the full
+-- (source_file, env_fingerprint, collect_sha) triple in
+-- `tests_covering_ranges`, and the two-column prefix (source_file,
+-- env_fingerprint) in `file_tracked`, which `warn_untracked_rs_files` calls
+-- once per changed `.rs` file.
+-- Range overlap is NOT pushed into SQL — `tests_covering_ranges` pulls every
+-- row for the triple once and walks them in Rust, because rows-per-file is
+-- small and SQLite round-trips dominate the per-hunk cost (see the method's
+-- docs). So the trailing `line_start, line_end` columns don't participate in
+-- either lookup, and don't make the index covering either (the query also
+-- reads binary_id and test_name). They are kept rather than dropped because
 -- `CREATE INDEX IF NOT EXISTS` never rewrites an index that already exists:
 -- narrowing the shape here would only apply to freshly-created databases
 -- unless `migrate_legacy_tables` also learned to drop the old one.
