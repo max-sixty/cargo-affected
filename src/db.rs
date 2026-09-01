@@ -97,11 +97,12 @@ CREATE TABLE IF NOT EXISTS test_regions (
     collect_sha TEXT NOT NULL,
     PRIMARY KEY (binary_id, test_name, source_file, line_start, line_end, env_fingerprint, collect_sha)
 );
--- Serves two equality lookups, both on the `run`/`status` path: the full
--- (source_file, env_fingerprint, collect_sha) triple in
--- `tests_covering_ranges`, and the two-column prefix (source_file,
+-- Serves two equality lookups. The full (source_file, env_fingerprint,
+-- collect_sha) triple in `tests_covering_ranges`, reached from `run`,
+-- `status` (both via `plan`) and `collect --diff` (via
+-- `selection::select_with_reach`). And the two-column prefix (source_file,
 -- env_fingerprint) in `file_tracked`, which `warn_untracked_rs_files` calls
--- once per changed `.rs` file.
+-- once per changed `.rs` file from `run` and `status` only.
 -- Range overlap is NOT pushed into SQL — `tests_covering_ranges` pulls every
 -- row for the triple once and walks them in Rust, because rows-per-file is
 -- small and SQLite round-trips dominate the per-hunk cost (see the method's
