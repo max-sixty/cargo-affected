@@ -92,9 +92,9 @@ pub(crate) fn git(dir: &Path, args: &[&str]) {
 /// existing call site — selection summaries and notices land there (`run`'s
 /// and `collect`'s), and so do nextest's own PASS/FAIL lines, because nextest
 /// writes its whole human-readable run to stderr. `status` splits the other
-/// way: only its `cargo-affected: cache=…` summary and `checking for new
-/// tests...` go to stderr; everything else it prints goes to stdout. Tests
-/// grep both.
+/// way: only its `cargo-affected: cache=…` summary, `checking for new
+/// tests...` and the `warning:` lines go to stderr; everything else it prints
+/// goes to stdout. Tests grep both.
 pub(crate) fn combined_output(out: &Output) -> String {
     format!(
         "{}{}",
