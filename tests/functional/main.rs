@@ -89,8 +89,10 @@ pub(crate) fn git(dir: &Path, args: &[&str]) {
 
 /// Concatenate a process output's stderr and stdout (in that order) into a
 /// single `String` for substring assertions. Stderr first matches every
-/// existing call site — selection summaries and notices land on stderr while
-/// nextest's PASS/FAIL lines land on stdout, and tests grep both.
+/// existing call site — `run`'s selection summaries and notices land there,
+/// and so do nextest's own PASS/FAIL lines, because nextest writes its whole
+/// human-readable run to stderr. Stdout is `status`'s inventory and plan.
+/// Tests grep both.
 pub(crate) fn combined_output(out: &Output) -> String {
     format!(
         "{}{}",
