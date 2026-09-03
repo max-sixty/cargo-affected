@@ -150,9 +150,13 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
     // `<package>` for the lib and `<package>::bin/<name>` for the bin.
     assert_both_binary_ids(dir, "after the first collect");
 
-    // A second collect drives the pre-run listing through the same probe
-    // path again — confirms it stays stable run-to-run, not just on a
-    // cold target/.
+    // A second collect repeats the whole pipeline on a warm `target/` —
+    // confirms the two targets stay separately attributed run-to-run, not
+    // just on a cold build. Neither half of that attribution goes through a
+    // path probe any more: which target a test belongs to comes from
+    // `NEXTEST_BINARY_ID`, and each target's function map is filed under its
+    // own `wt_perf-<hash>` file name, whose hash differs even though the
+    // stem collides.
     let recollect = cargo_affected_stripped(dir, &["affected", "collect"]);
     let combined = combined_output(&recollect);
     assert!(
