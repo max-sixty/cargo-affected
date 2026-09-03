@@ -98,6 +98,29 @@ fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
 }
 
+/// The lib and the bin must each hold rows under their own `binary_id`. A
+/// merged or dropped target loses one of the two; `when` names which collect
+/// the check follows so a failure points at the right one.
+fn assert_both_binary_ids(dir: &Path, when: &str) {
+    let conn = rusqlite::Connection::open(dir.join("target/affected/coverage.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT binary_id FROM test_regions")
+        .unwrap();
+    let ids: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "wt_perf_collide"),
+        "expected lib binary_id {when}, got {ids:?}",
+    );
+    assert!(
+        ids.iter().any(|id| id == "wt_perf_collide::bin/wt-perf"),
+        "expected bin binary_id {when}, got {ids:?}",
+    );
+}
+
 #[test]
 fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -112,38 +135,28 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
         "collect failed: stderr=\n{stderr}\nstdout=\n{}",
         String::from_utf8_lossy(&collect.stdout)
     );
+    // Every test must produce coverage. A `binary_id` the shim can't resolve
+    // is a *soft* failure — that test lands as `Skipped` and collect still
+    // exits 0 on the other binary's rows — so the exit status above proves
+    // nothing on its own. `collect` prints this line for any skip. On this
+    // first collect the binary_id assertions below would also catch a drop;
+    // this line just fails earlier, with a clearer reason.
     assert!(
-        !stderr.contains("failed to resolve binary_id"),
-        "shim must not bail on lib+bin same-basename: stderr=\n{stderr}",
-    );
-    assert!(
-        !stderr.contains("basename fallback ambiguous"),
-        "marker probe must disambiguate lib+bin: stderr=\n{stderr}",
+        !stderr.contains("produced no coverage"),
+        "lib+bin same-basename must not cost a target its coverage: stderr=\n{stderr}",
     );
 
     // Both targets must land under their own binary_ids — nextest's
     // `<package>` for the lib and `<package>::bin/<name>` for the bin.
-    let db = dir.join("target/affected/coverage.db");
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let ids: Vec<String> = conn
-        .prepare("SELECT DISTINCT binary_id FROM test_regions")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    assert!(
-        ids.iter().any(|id| id == "wt_perf_collide"),
-        "expected lib binary_id in {ids:?}",
-    );
-    assert!(
-        ids.iter().any(|id| id == "wt_perf_collide::bin/wt-perf"),
-        "expected bin binary_id in {ids:?}",
-    );
+    assert_both_binary_ids(dir, "after the first collect");
 
-    // A second collect drives the pre-run listing through the same probe
-    // path again — confirms it stays stable run-to-run, not just on a
-    // cold target/.
+    // A second collect repeats the whole pipeline on a warm `target/` —
+    // confirms the two targets stay separately attributed run-to-run, not
+    // just on a cold build. Neither half of that attribution goes through a
+    // path probe any more: which target a test belongs to comes from
+    // `NEXTEST_BINARY_ID`, and each target's function map is filed under its
+    // own `wt_perf-<hash>` file name, whose hash differs even though the
+    // stem collides.
     let recollect = cargo_affected_stripped(dir, &["affected", "collect"]);
     let combined = combined_output(&recollect);
     assert!(
@@ -151,7 +164,12 @@ fn lib_bin_same_basename_resolves_via_nextest_binary_id() {
         "second collect failed: {combined}"
     );
     assert!(
-        !combined.contains("failed to resolve binary_id"),
+        !combined.contains("produced no coverage"),
         "second collect must not regress: {combined}",
     );
+    // Re-check the database, not just stderr. The assertion above greps a
+    // `collect` message, so a reword of it would silently retire the guard —
+    // exactly the drift this scenario has already suffered once. The row
+    // check pins the property itself.
+    assert_both_binary_ids(dir, "after the second collect");
 }
