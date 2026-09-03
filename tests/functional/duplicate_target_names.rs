@@ -130,8 +130,12 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     // Force a rebuild of one crate's `builds` binary by editing its lib —
     // cargo re-hashes that binary, leaving the other unchanged. Under the
     // old shim this was the worst-case path: ambiguous basename, debuginfo
-    // stripped, partial rebuild. Under the new shim the pre-run listing
-    // refreshes paths, so the lookup remains exact.
+    // stripped, partial rebuild. The current shim splits the two halves so
+    // neither depends on the path staying put: attribution comes from
+    // `NEXTEST_BINARY_ID`, which nextest sets per test, and the function map
+    // carries a stamp of the binary it was exported from that
+    // `load_function_map` checks. A rebuild keeps the binary's *name*, so a
+    // stale map would still be found by name — the stamp is what rejects it.
     replace_in_file(
         &dir.join("mock-stub/src/lib.rs"),
         "pub fn touch() {}",
@@ -159,7 +163,8 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     );
 
     // A second collect after the edit exercises the full pipeline again —
-    // pre-run listing must still produce a working binary_map. Commit the
+    // collect must re-export a function map whose stamp matches the rebuilt
+    // binary, or every test in it lands `Skipped`. Commit the
     // edit first so collect's clean-tree gate is satisfied; the gate exists
     // because stored ranges would otherwise be filed under HEAD but reflect
     // the dirty working tree.
@@ -186,6 +191,4 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         2,
         "post-edit collect must keep both binary_ids for `builds`, got {ids:?}"
     );
-
-    git(dir, &["checkout", "--", "mock-stub/src/lib.rs"]);
 }
