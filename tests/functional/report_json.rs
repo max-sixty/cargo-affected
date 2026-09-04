@@ -92,9 +92,13 @@ fn report_json_documents_selection_in_full_detail() {
         .expect("collect_shas should be populated when the fingerprint matched");
     assert_eq!(shas.len(), 1, "one collect, one anchor sha, got: {shas:?}");
     assert_eq!(shas[0]["relation"], "equal");
+    // `.get()`, not `["commits_ahead"].is_null()`: indexing a missing key on a
+    // `Value` yields `Null`, so `is_null()` can't tell "skipped" from "emitted
+    // as null" — and skipped is exactly what `CollectShaEntry` documents,
+    // because consumers use field presence to detect reachable shas.
     assert!(
-        shas[0]["commits_ahead"].is_null(),
-        "commits_ahead is emitted only for `reachable` shas, got: {:?}",
+        shas[0].get("commits_ahead").is_none(),
+        "commits_ahead must be omitted entirely (not null) for a non-reachable sha, got: {}",
         shas[0]
     );
 
@@ -294,10 +298,19 @@ fn report_json_full_suite_shape_under_all() {
     assert!(report["selection"]["changed_files"].is_null());
     assert!(report["selection"]["selected_tests"].is_null());
 
-    // --all bypasses selection but still runs the suite: all three tests ran.
+    // The notice alone proves nothing — it prints before any work happens, and
+    // nothing was edited here, so a selection-mode run would have picked zero
+    // tests. Name each test instead: seeing all three is what pins that `--all`
+    // ran the suite rather than just announcing it.
     let combined = crate::combined_output(&out);
     assert!(
         combined.contains("running all tests (--all)"),
         "expected the --all notice, got:\n{combined}"
     );
+    for test in ["test_add", "test_multiply", "test_greet"] {
+        assert!(
+            combined.contains(test),
+            "--all must run the whole suite; {test} is missing from:\n{combined}"
+        );
+    }
 }
