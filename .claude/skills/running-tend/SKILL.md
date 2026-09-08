@@ -220,3 +220,53 @@ Fixed upstream in tend `0.1.22`
 (`running-in-ci/references/grounded-analysis.md`, plus explicit `--limit`
 bounds at every listing site); this repo pins `0.1.14`. Drop this section
 once the pin moves past `0.1.22`.
+
+## Pre-filter the nightly survey against open PRs — the 28-day rotation now re-derives them
+
+`nightly-survey-files.sh` is deterministic in both directions: the day picks
+the bucket (`unix_day / 86400 % 28`) and the path picks the bucket
+(`cksum(path) % 28`), so bucket *N* comes back to the same file set every 28
+days. That is a rotation, not a sample, and it only stays useful while the PRs
+it produces get merged. `main` has been static at `83507c6` since 2026-08-08 —
+now longer than the cycle — so every bucket whose last pass left an unmerged
+PR re-derives that PR's findings when it comes round.
+
+`tend-nightly` [`34195750626`](https://github.com/max-sixty/cargo-affected/actions/runs/34195750626)
+(2026-09-08, bucket 12/28) drew `tests/functional/clean.rs` and
+`tests/functional/db_has_function_ranges.rs`, found the unreachable
+`|| contains("no coverage data found")` alternative and the `pub` →
+`pub(crate)` error in the sentinel module doc, wrote both fixes, installed
+`llvm-tools` and `cargo-nextest`, built, and ran the full functional suite plus
+`clippy` and `fmt` — and only then did the pre-`gh pr create` dedup surface
+[#83](https://github.com/max-sixty/cargo-affected/pull/83), opened 2026-08-11
+(exactly 28 days earlier, the same bucket) against the same two files with the
+same two fixes. The branch was discarded unpushed. Two earlier nightlies landed
+the same way with less sunk cost:
+[`33724452938`](https://github.com/max-sixty/cargo-affected/actions/runs/33724452938)
+(09-03) found two of its three survey defects already carried by #77 and #99,
+and [`33950286183`](https://github.com/max-sixty/cargo-affected/actions/runs/33950286183)
+(09-05) declined to file after its `src/selection.rs` defect turned out to be
+covered by #81.
+
+Spend one call at the *top* of Step 6, before reading any of the files:
+
+```bash
+gh pr list --state open --limit 200 --json number,files \
+  --jq '[.[] | {n: .number, paths: [.files[].path]}]' > /tmp/open-pr-files.json
+# then, per surveyed path:
+jq -r --arg p "<path>" '.[] | select(.paths | index($p)) | .n' /tmp/open-pr-files.json
+```
+
+A file that already has an open PR against it is not worth surveying:
+whatever the survey would find there is either in that PR already or belongs
+as a comment on it. Drop those paths and review the rest.
+
+The pinned `0.1.14` bundled `nightly` skill has no dedup in Step 6 at all —
+the only guard is the pre-`gh pr create` recheck in `running-in-ci`, which by
+construction fires after the fix is written and tested. `0.2.0` adds **Fetch
+the prior rejection before re-deriving a fix**, which searches by path per
+finding and fires before code is written; that recovers the build-and-test
+cost but still pays for the review. This section stays after the pin moves —
+a file-level pre-filter is upstream of both, and nothing in the bundled skill
+carries it. Filed upstream as
+[max-sixty/tend#1176](https://github.com/max-sixty/tend/issues/1176).
