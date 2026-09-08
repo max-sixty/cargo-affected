@@ -223,9 +223,11 @@ once the pin moves past `0.1.22`.
 
 ## Pre-filter the nightly survey against open PRs — the 28-day rotation now re-derives them
 
-`nightly-survey-files.sh` is deterministic in both directions: the day picks
-the bucket (`unix_day / 86400 % 28`) and the path picks the bucket
-(`cksum(path) % 28`), so bucket *N* comes back to the same file set every 28
+The survey script is deterministic in both directions: the day picks the bucket
+(`unix_seconds / 86400 % 28`) and the path picks the bucket (`cksum` of the path
+`% 28` at `0.1.14`; `zlib.crc32` in `0.2.0`'s `nightly_survey_files.py`, a
+different hash that reshuffles every bucket once when the pin moves), so bucket
+*N* comes back to the same file set every 28
 days. That is a rotation, not a sample, and it only stays useful while the PRs
 it produces get merged. `main` has been static at `83507c6` since 2026-08-08 —
 now longer than the cycle — so every bucket whose last pass left an unmerged
@@ -257,12 +259,17 @@ gh pr list --state open --limit 200 --json number,files \
 jq -r --arg p "<path>" '.[] | select(.paths | index($p)) | .n' /tmp/open-pr-files.json
 ```
 
-A file that already has an open PR against it is not worth surveying:
-whatever the survey would find there is either in that PR already or belongs
-as a comment on it. Drop those paths and review the rest.
+A hit is a warning, not a verdict. Read that PR's diff before reviewing the
+file and drop a *finding* it already carries — or post the finding as a comment
+there — rather than dropping the path. An outright path drop would blind the
+survey here: 23 of the 32 files under `src/` and `tests/` currently sit under an
+open PR, 11 of the 13 in `src/` among them, and the static backlog this section
+is about is exactly what keeps them there.
 
-The pinned `0.1.14` bundled `nightly` skill has no dedup in Step 6 at all —
-the only guard is the pre-`gh pr create` recheck in `running-in-ci`, which by
+The pinned `0.1.14` bundled `nightly` skill has no dedup in Step 6 at all. Its
+Step 8 opens with a title-only `gh pr list --json number,title` — unbounded, so
+truncated at 30 on this repo per the section above — and the only path-aware
+guard is the pre-`gh pr create` recheck in `running-in-ci`, which by
 construction fires after the fix is written and tested. `0.2.0` adds **Fetch
 the prior rejection before re-deriving a fix**, which searches by path per
 finding and fires before code is written; that recovers the build-and-test
