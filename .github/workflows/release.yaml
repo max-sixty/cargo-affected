@@ -25,12 +25,12 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
       # `--locked` asserts the committed `Cargo.lock` is already in sync with
-      # `Cargo.toml`. A release commit that bumps the version without
-      # regenerating the lock would otherwise have cargo silently re-resolve
-      # every dependency to newest-compatible during the verify build, and ship
-      # that lock inside the published crate — so `cargo install --locked
-      # cargo-affected` would pin versions CI never tested. With `--locked` the
-      # publish fails instead.
+      # `Cargo.toml`. Without it, an out-of-sync lock is silently rewritten
+      # during the verify build and the rewritten lock ships inside the
+      # published crate, so `cargo install --locked cargo-affected` can pin
+      # dependency versions no CI job built — a bumped or added dependency
+      # requirement gets re-resolved to newest-compatible at publish time.
+      # With `--locked` the publish fails instead.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
