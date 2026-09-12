@@ -37,11 +37,14 @@ edition = "2021"
     )
     .unwrap();
 
-    // A function in a *non-root* module, so the crate has at least one real
-    // stored range. Every edit to `src/lib.rs` matches that file's crate-root
-    // sentinel `(1, i64::MAX)` regardless of what it touches, so the crate root
-    // can't stand in for coverage — see
-    // `config_rule_inert_when_no_glob_matches`, which edits this body.
+    // A function in a *non-root* module. The crate already had a real stored
+    // range before this — `golden_matches` is an instrumented function, so it
+    // gets one of its own — but every crate root (`src/lib.rs`,
+    // `tests/golden.rs`) also carries the sentinel `(1, i64::MAX)`, which
+    // matches any hunk in that file regardless of what it touches. Only a
+    // non-root file can hold an edit that has to overlap a function range to
+    // select — see `config_rule_inert_when_no_glob_matches`, which edits this
+    // body.
     std::fs::write(
         src.join("greeting.rs"),
         r#"pub fn greeting() -> &'static str {
