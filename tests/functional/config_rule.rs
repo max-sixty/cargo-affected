@@ -90,8 +90,9 @@ fn config_rule_selects_test_for_non_rust_input_change() {
     write_golden_project(dir);
     init_git_with_initial_commit(dir);
 
-    // Seed coverage: `golden_matches` runs, covering `GREETING` and the test
-    // body — but nothing links `golden.txt` to it.
+    // Seed coverage: `golden_matches` runs, covering `greeting()` and the test
+    // body — but nothing links `golden.txt` to it. (`GREETING` is a `const`:
+    // it instruments no function, so it gets no range of its own.)
     let collect = cargo_affected(dir, &["affected", "collect"]);
     assert!(
         collect.status.success(),
