@@ -14,8 +14,9 @@ use std::path::Path;
 
 use crate::{cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file};
 
-/// Crate whose only test reads `golden.txt` at runtime and compares it to a
-/// `const` — a hermetic stand-in for an insta snapshot or doc-sync test.
+/// Crate whose only test reads `golden.txt` at runtime and compares it to what
+/// `greeting()` returns — a hermetic stand-in for an insta snapshot or doc-sync
+/// test.
 fn write_golden_project(dir: &Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -32,7 +33,21 @@ edition = "2021"
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         src.join("lib.rs"),
-        "pub const GREETING: &str = \"hello\";\n",
+        "pub mod greeting;\n\npub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+
+    // A function in a *non-root* module, so the crate has at least one real
+    // stored range. Every edit to `src/lib.rs` matches that file's crate-root
+    // sentinel `(1, i64::MAX)` regardless of what it touches, so the crate root
+    // can't stand in for coverage — see
+    // `config_rule_inert_when_no_glob_matches`, which edits this body.
+    std::fs::write(
+        src.join("greeting.rs"),
+        r#"pub fn greeting() -> &'static str {
+    crate::GREETING
+}
+"#,
     )
     .unwrap();
 
@@ -50,7 +65,7 @@ fn golden_matches() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
     )
     .unwrap();
-    assert_eq!(config_rule_sample::GREETING, expected.trim());
+    assert_eq!(config_rule_sample::greeting::greeting(), expected.trim());
 }
 "#,
     )
@@ -177,7 +192,17 @@ fn config_rule_inert_when_no_glob_matches() {
 
     // Edit a Rust file (not golden.txt). The rule's glob doesn't match, so the
     // config category stays empty and selection is driven purely by coverage.
-    replace_in_file(&dir.join("src/lib.rs"), "hello", "hello world");
+    //
+    // The hunk lands inside `greeting`'s body, which `golden_matches` executes
+    // — a genuine range overlap. Editing `src/lib.rs` instead would prove less
+    // than it reads: that file is the crate root, and its sentinel row
+    // `(1, i64::MAX)` selects for *any* edit to it, so the assertion below
+    // would hold even for a line no test could reach.
+    replace_in_file(
+        &dir.join("src/greeting.rs"),
+        "    crate::GREETING\n",
+        "    crate::GREETING.trim()\n",
+    );
     let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
     assert!(
         out.contains("0 config"),
@@ -185,6 +210,6 @@ fn config_rule_inert_when_no_glob_matches() {
     );
     assert!(
         out.contains("golden_matches"),
-        "the GREETING edit should still select the test via coverage: {out}"
+        "the greeting edit should still select the test via coverage: {out}"
     );
 }
