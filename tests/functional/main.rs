@@ -104,6 +104,13 @@ pub(crate) fn combined_output(out: &Output) -> String {
 /// success path of `collect` owes this sweep, and the dirs are PID-suffixed,
 /// so a missed one strands a fresh set on every invocation rather than
 /// overwriting the last. `what` names the command that was supposed to sweep.
+///
+/// An unreadable `target/affected/` panics rather than reading as an empty
+/// directory: every `collect` creates it and nothing removes it (`clean` takes
+/// the staging dirs and clears the DB via SQL, never the parent), so the only
+/// way to arrive here with it missing is a caller passing something other than
+/// the scratch-repo root — which would otherwise make this assertion pass
+/// vacuously.
 pub(crate) fn assert_no_staging_dirs(root: &Path, what: &str) {
     let affected = root.join("target").join("affected");
     let leftovers: Vec<PathBuf> = std::fs::read_dir(&affected)
@@ -120,7 +127,7 @@ pub(crate) fn assert_no_staging_dirs(root: &Path, what: &str) {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| panic!("{} unreadable after {what}: {e}", affected.display()));
     assert!(
         leftovers.is_empty(),
         "expected no staging dirs under target/affected after {what}, found:\n  {}",
