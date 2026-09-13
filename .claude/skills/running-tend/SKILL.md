@@ -277,3 +277,53 @@ cost but still pays for the review. This section stays after the pin moves —
 a file-level pre-filter is upstream of both, and nothing in the bundled skill
 carries it. Filed upstream as
 [max-sixty/tend#1176](https://github.com/max-sixty/tend/issues/1176).
+
+## A `tend-review` session that pushes before it posts cancels itself
+
+`.github/workflows/tend-review.yaml` is the tend `0.1.14` generation, and its
+`review` job sets `cancel-in-progress: true` on
+`group: ${{ github.workflow }}-${{ github.event.pull_request.number }}`. A
+commit pushed to the PR branch fires `pull_request_target: synchronize`, GitHub
+starts a sibling run in that group, and the sibling cancels the run that pushed
+it. Step 8 of the bundled `review` skill ("Push fixes") therefore destroys the
+session executing it, and the review that session had already written is never
+posted.
+
+**Submit the review first, then push the fix.** The bundled skill already
+orders them that way — step 5 submits, step 8 pushes — but it gives no reason,
+and a session that finds a fixable defect mid-review has no signal that acting
+on it immediately is fatal here.
+
+Twice on consecutive nights, seventeen seconds after the push each time:
+
+- 2026-09-12 on [#105](https://github.com/max-sixty/cargo-affected/pull/105) —
+  [`34679088931`](https://github.com/max-sixty/cargo-affected/actions/runs/34679088931)
+  started 06:48:33, pushed `9b746786` at 06:52:06, sibling
+  [`34679244006`](https://github.com/max-sixty/cargo-affected/actions/runs/34679244006)
+  was created 06:52:10, and the original was cancelled 06:52:23. The first
+  review on #105 landed 07:10:33 — from the replacement, 22 minutes after the
+  original was ready to post one.
+- 2026-09-13 on [#106](https://github.com/max-sixty/cargo-affected/pull/106) —
+  [`34744043310`](https://github.com/max-sixty/cargo-affected/actions/runs/34744043310)
+  started 06:57:54, pushed `4b733ebe` at 07:02:33, sibling
+  [`34744245947`](https://github.com/max-sixty/cargo-affected/actions/runs/34744245947)
+  was created 07:02:36, and the original was cancelled 07:02:50. Its last tool
+  call is 07:02:40, part-way through fetching review threads to post against.
+  Its session log records 44 turns / 26.1K output / 3.15M cache-read, all
+  discarded; the replacement re-read the PR from scratch for a measured $2.14
+  and posted at 07:09:51.
+
+Neither cancelled session had posted a review, a comment, or an inline reply —
+the push was its only visible output, so from the PR the loss is invisible.
+Both had completed the substantive work: the 09-13 one had run the structured
+`code-review` pass and reduced it to a single surviving finding.
+
+`tend-mention` is not exposed. Its `handle` job already carries
+`cancel-in-progress: false` on `main`, so a mention session may push freely;
+only `tend-review` has the hazard.
+
+Drop this section once
+[#85](https://github.com/max-sixty/cargo-affected/pull/85) lands — `0.2.7`
+moves the group to `queue: max` + `cancel-in-progress: false`, and its
+generated comment names this exact case ("Runs stay serial so outward actions
+cannot race").
