@@ -267,7 +267,8 @@ open PR, 11 of the 13 in `src/` among them, and the static backlog this section
 is about is exactly what keeps them there.
 
 The pinned `0.1.14` bundled `nightly` skill has no dedup in Step 6 at all. Its
-Step 8 opens with a title-only `gh pr list --json number,title` — unbounded, so
+Step 8 opens with a path-blind
+`gh pr list --state open --json number,title,headRefName` — unbounded, so
 truncated at 30 on this repo per the section above — and the only path-aware
 guard is the pre-`gh pr create` recheck in `running-in-ci`, which by
 construction fires after the fix is written and tested. `0.2.0` adds **Fetch
@@ -278,7 +279,7 @@ a file-level pre-filter is upstream of both, and nothing in the bundled skill
 carries it. Filed upstream as
 [max-sixty/tend#1176](https://github.com/max-sixty/tend/issues/1176).
 
-## A `tend-review` session that pushes before it posts cancels itself
+## A `tend-review` session that pushes to the PR branch cancels itself
 
 `.github/workflows/tend-review.yaml` is the tend `0.1.14` generation, and its
 `review` job sets `cancel-in-progress: true` on
@@ -292,7 +293,11 @@ posted.
 **Submit the review first, then push the fix.** The bundled skill already
 orders them that way — step 5 submits, step 8 pushes — but it gives no reason,
 and a session that finds a fixable defect mid-review has no signal that acting
-on it immediately is fatal here.
+on it immediately is fatal here. Posting first rescues the review, not the
+session: the push cancels the run either way, so it must be the session's
+**last** action. The pushed commit's CI cannot be polled from the session that
+pushed it — the sibling run the push starts is what reviews and monitors the
+new head.
 
 Twice on consecutive nights, seventeen seconds after the push each time:
 
@@ -301,7 +306,7 @@ Twice on consecutive nights, seventeen seconds after the push each time:
   started 06:48:33, pushed `9b746786` at 06:52:06, sibling
   [`34679244006`](https://github.com/max-sixty/cargo-affected/actions/runs/34679244006)
   was created 06:52:10, and the original was cancelled 06:52:23. The first
-  review on #105 landed 07:10:33 — from the replacement, 22 minutes after the
+  review on #105 landed 07:10:33 — from the replacement, 18 minutes after the
   original was ready to post one.
 - 2026-09-13 on [#106](https://github.com/max-sixty/cargo-affected/pull/106) —
   [`34744043310`](https://github.com/max-sixty/cargo-affected/actions/runs/34744043310)
