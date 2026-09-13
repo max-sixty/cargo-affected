@@ -248,6 +248,12 @@ pub(crate) fn collect(
                      ({:.1}s total)",
                     total_start.elapsed().as_secs_f64(),
                 );
+                // This is a success path like the two below, so it owes the
+                // same sweep: the staging dirs were created before we knew
+                // there was nothing to rerun, and the PID suffix means each
+                // no-op `--diff` would otherwise strand a fresh empty triple
+                // under target/affected/ until the next `clean`.
+                remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
                 return Ok(0);
             }
         }
