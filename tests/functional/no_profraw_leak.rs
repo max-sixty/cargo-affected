@@ -10,7 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{cargo_affected, init_git_with_initial_commit, write_two_module_project};
+use crate::{
+    assert_no_staging_dirs, cargo_affected, init_git_with_initial_commit, write_two_module_project,
+};
 
 fn collect_profraws_outside_target(root: &Path) -> Vec<PathBuf> {
     let mut leaks = Vec::new();
@@ -93,78 +95,10 @@ fn collect_removes_staging_dirs_on_success() {
         String::from_utf8_lossy(&collect.stderr)
     );
 
-    let affected = dir.join("target").join("affected");
-    assert_no_staging_dirs(&affected, "collect");
+    assert_no_staging_dirs(dir, "collect");
     // Sanity: the DB the cleanup is supposed to preserve must still be there.
     assert!(
-        affected.join("coverage.db").exists(),
+        dir.join("target/affected/coverage.db").exists(),
         "coverage.db missing after collect"
-    );
-}
-
-/// The same sweep is owed by the third success path: a `collect --diff` that
-/// finds nothing to recollect returns before nextest ever runs, but the
-/// staging dirs were already created — they're made before the diff plan
-/// exists, since that's the point at which we learn there's nothing to rerun.
-/// Each is PID-suffixed, so without the sweep every no-op `--diff` strands a
-/// fresh empty triple under `target/affected/` until the next `clean`.
-#[test]
-fn diff_collect_removes_staging_dirs_when_nothing_to_recollect() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    write_two_module_project(dir, "sample_diff_noop_cleanup");
-    init_git_with_initial_commit(dir);
-
-    let collect = cargo_affected(dir, &["affected", "collect"]);
-    assert!(
-        collect.status.success(),
-        "collect failed: {}",
-        String::from_utf8_lossy(&collect.stderr)
-    );
-    let affected = dir.join("target").join("affected");
-    assert_no_staging_dirs(&affected, "collect");
-
-    // Clean tree, same HEAD: no hunks to match, no new tests — the
-    // nothing-to-recollect early return.
-    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
-    assert!(
-        diff.status.success(),
-        "collect --diff failed: {}",
-        String::from_utf8_lossy(&diff.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&diff.stderr).contains("nothing to recollect"),
-        "expected the no-op --diff path, got:\n{}",
-        String::from_utf8_lossy(&diff.stderr),
-    );
-    assert_no_staging_dirs(&affected, "collect --diff");
-}
-
-/// No `profraw-*/`, `results-*/` or `function-maps-*/` left under
-/// `target/affected/`. `what` names the command that was supposed to sweep.
-fn assert_no_staging_dirs(affected: &Path, what: &str) {
-    let leftovers: Vec<PathBuf> = std::fs::read_dir(affected)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                        n.starts_with("profraw-")
-                            || n.starts_with("results-")
-                            || n.starts_with("function-maps-")
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(
-        leftovers.is_empty(),
-        "expected no staging dirs under target/affected after {what}, found:\n  {}",
-        leftovers
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n  "),
     );
 }

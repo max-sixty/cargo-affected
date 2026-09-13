@@ -9,8 +9,8 @@
 //! collect, and a stored sha no longer reachable from HEAD.
 
 use crate::{
-    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit, replace_in_file,
-    write_two_module_project,
+    assert_no_staging_dirs, cargo_affected, combined_output, git, git_head,
+    init_git_with_initial_commit, replace_in_file, write_two_module_project,
 };
 
 /// Distinct collect_shas that anchor `test_name`'s rows. Sorted for stable
@@ -658,7 +658,8 @@ fn diff_collect_all_phantom_selection_prunes_cleanly() {
 
 /// `--diff` on a clean working tree (HEAD == prior collect_sha, no
 /// uncommitted edits) should short-circuit with exit 0 and announce that
-/// nothing needs to be recollected — no nextest invocation, no DB writes.
+/// nothing needs to be recollected — no nextest invocation, no DB writes,
+/// and no staging dirs left behind.
 #[test]
 fn diff_collect_clean_tree_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -711,4 +712,10 @@ fn diff_collect_clean_tree_exits_zero() {
         before,
         "clean-tree --diff should leave test_regions row count unchanged"
     );
+    // ...and the disk invariant. The staging dirs are created before the diff
+    // plan exists — that plan is what tells us there's nothing to rerun — so
+    // this path has to sweep them on the way out like the two rerun paths do.
+    // Without it, each no-op `--diff` strands a fresh PID-suffixed triple
+    // until the next `clean`.
+    assert_no_staging_dirs(dir, "collect --diff");
 }

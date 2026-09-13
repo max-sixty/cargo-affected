@@ -39,7 +39,7 @@ mod run;
 mod structural;
 mod workspace;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 // llvm-tools is a hard requirement — every scenario invokes `cargo affected
@@ -97,6 +97,39 @@ pub(crate) fn combined_output(out: &Output) -> String {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     )
+}
+
+/// Assert no per-PID staging dir — `profraw-*/`, `results-*/`,
+/// `function-maps-*/` — survives under `<root>/target/affected/`. Every
+/// success path of `collect` owes this sweep, and the dirs are PID-suffixed,
+/// so a missed one strands a fresh set on every invocation rather than
+/// overwriting the last. `what` names the command that was supposed to sweep.
+pub(crate) fn assert_no_staging_dirs(root: &Path, what: &str) {
+    let affected = root.join("target").join("affected");
+    let leftovers: Vec<PathBuf> = std::fs::read_dir(&affected)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n.starts_with("profraw-")
+                            || n.starts_with("results-")
+                            || n.starts_with("function-maps-")
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "expected no staging dirs under target/affected after {what}, found:\n  {}",
+        leftovers
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    );
 }
 
 /// Capture `git rev-parse HEAD` in `dir` as a 40-char sha.
