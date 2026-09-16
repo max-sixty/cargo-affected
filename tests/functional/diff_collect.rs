@@ -63,8 +63,8 @@ fn diff_collect_re_anchors_only_affected_tests() {
     // The re-collect summary should pick exactly one test (test_add).
     let combined = combined_output(&diff);
     assert!(
-        combined.contains("1 tests to recollect"),
-        "expected '1 tests to recollect' in diff output, got:\n{combined}"
+        combined.contains("1 test to recollect"),
+        "expected '1 test to recollect' in diff output, got:\n{combined}"
     );
 
     // DB invariant: rerun test now anchored at edited_sha; the others remain
@@ -181,7 +181,7 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     );
     let combined2 = combined_output(&diff2);
     assert!(
-        combined2.contains("1 tests to recollect"),
+        combined2.contains("1 test to recollect"),
         "round2 should rerun exactly test_fb, got:\n{combined2}"
     );
 
@@ -306,7 +306,7 @@ fn run_uses_sibling_sha_without_stranding_or_widening() {
     // The breakdown pins the *category*: a sibling sha contributes `affected`
     // hits, never `stranded` ones.
     assert!(
-        combined.contains("1 tests to run (1 affected + 0 config + 0 new + 0 stranded"),
+        combined.contains("1 test to run (1 affected + 0 config + 0 new + 0 stranded"),
         "expected test_fa selected as 'affected' with nothing stranded, got:\n{combined}"
     );
     assert!(

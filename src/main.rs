@@ -119,7 +119,7 @@ fn clean() -> Result<()> {
     // even when there's no DB to clear.
     let swept = collect::clean_staging_dirs(&project.workspace_root)?;
     if swept > 0 {
-        let s = if swept == 1 { "" } else { "s" };
+        let s = collect::plural_s(swept);
         eprintln!("removed {swept} leftover staging dir{s}");
     }
 
