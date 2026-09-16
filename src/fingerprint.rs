@@ -28,22 +28,22 @@ use crate::project::ProjectRoot;
 
 /// Composite fingerprint plus the per-component hashes that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fingerprint {
+pub(crate) struct Fingerprint {
     /// Composite SHA-256 hex digest. The cache-scoping value used in the DB.
-    pub hex: String,
+    pub(crate) hex: String,
     /// Per-component hashes in the same order they were folded into `hex`.
     /// Used to answer "which input changed?" on a fingerprint mismatch.
-    pub components: Vec<FingerprintComponent>,
+    pub(crate) components: Vec<FingerprintComponent>,
 }
 
 /// A single named input contributing to the composite fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FingerprintComponent {
+pub(crate) struct FingerprintComponent {
     /// Stable label (`cargo_lock`, `manifest:Cargo.toml`, `rustc`,
     /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
-    pub label: String,
+    pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
-    pub hash: String,
+    pub(crate) hash: String,
 }
 
 /// Compute the composite fingerprint and per-component hashes of the build
@@ -56,7 +56,7 @@ pub struct FingerprintComponent {
 /// Inputs are read once into memory; the composite digest and per-component
 /// digests are computed from the same byte buffers. A file changing on disk
 /// after the read still produces a self-consistent `Fingerprint`.
-pub fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
+pub(crate) fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
     let inputs = collect_inputs(project)?;
 
     let mut hasher = Sha256::new();
@@ -100,10 +100,7 @@ fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
     }
 
     inputs.push(("rustc".to_string(), rustc_version_bytes()?));
-    inputs.push((
-        "RUSTFLAGS".to_string(),
-        env_var("RUSTFLAGS").into_bytes(),
-    ));
+    inputs.push(("RUSTFLAGS".to_string(), env_var("RUSTFLAGS").into_bytes()));
     inputs.push((
         "CARGO_BUILD_TARGET".to_string(),
         env_var("CARGO_BUILD_TARGET").into_bytes(),
@@ -166,7 +163,7 @@ fn read_manifest_for_fingerprint(path: &std::path::Path) -> Result<Vec<u8>> {
         return Ok(raw);
     };
     let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
-        // Unparseable manifest: `cargo metadata` would already have failed
+        // Unparsable manifest: `cargo metadata` would already have failed
         // upstream. Hash raw so a broken manifest still differs from a fixed one.
         return Ok(raw);
     };
@@ -319,12 +316,18 @@ mod tests {
         )?;
         let edited = compute(&project)?;
 
-        assert_eq!(with_rule.hex, edited.hex, "editing a rule must not change the fingerprint");
+        assert_eq!(
+            with_rule.hex, edited.hex,
+            "editing a rule must not change the fingerprint"
+        );
         // First-add may differ by at most the metadata text; the stable
         // guarantee is edit-invariance above. Build inputs still register:
         std::fs::write(&manifest, format!("{bare}edition2 = true\n"))?;
         let real_change = compute(&project)?;
-        assert_ne!(a.hex, real_change.hex, "a non-metadata manifest edit must still register");
+        assert_ne!(
+            a.hex, real_change.hex,
+            "a non-metadata manifest edit must still register"
+        );
         Ok(())
     }
 
@@ -360,13 +363,13 @@ mod tests {
         std::fs::write(root.join("Cargo.lock"), b"lock")?;
         std::fs::write(root.join("Cargo.toml"), b"[package]")?;
         std::fs::create_dir_all(root.join("crates/foo"))?;
-        std::fs::write(root.join("crates/foo/Cargo.toml"), b"[package]\nname = \"foo\"")?;
+        std::fs::write(
+            root.join("crates/foo/Cargo.toml"),
+            b"[package]\nname = \"foo\"",
+        )?;
         let project = project_with(
             root.clone(),
-            vec![
-                root.join("Cargo.toml"),
-                root.join("crates/foo/Cargo.toml"),
-            ],
+            vec![root.join("Cargo.toml"), root.join("crates/foo/Cargo.toml")],
         );
 
         let fp = compute(&project)?;

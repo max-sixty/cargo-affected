@@ -1,11 +1,16 @@
 //! Shared test-selection plumbing for `run`, `status`, and `collect --diff`.
 //!
 //! Reachability classification, per-sha diff collection, the selection
-//! computation itself, and the human-facing notices/summaries. The three
-//! callers all walk the same path: classify stored `collect_sha`s, gather
-//! per-sha changed line ranges, list tests via nextest, look up overlaps for
-//! known tests, and union with tests added since the last `collect`. This
-//! module owns the whole flow so the callers can't drift apart.
+//! computation itself, and the human-facing notices/summaries — the pieces
+//! every selection walks: classify stored `collect_sha`s, gather per-sha
+//! changed line ranges, look up overlaps for known tests, and union with
+//! tests added since the last `collect`.
+//!
+//! The pieces live here; the order they're called in does not. `run` and
+//! `status` reach them through [`crate::plan`], which is what keeps those two
+//! agreeing. `collect --diff` composes them differently — it has already
+//! listed tests for its own purposes and wants a selection to rerun, not to
+//! report — so it calls [`select_with_reach`] directly.
 //!
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
@@ -20,7 +25,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::Listing;
+use crate::collect::{plural_s, Listing};
 use crate::db::{Db, HitKind, HitReason, TestId};
 use crate::project::{
     git_added_files_since, git_changed_line_ranges, relation_to_head, LineRange, ShaRelation,
@@ -32,6 +37,8 @@ pub(crate) struct Selection {
     /// Excludes `#[ignore]`d tests: their coverage rows can persist from
     /// an earlier (non-ignored) collect, but `nextest run` would skip them
     /// — same all-ignored-selection rationale as [`new_tests`].
+    ///
+    /// [`new_tests`]: Self::new_tests
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
@@ -90,7 +97,7 @@ impl Selection {
 /// dominated by `Full`'s per-test reason vectors, so the default is
 /// bounded; `Full` is opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum DiagnosticDetail {
+pub(crate) enum DiagnosticDetail {
     /// Per-file/per-kind aggregate counters only.
     Summary,
     /// Per-test reason vectors plus the per-file aggregates.
@@ -183,7 +190,7 @@ pub(crate) struct Reachability {
 /// rerun as 'new'" for `status`. Returns the body without a trailing
 /// newline so callers can `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {
-    let plural = if missing.len() == 1 { "" } else { "s" };
+    let plural = plural_s(missing.len());
     let list = missing.iter().cloned().collect::<Vec<_>>().join(", ");
     format!(
         "note: {} collect_sha{plural} not in the repo ({list}) — \
@@ -243,12 +250,15 @@ pub(crate) fn changed_ranges_per_sha(
 
 /// Compute selection given a pre-built listing and a `Reachability`.
 ///
-/// Bundles the two steps that always happen together — per-sha diff query
-/// and the selection compute — so the three callers (`run`, `status`,
-/// `collect --diff`) don't each open-code the pair. Caller stays
-/// responsible for handling `reach.reachable.is_empty()` upstream:
-/// `run`/`status` widen to all tests there, `collect --diff` bails. Those
-/// policies and their notices differ, so they don't belong in here.
+/// Bundles the per-sha diff query with the selection compute for the caller
+/// that only wants the answer: `collect --diff`. [`crate::plan`] runs the
+/// same pair by hand because it needs the intermediate ranges again when
+/// building the report, and re-deriving them would mean a second `git diff
+/// -U0` per reachable sha.
+///
+/// Caller stays responsible for handling `reach.reachable.is_empty()`
+/// upstream: `run`/`status` widen to all tests there, `collect --diff` bails.
+/// Those policies and their notices differ, so they don't belong in here.
 pub(crate) fn select_with_reach(
     project_root: &Path,
     db: &Db,
@@ -392,8 +402,7 @@ pub(crate) fn compute(
     // In `Full` mode we additionally retain the per-test vector for the
     // JSON report to consume.
     let mut affected = BTreeSet::new();
-    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> =
-        BTreeMap::new();
+    let mut strongest_per_file_test: BTreeMap<String, BTreeMap<TestId, HitKind>> = BTreeMap::new();
     let mut per_test_reasons: BTreeMap<TestId, Vec<HitReason>> = BTreeMap::new();
     let retain_per_test = matches!(detail, DiagnosticDetail::Full);
     for (collect_sha, ranges_by_file) in changed_ranges_by_sha {
@@ -401,8 +410,7 @@ pub(crate) fn compute(
             if hunks.is_empty() {
                 continue;
             }
-            let hits =
-                db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
+            let hits = db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
                 if listing.ignored.contains(&hit.test_id) {
                     // Coverage rows from a previous (non-ignored) collect
@@ -457,13 +465,16 @@ pub(crate) fn compute(
             if retain_per_test {
                 // Config reasons name the triggering input path; they have no
                 // sha-anchored coverage hunk, so those fields are left empty.
-                per_test_reasons.entry(test.clone()).or_default().push(HitReason {
-                    collect_sha: String::new(),
-                    file: path.clone(),
-                    kind: HitKind::ConfigRule,
-                    matched_hunk: (0, 0),
-                    stored_range: None,
-                });
+                per_test_reasons
+                    .entry(test.clone())
+                    .or_default()
+                    .push(HitReason {
+                        collect_sha: String::new(),
+                        file: path.clone(),
+                        kind: HitKind::ConfigRule,
+                        matched_hunk: (0, 0),
+                        stored_range: None,
+                    });
             }
         }
     }
@@ -515,9 +526,10 @@ fn aggregate_per_file_counts(
 pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> String {
     let selected = sel.selected();
     let mut out = format!(
-        "{} tests {verb} ({} affected + {} config + {} new + {} stranded, \
+        "{} test{} {verb} ({} affected + {} config + {} new + {} stranded, \
          {} skipped of {} reachable-known)",
         selected.len(),
+        plural_s(selected.len()),
         sel.affected.len(),
         sel.config_tests.len(),
         sel.new_tests.len(),
@@ -598,6 +610,20 @@ mod tests {
         );
     }
 
+    /// A one-test selection says "1 test", not "1 tests". This is the single
+    /// most-printed line in the tool, and the `-v` breakdown right next to it
+    /// already pluralizes correctly, so the mismatch was visible on any run
+    /// that selected exactly one test.
+    #[test]
+    fn summary_singular_test_count() {
+        let sel = selection_with(&[tid("crate_a", "test_a")], &[], &[], &[], 5);
+        let out = format_summary(&sel, "to run", false);
+        assert!(
+            out.starts_with("1 test to run ("),
+            "expected a singular noun for a one-test selection, got:\n{out}"
+        );
+    }
+
     #[test]
     fn summary_verbose_tags_categories() {
         let sel = selection_with(
@@ -637,12 +663,36 @@ mod tests {
     fn strongest_reason_orders_line_then_backstop_then_sentinel() {
         // Pairwise: stronger arg returned regardless of position.
         for (a, b, expected) in [
-            (HitKind::LineOverlap, HitKind::CrateRootSentinel, HitKind::LineOverlap),
-            (HitKind::CrateRootSentinel, HitKind::LineOverlap, HitKind::LineOverlap),
-            (HitKind::StructuralBackstop, HitKind::CrateRootSentinel, HitKind::StructuralBackstop),
-            (HitKind::CrateRootSentinel, HitKind::StructuralBackstop, HitKind::StructuralBackstop),
-            (HitKind::LineOverlap, HitKind::StructuralBackstop, HitKind::LineOverlap),
-            (HitKind::StructuralBackstop, HitKind::LineOverlap, HitKind::LineOverlap),
+            (
+                HitKind::LineOverlap,
+                HitKind::CrateRootSentinel,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::CrateRootSentinel,
+                HitKind::LineOverlap,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::StructuralBackstop,
+                HitKind::CrateRootSentinel,
+                HitKind::StructuralBackstop,
+            ),
+            (
+                HitKind::CrateRootSentinel,
+                HitKind::StructuralBackstop,
+                HitKind::StructuralBackstop,
+            ),
+            (
+                HitKind::LineOverlap,
+                HitKind::StructuralBackstop,
+                HitKind::LineOverlap,
+            ),
+            (
+                HitKind::StructuralBackstop,
+                HitKind::LineOverlap,
+                HitKind::LineOverlap,
+            ),
         ] {
             assert_eq!(strongest(a, b), expected, "{a:?} vs {b:?}");
         }

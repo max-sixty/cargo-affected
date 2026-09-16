@@ -91,25 +91,30 @@ impl AffectedConfig {
 
 /// The `metadata.affected` value of the package whose manifest is the workspace
 /// root's `Cargo.toml` — i.e. the root package's `[package.metadata.affected]`.
-fn root_package_metadata_affected<'a>(metadata: &'a Value, workspace_root: &Path) -> Option<&'a Value> {
+fn root_package_metadata_affected<'a>(
+    metadata: &'a Value,
+    workspace_root: &Path,
+) -> Option<&'a Value> {
     let root_manifest = workspace_root.join("Cargo.toml");
-    metadata.get("packages")?.as_array()?.iter().find_map(|pkg| {
-        let manifest = pkg.get("manifest_path")?.as_str()?;
-        if Path::new(manifest) == root_manifest {
-            pkg.get("metadata")?.get("affected")
-        } else {
-            None
-        }
-    })
+    metadata
+        .get("packages")?
+        .as_array()?
+        .iter()
+        .find_map(|pkg| {
+            let manifest = pkg.get("manifest_path")?.as_str()?;
+            if Path::new(manifest) == root_manifest {
+                pkg.get("metadata")?.get("affected")
+            } else {
+                None
+            }
+        })
 }
 
 impl InputRule {
     fn compile(&self) -> Result<CompiledRule> {
         let mut builder = GlobSetBuilder::new();
         for g in &self.globs {
-            builder.add(Glob::new(g).with_context(|| {
-                format!("invalid glob {g:?} in {TABLE}")
-            })?);
+            builder.add(Glob::new(g).with_context(|| format!("invalid glob {g:?} in {TABLE}"))?);
         }
         Ok(CompiledRule {
             matcher: builder
@@ -133,13 +138,18 @@ pub(crate) fn config_rule_hits(
     changed_ranges_by_sha: &ChangedRangesBySha,
     working_tree_files: &[String],
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
-    let rules = AffectedConfig::from_metadata(&project.metadata, &project.workspace_root)?.compile()?;
+    let rules =
+        AffectedConfig::from_metadata(&project.metadata, &project.workspace_root)?.compile()?;
     if rules.is_empty() {
         return Ok(BTreeMap::new());
     }
     let project_root = &project.workspace_root;
-    let changed_paths =
-        changed_paths_since(project_root, reach, changed_ranges_by_sha, working_tree_files)?;
+    let changed_paths = changed_paths_since(
+        project_root,
+        reach,
+        changed_ranges_by_sha,
+        working_tree_files,
+    )?;
     resolve_config_hits(project_root, build_args, &rules, &changed_paths)
 }
 
@@ -185,13 +195,19 @@ pub(crate) fn resolve_config_hits(
             eprintln!(
                 "warning: {TABLE} rule matched {} but its filterset ({:?}) \
                  selected no tests — those input changes may go untested",
-                matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                matched
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 rule.filterset,
             );
             continue;
         }
         for p in matched {
-            out.entry(p.clone()).or_default().extend(tests.iter().cloned());
+            out.entry(p.clone())
+                .or_default()
+                .extend(tests.iter().cloned());
         }
     }
     Ok(out)
@@ -222,7 +238,10 @@ mod tests {
         ]));
         let cfg = AffectedConfig::from_metadata(&meta, Path::new("/ws")).unwrap();
         assert_eq!(cfg.rules.len(), 2);
-        assert_eq!(cfg.rules[0].filterset, "binary_id(=pkg::integration) & test(/help/)");
+        assert_eq!(
+            cfg.rules[0].filterset,
+            "binary_id(=pkg::integration) & test(/help/)"
+        );
         assert_eq!(cfg.rules[1].globs, vec!["README.md", "docs/**/*.md"]);
     }
 
