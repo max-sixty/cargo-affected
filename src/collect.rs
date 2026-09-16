@@ -1013,17 +1013,25 @@ const RUN_ONLY_VALUED: &[&str] = &[
     "--flaky-result",
     "--test-threads",
     "--jobs",
+    // The one run-only *filter* option: `-R`/`--rerun <RUN_ID_OR_RECORDING>`
+    // re-runs the tests a previous recorded run failed. Every other filter is
+    // shared with `list`, which is why a filter-forwarding denylist has to
+    // name this one explicitly — `cargo nextest list` rejects it.
+    "--rerun",
 ];
 
-/// Short `cargo nextest run`-only flags that consume a value.
-const RUN_ONLY_SHORT_VALUED: &[&str] = &["-j"];
+/// Short `cargo nextest run`-only flags that consume a value: `-j`
+/// (`--test-threads`) and `-R` (`--rerun`).
+const RUN_ONLY_SHORT_VALUED: &[&str] = &["-j", "-R"];
 
 /// Drop `cargo nextest run`-only flags from the post-`--` passthrough so the
 /// `cargo nextest list` used for new-test detection enumerates the same test
 /// set as the eventual `cargo nextest run`. Everything else — cargo build
 /// flags, positional substring filters, `-E`/`--filterset` expressions,
 /// `--exact`/`--skip`/`--run-ignored` libtest-compatible options — is shared
-/// between `list` and `run` and passes through unchanged.
+/// between `list` and `run` and passes through unchanged. The lone exception
+/// is `-R`/`--rerun`, a filter option `run` alone accepts; it sits in the
+/// denylist with the execution flags.
 ///
 /// Run-only flags govern execution: failure handling (`--retries`,
 /// `--no-fail-fast`, `--max-fail`), test parallelism (`-j`/`--test-threads`),
@@ -1041,14 +1049,52 @@ const RUN_ONLY_SHORT_VALUED: &[&str] = &["-j"];
 /// previous build-flag *allowlist* dropped any unknown flag, so a future
 /// build flag silently produced a listing that did not match the run.
 pub(crate) fn args_for_listing(nextest_args: &[String]) -> Vec<String> {
+    drop_flags(
+        nextest_args,
+        RUN_ONLY_BARE,
+        RUN_ONLY_VALUED,
+        RUN_ONLY_SHORT_VALUED,
+    )
+}
+
+/// Long spellings of nextest's filterset flag: `--filterset` plus the
+/// `--filter-expr` alias 0.9.132 still accepts without listing in `--help`.
+/// The short `-E` is handled alongside.
+const FILTERSET_VALUED: &[&str] = &["--filterset", "--filter-expr"];
+
+/// Drop the caller's `-E`/`--filterset` expressions from listing args so a
+/// filterset the *tool* supplies is the only one in play.
+///
+/// `cargo nextest list` unions repeated `-E` flags, so resolving a
+/// `[*.metadata.affected]` rule against a listing that still carried the
+/// user's expression would report every test the *user's* expression matches
+/// as a hit for that rule. Positional substring filters need no such
+/// treatment: nextest intersects test-name filters with filtersets (verified
+/// against 0.9.132 — `-E test(=a) b` matches nothing), so a retained
+/// positional can only narrow a rule's set to the tests `nextest run` would
+/// actually admit.
+pub(crate) fn args_without_filtersets(list_args: &[String]) -> Vec<String> {
+    drop_flags(list_args, &[], FILTERSET_VALUED, &["-E"])
+}
+
+/// Remove `bare` flags, `valued` long flags (with their value, whether a
+/// separate token or `=`-joined), and `short_valued` short flags (separate,
+/// `=`-joined, or joined as `-jN`) from `args`. Everything else passes
+/// through in order.
+fn drop_flags(
+    args: &[String],
+    bare: &[&str],
+    valued: &[&str],
+    short_valued: &[&str],
+) -> Vec<String> {
     let mut out = Vec::new();
-    let mut iter = nextest_args.iter();
+    let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let name = arg.split('=').next().unwrap_or(arg);
-        if RUN_ONLY_BARE.contains(&name) {
+        if bare.contains(&name) {
             continue;
         }
-        if RUN_ONLY_VALUED.contains(&name) {
+        if valued.contains(&name) {
             // Drop the flag, and (when the value rides as a separate token)
             // the value too.
             if !arg.contains('=') {
@@ -1056,14 +1102,14 @@ pub(crate) fn args_for_listing(nextest_args: &[String]) -> Vec<String> {
             }
             continue;
         }
-        if RUN_ONLY_SHORT_VALUED.contains(&arg.as_str()) {
+        if short_valued.contains(&arg.as_str()) {
             iter.next();
             continue;
         }
         // Joined short form `-j4`. `-j=4` is unusual but the prefix check
         // catches it; the name-then-`=` split above already routed `-j=4`
         // away from the bare/valued long-flag arms.
-        if RUN_ONLY_SHORT_VALUED.iter().any(|s| arg.starts_with(*s)) && arg.len() > 2 {
+        if short_valued.iter().any(|s| arg.starts_with(*s)) && arg.len() > 2 {
             continue;
         }
         out.push(arg.clone());
@@ -1553,8 +1599,67 @@ mod tests {
     }
 
     #[test]
+    fn args_for_listing_drops_rerun() {
+        // `-R`/`--rerun <RUN_ID_OR_RECORDING>` is the one run-only *filter*
+        // option. `cargo nextest list` rejects it ("unexpected argument
+        // '--rerun' found"), so every spelling has to go: separate value,
+        // `=`-joined, short separate, short joined.
+        for args in [
+            vec!["--rerun", "latest", "--keep"],
+            vec!["--rerun=latest", "--keep"],
+            vec!["-R", "latest", "--keep"],
+            vec!["-Rlatest", "--keep"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(args_for_listing(&args), vec!["--keep"], "for {args:?}");
+        }
+    }
+
+    #[test]
     fn args_for_listing_empty() {
         assert!(args_for_listing(&[]).is_empty());
+    }
+
+    #[test]
+    fn args_without_filtersets_drops_every_filterset_spelling() {
+        for args in [
+            vec!["--keep", "-E", "test(slow)"],
+            vec!["--keep", "-E=test(slow)"],
+            vec!["--keep", "-Etest(slow)"],
+            vec!["--keep", "--filterset", "test(slow)"],
+            vec!["--keep", "--filterset=test(slow)"],
+            vec!["--keep", "--filter-expr", "test(slow)"],
+            vec!["--keep", "--filter-expr=test(slow)"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                args_without_filtersets(&args),
+                vec!["--keep"],
+                "for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn args_without_filtersets_keeps_build_flags_and_positionals() {
+        // Only the caller's filtersets go; build flags stay (the rule listing
+        // must build the same test set) and so do positional substring
+        // filters, which nextest intersects with the rule's own filterset.
+        let args: Vec<String> = [
+            "--features=a,b",
+            "-p",
+            "mycrate",
+            "-E",
+            "test(slow)",
+            "some_test_filter",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            args_without_filtersets(&args),
+            vec!["--features=a,b", "-p", "mycrate", "some_test_filter"],
+        );
     }
 
     /// Regression for the Windows command-line overflow: a large affected set

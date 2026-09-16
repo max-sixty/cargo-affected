@@ -188,3 +188,144 @@ fn config_rule_inert_when_no_glob_matches() {
         "the GREETING edit should still select the test via coverage: {out}"
     );
 }
+
+/// Same golden-file shape, but with two tests the rule's filterset does *not*
+/// name — the shape that catches a rule resolving to the whole project.
+fn write_multi_test_golden_project(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "config-rule-multi-sample"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
+
+    let tests = dir.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("golden.rs"),
+        r#"#[test]
+fn golden_matches() {
+    let expected = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
+    )
+    .unwrap();
+    assert_eq!(config_rule_multi_sample::GREETING, expected.trim());
+}
+
+#[test]
+fn unrelated_one() {
+    assert_eq!(2 + 2, 4);
+}
+
+#[test]
+fn unrelated_two() {
+    assert_eq!(3 * 3, 9);
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// A rule resolves to the tests its filterset *matches*, not to every test in
+/// the project.
+///
+/// `cargo nextest list -E <filterset>` reports every testcase and tags the
+/// non-matches `filter-match: { status: "mismatch", reason: "expression" }` —
+/// it does not omit them. Reading the listing's test set whole made a rule that
+/// matched one changed path force-select the entire suite, which is both wrong
+/// (unrelated tests run) and invisible (they pass).
+#[test]
+fn config_rule_selects_only_the_tests_its_filterset_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
+    assert!(
+        out.contains("selection=1/3"),
+        "only the filterset's test should be selected (1 of 3): {out}"
+    );
+    assert!(
+        out.contains("1 config"),
+        "expected exactly one config hit: {out}"
+    );
+    assert!(
+        out.contains("golden_matches (config)"),
+        "golden_matches is the test the filterset names: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_one") && !out.contains("unrelated_two"),
+        "tests the filterset doesn't name must not be config-selected: {out}"
+    );
+}
+
+/// The caller's own `-E` must not leak into the rule-resolution listing.
+///
+/// `run`/`status` forward the post-`--` filters to `cargo nextest list` so the
+/// listing matches what `nextest run` will admit — but nextest *unions*
+/// repeated `-E` flags, so passing the user's expression alongside a rule's
+/// filterset would make every test the user's expression matches a hit for
+/// that rule. Here `-E test(=unrelated_one)` is the user's filter and the
+/// rule names `golden_matches`: the rule's test is filtered out by the user,
+/// so nothing is config-selected — and `unrelated_one` in particular must not
+/// be, since no rule names it.
+#[test]
+fn config_rule_ignores_the_callers_filterset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(
+        dir,
+        &[
+            "affected",
+            "status",
+            "-v",
+            "--",
+            "-E",
+            "test(=unrelated_one)",
+        ],
+    ));
+    assert!(
+        out.contains("selection=0/3"),
+        "the rule's own test is excluded by the caller's filter, so nothing is \
+         selected: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_one"),
+        "the caller's filterset must not turn its own matches into config hits: {out}"
+    );
+}
