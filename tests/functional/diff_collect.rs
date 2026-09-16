@@ -63,8 +63,8 @@ fn diff_collect_re_anchors_only_affected_tests() {
     // The re-collect summary should pick exactly one test (test_add).
     let combined = combined_output(&diff);
     assert!(
-        combined.contains("1 tests to recollect"),
-        "expected '1 tests to recollect' in diff output, got:\n{combined}"
+        combined.contains("1 test to recollect"),
+        "expected '1 test to recollect' in diff output, got:\n{combined}"
     );
 
     // DB invariant: rerun test now anchored at edited_sha; the others remain
@@ -181,7 +181,7 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     );
     let combined2 = combined_output(&diff2);
     assert!(
-        combined2.contains("1 tests to recollect"),
+        combined2.contains("1 test to recollect"),
         "round2 should rerun exactly test_fb, got:\n{combined2}"
     );
 
@@ -299,8 +299,8 @@ fn run_uses_reachable_shas_when_one_sha_diverges() {
     // Selection chose exactly one test (test_fa — anchored at sha1, which is
     // a sibling but reachable, and the diff against it picks up the edit).
     assert!(
-        combined.contains("1 tests to run"),
-        "expected '1 tests to run' (test_fa affected via sha1), got:\n{combined}"
+        combined.contains("1 test to run"),
+        "expected '1 test to run' (test_fa affected via sha1), got:\n{combined}"
     );
     assert!(
         combined.contains("test_fa"),
