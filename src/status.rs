@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::{args_for_listing, require_nextest};
+use crate::collect::{args_for_listing, plural_s, require_nextest};
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
 use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
@@ -108,7 +108,7 @@ pub(crate) fn status(
             println!(
                 "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
                 selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
-                if reach.missing.len() == 1 { "" } else { "s" },
+                plural_s(reach.missing.len()),
             );
         }
     }
