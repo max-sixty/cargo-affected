@@ -329,3 +329,50 @@ fn config_rule_ignores_the_callers_filterset() {
         "the caller's filterset must not turn its own matches into config hits: {out}"
     );
 }
+
+/// A caller's positional filter must not make the rule report itself broken.
+///
+/// The rule listing keeps the caller's positional substring filters (nextest
+/// intersects them with the rule's filterset, so they can only narrow the rule
+/// toward what `nextest run` will admit). Resolving the rule against the whole
+/// `filter-match: mismatch` set therefore made the rule's own test look like a
+/// non-match whenever a positional excluded it, collapsing the rule to nothing
+/// and firing the "matched no tests" warning — whose whole purpose is catching
+/// a typo'd filterset — against a filterset that is not at fault. The `-E`
+/// spelling of the same narrowing never warned, because the caller's filtersets
+/// are stripped from the rule listing.
+#[test]
+fn config_rule_does_not_warn_when_the_caller_filters_its_test_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(
+        dir,
+        &["affected", "status", "-v", "--", "unrelated"],
+    ));
+    assert!(
+        !out.contains("matched no tests"),
+        "the rule's filterset is valid — only the caller's positional excluded \
+         its test, so no filterset warning should fire: {out}"
+    );
+    assert!(
+        out.contains("selection=0/3"),
+        "the rule's test is filtered out by the caller, so nothing runs: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_one") && !out.contains("unrelated_two"),
+        "the caller's positional must not turn its own matches into config \
+         hits: {out}"
+    );
+}

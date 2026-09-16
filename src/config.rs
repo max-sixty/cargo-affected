@@ -166,11 +166,24 @@ pub(crate) fn config_rule_hits(
 ///
 /// `-E` restricts nothing about *which* testcases the listing reports: nextest
 /// lists every one and tags the non-matches `filter-match: { status:
-/// "mismatch" }`, so the rule's tests are `listing.tests` minus
-/// `listing.excluded`. Taking `tests` whole would make every test in the
-/// project a hit for any rule that matched a path. The caller's own
-/// `-E` comes out of the listing args ([`args_without_filtersets`]) because
-/// nextest unions repeated `-E` flags.
+/// "mismatch", reason: ... }`, so the rule's tests are `listing.tests` minus
+/// the subset the rule's own expression rejected
+/// ([`Listing::filterset_mismatched`]). Taking `tests` whole would make every
+/// test in the project a hit for any rule that matched a path. The caller's
+/// own `-E` comes out of the listing args ([`args_without_filtersets`])
+/// because nextest unions repeated `-E` flags.
+///
+/// Subtracting the whole `listing.excluded` set instead would fold the
+/// *caller's* filters into the rule's verdict: the caller's positional
+/// substring filters deliberately stay in the listing args (nextest
+/// intersects them with the filterset, so they can only narrow a rule toward
+/// what `nextest run` will admit), and a rule's own test tagged
+/// `reason: "string"` by one of them would leave the rule resolving to
+/// nothing and firing the warning below against a filterset that is not at
+/// fault. Tests excluded for any other reason stay hits here and are dropped
+/// downstream by [`crate::selection::compute`], which filters config hits
+/// through `listing.excluded` — so the net selection is the same either way
+/// and only the diagnostic differs.
 ///
 /// A rule whose filterset matches zero tests is surfaced as a warning rather
 /// than swallowed: a typo'd filterset would otherwise silently reopen the gap
@@ -206,11 +219,13 @@ pub(crate) fn resolve_config_hits(
             )
         })?;
         let Listing {
-            tests, excluded, ..
+            tests,
+            filterset_mismatched,
+            ..
         } = listing;
         let tests: BTreeSet<TestId> = tests
             .into_iter()
-            .filter(|t| !excluded.contains(t))
+            .filter(|t| !filterset_mismatched.contains(t))
             .collect();
         if tests.is_empty() {
             eprintln!(
