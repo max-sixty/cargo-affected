@@ -167,27 +167,26 @@ pub(crate) fn config_rule_hits(
 /// `-E` restricts nothing about *which* testcases the listing reports: nextest
 /// lists every one and tags the non-matches `filter-match: { status:
 /// "mismatch", reason: ... }`, so the rule's tests are `listing.tests` minus
-/// the subset the rule's own expression rejected
-/// ([`Listing::filterset_mismatched`]). Taking `tests` whole would make every
-/// test in the project a hit for any rule that matched a path. The caller's
-/// own `-E` comes out of the listing args ([`args_without_filtersets`])
-/// because nextest unions repeated `-E` flags.
-///
-/// Subtracting the whole `listing.excluded` set instead would fold the
-/// *caller's* filters into the rule's verdict: the caller's positional
-/// substring filters deliberately stay in the listing args (nextest
-/// intersects them with the filterset, so they can only narrow a rule toward
-/// what `nextest run` will admit), and a rule's own test tagged
-/// `reason: "string"` by one of them would leave the rule resolving to
-/// nothing and firing the warning below against a filterset that is not at
-/// fault. Tests excluded for any other reason stay hits here and are dropped
-/// downstream by [`crate::selection::compute`], which filters config hits
-/// through `listing.excluded` — so the net selection is the same either way
-/// and only the diagnostic differs.
+/// `listing.excluded`. Taking `tests` whole would make every test in the
+/// project a hit for any rule that matched a path. The caller's own `-E` comes
+/// out of the listing args ([`args_without_filtersets`]) because nextest
+/// unions repeated `-E` flags; their positional substring filters stay, since
+/// nextest *intersects* name filters with filtersets and so they can only
+/// narrow a rule toward what `nextest run` will admit.
 ///
 /// A rule whose filterset matches zero tests is surfaced as a warning rather
 /// than swallowed: a typo'd filterset would otherwise silently reopen the gap
-/// it exists to close.
+/// it exists to close. The warning is suppressed when a positional filter
+/// rejected something in this listing ([`Listing::name_filter_mismatch`]),
+/// because then the empty set is not evidence against the filterset: nextest
+/// reports one mismatch reason per testcase, chosen in a fixed filter order
+/// that puts name filters ahead of filtersets, so `cargo affected run --
+/// <substring>` — the ordinary way to narrow a run — would otherwise blame a
+/// filterset that is not at fault on every invocation. Keying the hit set on
+/// `reason: "expression"` instead is the mirror-image mistake: the same
+/// ordering hides the expression's verdict behind `"ignored"` too, so one
+/// `#[ignore]`d test anywhere in the project would keep the set non-empty and
+/// the warning would never fire at all.
 pub(crate) fn resolve_config_hits(
     project_root: &Path,
     build_args: &[String],
@@ -220,24 +219,27 @@ pub(crate) fn resolve_config_hits(
         })?;
         let Listing {
             tests,
-            filterset_mismatched,
+            excluded,
+            name_filter_mismatch,
             ..
         } = listing;
         let tests: BTreeSet<TestId> = tests
             .into_iter()
-            .filter(|t| !filterset_mismatched.contains(t))
+            .filter(|t| !excluded.contains(t))
             .collect();
         if tests.is_empty() {
-            eprintln!(
-                "warning: {TABLE} rule matched {} but its filterset ({:?}) \
-                 matched no tests — those input changes may go untested",
-                matched
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                rule.filterset,
-            );
+            if !name_filter_mismatch {
+                eprintln!(
+                    "warning: {TABLE} rule matched {} but its filterset ({:?}) \
+                     matched no tests — those input changes may go untested",
+                    matched
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    rule.filterset,
+                );
+            }
             continue;
         }
         for p in matched {

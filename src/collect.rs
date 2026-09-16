@@ -1135,18 +1135,19 @@ pub(crate) struct Listing {
     /// (`reason: "string"`), `-E`/`--filterset` expressions
     /// (`reason: "expression"`), and the project's own `default-filter`.
     pub(crate) excluded: BTreeSet<TestId>,
-    /// Subset of `excluded` that *this listing's own* `-E` rejected —
-    /// `filter-match: { status: "mismatch", reason: "expression" }`.
+    /// Whether any testcase in this listing was rejected by a positional
+    /// substring filter — `filter-match: { status: "mismatch", reason:
+    /// "string" }`.
     ///
-    /// Only meaningful on a listing the tool gave a `filter_expr` to, i.e.
-    /// the per-rule listings [`crate::config::resolve_config_hits`] builds
-    /// (the caller's own filtersets are stripped first, so the rule's
-    /// expression is the only one in play). It answers "which tests did
-    /// *this filterset* reject", where `excluded` answers "which tests will
-    /// `nextest run` skip, for any reason" — a rule resolved against
-    /// `excluded` would report itself as matching nothing the moment the
-    /// caller narrowed the run with a positional filter.
-    pub(crate) filterset_mismatched: BTreeSet<TestId>,
+    /// nextest reports exactly one reason per testcase and evaluates the
+    /// filters in a fixed order, name filters before filtersets, so on a
+    /// listing carrying both the caller's positionals and a tool-supplied
+    /// `-E` the per-test verdicts can't be attributed to one or the other:
+    /// a test both reject comes back `"string"`. What *is* attributable is
+    /// whether a name filter narrowed the listing at all, which is what
+    /// [`crate::config::resolve_config_hits`] needs before blaming a rule's
+    /// filterset for matching nothing.
+    pub(crate) name_filter_mismatch: bool,
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
@@ -1228,7 +1229,7 @@ pub(crate) fn nextest_list(
 
     let mut tests = BTreeSet::new();
     let mut excluded = BTreeSet::new();
-    let mut filterset_mismatched = BTreeSet::new();
+    let mut name_filter_mismatch = false;
     let mut binaries = Vec::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
@@ -1258,12 +1259,13 @@ pub(crate) fn nextest_list(
                     .and_then(|v| v.as_str())
                     .context("nextest list testcase missing `filter-match.status`")?;
                 if status != "matches" {
-                    // `reason` names the filter that rejected the test, and
-                    // nextest reports only one. A test the listing's own `-E`
-                    // rejects reports `expression` whatever else also excludes
-                    // it, so the two sets stay consistent.
-                    if filter_match.get("reason").and_then(|v| v.as_str()) == Some("expression") {
-                        filterset_mismatched.insert(test_id.clone());
+                    // `reason` names the one filter nextest stopped at, which
+                    // is the first to reject in its evaluation order — so
+                    // `"string"` here proves a name filter narrowed the
+                    // listing, while its absence on a given test proves
+                    // nothing about the filterset.
+                    if filter_match.get("reason").and_then(|v| v.as_str()) == Some("string") {
+                        name_filter_mismatch = true;
                     }
                     excluded.insert(test_id.clone());
                 }
@@ -1274,7 +1276,7 @@ pub(crate) fn nextest_list(
     Ok(Listing {
         tests: tests.into_iter().collect(),
         excluded,
-        filterset_mismatched,
+        name_filter_mismatch,
         binaries,
     })
 }
@@ -1448,7 +1450,7 @@ mod tests {
         Listing {
             tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
             excluded: BTreeSet::new(),
-            filterset_mismatched: BTreeSet::new(),
+            name_filter_mismatch: false,
             binaries: binaries
                 .iter()
                 .map(|(id, path)| BinaryEntry {

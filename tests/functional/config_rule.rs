@@ -376,3 +376,84 @@ fn config_rule_does_not_warn_when_the_caller_filters_its_test_out() {
          hits: {out}"
     );
 }
+
+/// Crate shaped like [`write_multi_test_golden_project`] but carrying an
+/// `#[ignore]`d test, which is what makes the filterset warning's keying
+/// observable.
+fn write_ignored_test_golden_project(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "config-rule-ignored-sample"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
+
+    let tests = dir.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("golden.rs"),
+        r#"#[test]
+fn golden_matches() {
+    let expected = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
+    )
+    .unwrap();
+    assert_eq!(config_rule_ignored_sample::GREETING, expected.trim());
+}
+
+#[test]
+#[ignore]
+fn ignored_one() {}
+"#,
+    )
+    .unwrap();
+}
+
+/// A filterset that matches nothing must warn even when some other filter
+/// rejected a test first.
+///
+/// nextest reports exactly one `filter-match` reason per testcase, chosen in a
+/// fixed filter order that puts `#[ignore]` and positional substring filters
+/// ahead of filtersets. So a test the rule's own `-E` rejects comes back
+/// tagged `ignored` (or `string`) whenever one of those rejects it too, and a
+/// rule's hit set computed as "everything not tagged `expression`" stays
+/// non-empty no matter how broken the filterset is: one `#[ignore]`d test
+/// anywhere in the project was enough to swallow the warning entirely, which
+/// is the only thing standing between a typo'd filterset and inputs that
+/// silently go untested.
+#[test]
+fn config_rule_warns_for_a_filterset_that_matches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_ignored_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=no_such_test)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
+    assert!(
+        out.contains("matched no tests"),
+        "a filterset matching nothing must warn even though `ignored_one` is \
+         tagged `ignored` rather than `expression`: {out}"
+    );
+}
