@@ -559,9 +559,11 @@ impl Report {
     }
 
     /// Serialize and write to `path` atomically: write to
-    /// `<path>.tmp`, then rename. A partial write (process killed,
-    /// disk full) leaves the previous artifact intact rather than a
-    /// truncated JSON file.
+    /// `path.with_extension("json.tmp")`, then rename. The extension is
+    /// replaced rather than appended, so `--report-json out.txt` stages
+    /// at `out.json.tmp`. A partial write (process killed, disk full)
+    /// leaves the previous artifact intact rather than a truncated JSON
+    /// file.
     pub(crate) fn write_json(&self, path: &Path) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("failed to serialize report to JSON")?;
