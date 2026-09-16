@@ -20,12 +20,9 @@ touches via LLVM coverage, then reruns only the tests whose ranges overlap
 
 ## Installation
 
-Not on crates.io yet. Install from source:
-
 ```sh
-git clone https://github.com/max-sixty/cargo-affected
-cd cargo-affected
-cargo install --path .
+cargo install cargo-affected
+cargo install cargo-nextest --locked
 rustup component add llvm-tools
 ```
 
@@ -40,6 +37,11 @@ cargo affected run        # run only tests overlapping the diff
 cargo affected status     # dry-run: show what would run
 cargo affected clean      # wipe the coverage cache
 ```
+
+`status` predicts `run`, so give it the same post-`--` args you'd give
+`run` — `cargo affected status -- --features extra`. Those flags decide
+which tests get built, and a dry run of a feature-less build can't tell
+you about tests that only exist with the feature on.
 
 For CI integration or debugging selection, both `run` and `status`
 accept `--report-json <PATH>` to emit a structured artifact alongside
@@ -69,11 +71,14 @@ nextest run`: always at least as safe.
 `collect`:
 
 1. `cargo nextest list` enumerates every test.
-2. `cargo nextest run` runs them with `-C instrument-coverage` and a
+2. `llvm-cov export` reads each test binary's coverage map once — where every
+   instrumented function lives in the source. That doesn't vary per test, and
+   it's the expensive part.
+3. `cargo nextest run` runs the tests with `-C instrument-coverage` and a
    per-test `LLVM_PROFILE_FILE`.
-3. For each test, `llvm-profdata` merges its profraw and `llvm-cov export`
-   lists every hit function with its source-line regions.
-4. Per `(test, file, function)`, the min/max line span is stored in
+4. For each test, `llvm-profdata` merges its profraw into the list of
+   functions it executed, and those are looked up in the map from step 2.
+5. Per `(test, file, function)`, the min/max line span is stored in
    `target/affected/coverage.db` (SQLite), keyed by a fingerprint of
    `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
    `CARGO_BUILD_TARGET`. The git HEAD sha is recorded alongside.
@@ -114,7 +119,9 @@ CI should still run the full suite.
 ### False negatives (tests skipped that should have run)
 
 - **Non-Rust sources.** `include_str!` / `include_bytes!` targets, SQL
-  files, migrations, assets, and templates aren't seen by llvm-cov.
+  files, migrations, assets, snapshots, and templates aren't seen by
+  llvm-cov — a change confined to one selects no test. [Input
+  rules](#input-rules) close this for inputs you can name.
 - **Build-time inputs not in the fingerprint.** The fingerprint covers
   `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
   `CARGO_BUILD_TARGET`. Changes to `build.rs`, `rust-toolchain.toml`, or
@@ -127,6 +134,46 @@ CI should still run the full suite.
 
 When in doubt, `cargo affected collect` to refresh coverage, or skip
 cargo-affected and run the full suite.
+
+## Input rules
+
+Coverage can't link a test to a non-Rust input it reads at runtime — an insta
+`.snap`, a doc a sync-test compares against, an `include_str!` target — so a
+change confined to that input selects no test (see [false
+negatives](#false-negatives-tests-skipped-that-should-have-run)). Optional
+`[[workspace.metadata.affected.rule]]` tables in `Cargo.toml` close the gap by
+mapping input globs to the tests that depend on them (use
+`[[package.metadata.affected.rule]]` in a single-crate project):
+
+```toml
+# Any `.snap` edit re-runs the integration suite that owns the snapshots.
+[[workspace.metadata.affected.rule]]
+globs = ["**/*.snap"]
+filterset = "binary_id(=mycrate::integration)"
+
+# Doc-sync tests read these inputs at runtime; run that module when any change.
+[[workspace.metadata.affected.rule]]
+globs = ["README.md", "docs/**/*.md"]
+filterset = "test(/readme_sync/)"
+```
+
+Each rule pairs `globs` (matched against changed paths) with a nextest
+`filterset` (the full [filter-expression
+language](https://nexte.st/docs/filtersets/)). When a changed path matches, the
+filterset is resolved with `cargo nextest list -E` and its tests are
+force-selected — reported under a `config` category distinct from coverage-driven
+selection. A Rust-only diff matches no globs and takes the exact prior path, so
+the speedup is preserved; the extra `nextest list` runs only on diffs that touch
+a configured input. A rule that matches a path but resolves to no tests warns
+rather than failing silently. No rules → no change in behavior.
+
+The rules live in `[*.metadata]`, which cargo ignores for the build — so
+cargo-affected excludes it from the coverage fingerprint. Editing a rule is
+cache-neutral: it doesn't force a re-collect, so you can iterate on rules freely.
+
+Rules are a remedy of last resort, not a substitute for coverage: prefer letting
+`collect` map Rust changes. Reach for a rule only for inputs llvm-cov
+structurally cannot see, and keep periodic full runs for everything else.
 
 ## Comparison with similar tools
 

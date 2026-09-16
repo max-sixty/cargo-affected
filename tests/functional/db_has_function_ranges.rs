@@ -2,14 +2,20 @@
 //! `test_regions` row that is not a crate-root sentinel.
 //!
 //! Sentinel rows (`line_end == coverage::CRATE_ROOT_SENTINEL_END`, i.e.
-//! `i64::MAX`) are the structural-edit backstop — they overlap every hunk by
-//! construction. If `extract_hit_ranges` ever silently filters out every real
-//! `llvm-cov` path (e.g., a path-form mismatch on a new platform causing
-//! `Path::strip_prefix(canonical_root)` to discard everything), the DB would
-//! contain *only* sentinels. Selection would still appear to work because
-//! sentinels match unconditionally, so the failure would surface as
-//! over-selection rather than a hard error. This scenario asserts the
-//! invariant directly.
+//! `i64::MAX`) are the structural-edit backstop — they cover a target's crate
+//! roots and overlap every hunk in *those* files by construction. If the real
+//! function ranges ever silently vanished — a path-form mismatch on a new
+//! platform making `Path::strip_prefix(canonical_root)` discard every
+//! function, or a symbol-name form the profile-to-map join doesn't recognise —
+//! the DB would hold *only* sentinels, and nothing about that looks like an
+//! error: collect exits 0 and the row count is plausible. But a sentinel
+//! covers a crate root and nothing else, so every edit elsewhere would select
+//! no test at all — silent *under*-selection, the one failure this tool can't
+//! detect downstream.
+//!
+//! `build_function_map` and `hit_ranges` each refuse their own half of that at
+//! runtime; this scenario is the end-to-end check that real ranges come out
+//! the far end.
 //!
 //! Definition of `CRATE_ROOT_SENTINEL_END` lives in `src/coverage.rs`. It's
 //! `pub`, but `cargo-affected` ships only a `[[bin]]` target with no library,
@@ -46,8 +52,9 @@ fn collect_writes_non_sentinel_function_ranges() {
     assert!(
         non_sentinel_rows > 0,
         "expected at least one test_regions row with line_end != \
-         CRATE_ROOT_SENTINEL_END (i64::MAX); a sentinel-only DB means \
-         extract_hit_ranges filtered every llvm-cov path out, likely a \
-         path-form mismatch in Path::strip_prefix(canonical_root)"
+         CRATE_ROOT_SENTINEL_END (i64::MAX); a sentinel-only DB means the \
+         function ranges were lost between llvm-cov and the DB — likely a \
+         path-form mismatch in Path::strip_prefix(canonical_root), or a \
+         profile-to-map join that matched nothing"
     );
 }

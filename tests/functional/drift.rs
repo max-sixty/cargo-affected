@@ -21,11 +21,7 @@ fn sibling_collect_sha_status_uses_selection() {
     // something to reset back from. After collect, we'll reset HEAD back to
     // the initial commit — the second commit's sha (where collect ran)
     // becomes a sibling: still in the repo, not an ancestor of HEAD.
-    std::fs::write(
-        dir.join("src/extra.rs"),
-        "pub fn extra() -> i32 { 1 }\n",
-    )
-    .unwrap();
+    std::fs::write(dir.join("src/extra.rs"), "pub fn extra() -> i32 { 1 }\n").unwrap();
     let lib_path = dir.join("src/lib.rs");
     let lib = std::fs::read_to_string(&lib_path).unwrap();
     std::fs::write(&lib_path, format!("{lib}pub mod extra;\n")).unwrap();

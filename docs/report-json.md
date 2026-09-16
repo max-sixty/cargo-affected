@@ -125,6 +125,7 @@ and its `differing_labels` answers "which input changed?".
 {
   "selected": 2577,
   "affected": 2569,
+  "config": 0,
   "new": 6,
   "stranded": 2,
   "skipped": 924,
@@ -136,11 +137,12 @@ and its `differing_labels` answers "which input changed?".
 | Field | Notes |
 |---|---|
 | `mode` | `"selection"` or `"full-suite-no-listing"`. |
-| `selected` | Union of affected + new + stranded. `null` on full-suite paths. |
+| `selected` | Union of affected + config + new + stranded. `null` on full-suite paths. |
 | `affected` | In DB at a reachable sha AND a hunk overlapped a stored row. |
+| `config` | Reachable-known and force-selected by a `[workspace.metadata.affected]` input rule (would otherwise have been skipped). Disjoint from `affected`. |
 | `new` | Listed in nextest but not in the DB at all under this fingerprint. |
 | `stranded` | In DB but only at currently-missing collect_shas. |
-| `skipped` | `total_reachable_known - affected` (saturating). |
+| `skipped` | `total_reachable_known - affected - config` (saturating). |
 | `total_reachable_known` | Distinct test count under the fingerprint at reachable shas. |
 
 ### `selection.changed_files[]`
@@ -156,20 +158,24 @@ Sorted `(tests_pulled_total desc, path asc)`.
   "tests_pulled_by_reason": {
     "line_overlap": 180,
     "structural_backstop": 0,
-    "crate_root_sentinel": 1060
+    "crate_root_sentinel": 1060,
+    "config_rule": 0
   }
 }
 ```
 
 `tracked_by_coverage` is `true` iff the file has at least one stored
 `test_regions` row at a reachable sha. Non-Rust files (`.snap`, configs)
-read `false`.
+read `false` — and are exactly where `config_rule` selections show up.
 
 `tests_pulled_by_reason` is deduplicated by **strongest reason** per
 test per file: a test pulled in by both line overlap and a sentinel
 counts once, classified by the strongest reason
-(`line_overlap` > `structural_backstop` > `crate_root_sentinel`). The
-three counters sum to `tests_pulled_total`.
+(`line_overlap` > `structural_backstop` > `config_rule` >
+`crate_root_sentinel`). `config_rule` counts tests force-selected by a
+`[workspace.metadata.affected]` rule matching this path (non-zero only for the
+non-Rust inputs such rules target). The four counters sum to
+`tests_pulled_total`.
 
 ### `selection.selected_tests[]`
 
@@ -195,10 +201,11 @@ Sorted `(binary_id, test_name)`.
 
 | Field | Notes |
 |---|---|
-| `kind` | `"affected"`, `"new"`, or `"stranded"`. |
-| `reasons` | Empty for `"new"` and `"stranded"`. Sorted `(file, kind, collect_sha)`. |
-| `reasons[].kind` | `"line_overlap"`, `"structural_backstop"`, or `"crate_root_sentinel"`. |
-| `reasons[].stored_range` | `null` for `structural_backstop` (no row matched by definition). |
+| `kind` | `"affected"`, `"config_rule"`, `"new"`, or `"stranded"`. |
+| `reasons` | Empty for `"new"` and `"stranded"`. For `"config_rule"`, names the triggering input path(s). Sorted `(file, kind, collect_sha)`. |
+| `reasons[].kind` | `"line_overlap"`, `"structural_backstop"`, `"crate_root_sentinel"`, or `"config_rule"`. |
+| `reasons[].stored_range` | `null` for `structural_backstop` and `config_rule` (no coverage row matched). |
+| `reasons[].collect_sha` / `matched_hunk` | Empty / `[0, 0]` for `config_rule` (not anchored to a coverage hunk). |
 
 ## Stderr summary line
 

@@ -16,9 +16,11 @@
 //! the fix.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
-use crate::{combined_output, git, init_git_with_initial_commit, replace_in_file};
+use crate::{
+    cargo_affected_with_env, combined_output, git, init_git_with_initial_commit, replace_in_file,
+};
 
 /// Two-member virtual workspace, both with `tests/builds.rs` containing a
 /// single `#[test] fn builds() {}`. Identical bodies on purpose — there's
@@ -61,13 +63,23 @@ edition = "2021"
 /// stripped-binary CI environment that originally tripped the
 /// duplicate-basename bug, not just the debug-info-rich default.
 fn cargo_affected_stripped(dir: &Path, args: &[&str]) -> Output {
-    let bin = env!("CARGO_BIN_EXE_cargo-affected");
-    Command::new(bin)
-        .args(args)
-        .current_dir(dir)
-        .env("RUSTFLAGS", "-C debuginfo=0")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run cargo-affected: {e}"))
+    cargo_affected_with_env(dir, args, &[("RUSTFLAGS", "-C debuginfo=0")])
+}
+
+/// Distinct `binary_id`s the database holds for the `builds` test. Two crates
+/// each ship one, so anything other than two means the shim merged or dropped
+/// a target.
+fn builds_binary_ids(dir: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(dir.join("target/affected/coverage.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT binary_id FROM test_regions WHERE test_name = 'builds'")
+        .unwrap();
+    let ids = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    ids
 }
 
 #[test]
@@ -84,24 +96,20 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         "collect failed: stderr=\n{collect_stderr}\nstdout=\n{}",
         String::from_utf8_lossy(&collect.stdout)
     );
+    // A `binary_id` the shim can't resolve is a *soft* failure: that test
+    // lands as `Skipped` and collect still exits 0 on whatever the other
+    // binary produced, so `status.success()` above doesn't cover it.
+    // `collect` prints this line for any skip.
     assert!(
-        !collect_stderr.contains("failed to resolve binary_id"),
-        "shim must not error on duplicate-basename binaries; stderr:\n{collect_stderr}"
+        !collect_stderr.contains("produced no coverage"),
+        "duplicate-basename binaries must not cost a test its coverage; stderr:\n{collect_stderr}"
     );
 
     // Both crates' `builds` test must land under DISTINCT binary_ids — the
     // whole point of the fix. If the shim merged them, only one binary_id
     // would appear (and one set of regions would silently overwrite the
     // other).
-    let db = dir.join("target/affected/coverage.db");
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let ids: Vec<String> = conn
-        .prepare("SELECT DISTINCT binary_id FROM test_regions WHERE test_name = 'builds'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let ids = builds_binary_ids(dir);
     assert_eq!(
         ids.len(),
         2,
@@ -122,9 +130,12 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     // Force a rebuild of one crate's `builds` binary by editing its lib —
     // cargo re-hashes that binary, leaving the other unchanged. Under the
     // old shim this was the worst-case path: ambiguous basename, debuginfo
-    // stripped, partial rebuild. The current shim sources `binary_id`
-    // from `NEXTEST_BINARY_ID` rather than the binary path, so hash
-    // shifts don't affect the lookup at all.
+    // stripped, partial rebuild. The current shim splits the two halves so
+    // neither depends on the path staying put: attribution comes from
+    // `NEXTEST_BINARY_ID`, which nextest sets per test, and the function map
+    // carries a stamp of the binary it was exported from that
+    // `load_function_map` checks. A rebuild keeps the binary's *name*, so a
+    // stale map would still be found by name — the stamp is what rejects it.
     replace_in_file(
         &dir.join("mock-stub/src/lib.rs"),
         "pub fn touch() {}",
@@ -152,11 +163,11 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
     );
 
     // A second collect after the edit exercises the full pipeline again —
-    // every test invocation must surface its `binary_id` via the env so the
-    // shim can route profraws correctly. Commit the edit first so collect's
-    // clean-tree gate is satisfied; the gate exists because stored ranges
-    // would otherwise be filed under HEAD but reflect the dirty working
-    // tree.
+    // collect must re-export a function map whose stamp matches the rebuilt
+    // binary, or every test in it lands `Skipped`. Commit the
+    // edit first so collect's clean-tree gate is satisfied; the gate exists
+    // because stored ranges would otherwise be filed under HEAD but reflect
+    // the dirty working tree.
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-q", "-m", "edit mock-stub touch"]);
     let recollect = cargo_affected_stripped(dir, &["affected", "collect"]);
@@ -167,9 +178,17 @@ fn duplicate_basename_with_stripped_debuginfo_resolves_correctly() {
         String::from_utf8_lossy(&recollect.stdout)
     );
     assert!(
-        !recollect_stderr.contains("failed to resolve binary_id"),
-        "shim must not error on the post-edit collect; stderr:\n{recollect_stderr}"
+        !recollect_stderr.contains("produced no coverage"),
+        "post-edit collect must not drop a test's coverage; stderr:\n{recollect_stderr}"
     );
-
-    git(dir, &["checkout", "--", "mock-stub/src/lib.rs"]);
+    // Re-check the database, not just stderr. The assertion above greps a
+    // `collect` message, so a reword of it would silently retire the guard —
+    // exactly the drift this scenario has already suffered once. The row
+    // check pins the property itself.
+    let ids = builds_binary_ids(dir);
+    assert_eq!(
+        ids.len(),
+        2,
+        "post-edit collect must keep both binary_ids for `builds`, got {ids:?}"
+    );
 }

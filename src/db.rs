@@ -62,12 +62,12 @@ fn translate_busy(err: rusqlite::Error, ctx: &'static str) -> anyhow::Error {
 /// Umbrella directory for all cargo-affected artifacts (DB, profraw files).
 /// Lives under `target/` so it shares the gitignore and lifecycle
 /// (cargo clean wipes it) of other build artifacts.
-pub fn affected_dir(project_root: &Path) -> PathBuf {
+pub(crate) fn affected_dir(project_root: &Path) -> PathBuf {
     project_root.join("target").join("affected")
 }
 
 /// Canonical DB location within the affected dir.
-pub fn db_path(project_root: &Path) -> PathBuf {
+pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     affected_dir(project_root).join("coverage.db")
 }
 
@@ -121,13 +121,13 @@ CREATE TABLE IF NOT EXISTS fingerprint_components (
 /// test identity, so we use it everywhere — storage keys, filter expressions,
 /// counts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TestId {
-    pub binary_id: String,
-    pub test_name: String,
+pub(crate) struct TestId {
+    pub(crate) binary_id: String,
+    pub(crate) test_name: String,
 }
 
 impl TestId {
-    pub fn new(binary_id: impl Into<String>, test_name: impl Into<String>) -> Self {
+    pub(crate) fn new(binary_id: impl Into<String>, test_name: impl Into<String>) -> Self {
         Self {
             binary_id: binary_id.into(),
             test_name: test_name.into(),
@@ -139,19 +139,19 @@ impl TestId {
 /// hashes from `fingerprint_components`. Returned by
 /// [`Db::stored_fingerprint_snapshots`] for the diagnostic report.
 #[derive(Debug, Clone)]
-pub struct StoredFingerprintRow {
-    pub fingerprint: String,
-    pub last_seen: String,
-    pub components: Vec<FingerprintComponent>,
+pub(crate) struct StoredFingerprintRow {
+    pub(crate) fingerprint: String,
+    pub(crate) last_seen: String,
+    pub(crate) components: Vec<FingerprintComponent>,
 }
 
 /// One hit recorded by [`Db::tests_covering_ranges`]: which test got pulled
 /// in, and the reason for it. A single test can appear multiple times if it
 /// matched several rows or several hunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestHit {
-    pub test_id: TestId,
-    pub reason: HitReason,
+pub(crate) struct TestHit {
+    pub(crate) test_id: TestId,
+    pub(crate) reason: HitReason,
 }
 
 /// Why a test was selected. The triple (`file`, `matched_hunk`, `kind`)
@@ -159,24 +159,24 @@ pub struct TestHit {
 /// row that matched (absent for [`HitKind::StructuralBackstop`], where the
 /// whole point is that nothing matched).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HitReason {
+pub(crate) struct HitReason {
     /// `collect_sha` the diff was anchored against. Hunks live in this
     /// sha's coordinate system; the reason is only meaningful paired with it.
-    pub collect_sha: String,
+    pub(crate) collect_sha: String,
     /// Source file the hunk applies to.
-    pub file: String,
+    pub(crate) file: String,
     /// Selection-path classification.
-    pub kind: HitKind,
+    pub(crate) kind: HitKind,
     /// The diff hunk that triggered the selection. Inclusive `(start, end)`.
-    pub matched_hunk: (i64, i64),
+    pub(crate) matched_hunk: (i64, i64),
     /// The stored row that overlapped the hunk. `None` when [`HitKind::StructuralBackstop`]
     /// fired (no row overlapped — the test was pulled in by file-presence alone).
-    pub stored_range: Option<(i64, i64)>,
+    pub(crate) stored_range: Option<(i64, i64)>,
 }
 
 /// How a test ended up in the selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HitKind {
+pub(crate) enum HitKind {
     /// A stored function-range row overlapped the hunk's line range.
     LineOverlap,
     /// No stored row overlapped the hunk; the test was pulled in because
@@ -188,6 +188,11 @@ pub enum HitKind {
     /// this file selects this test" link the function-level coverage
     /// can't observe directly.
     CrateRootSentinel,
+    /// The test was force-selected by a `[workspace.metadata.affected]` rule whose
+    /// globs matched a changed (typically non-Rust) input the coverage model
+    /// can't link to a test — an insta `.snap`, a doc, a template. Produced by
+    /// [`crate::config::resolve_config_hits`], not by coverage overlap.
+    ConfigRule,
 }
 
 /// How many distinct fingerprints to retain. `gc()` evicts the least-recently-
@@ -195,7 +200,7 @@ pub enum HitKind {
 /// Chosen to comfortably cover typical workflows (a handful of branches plus
 /// the occasional toolchain bump) while keeping the DB from accumulating
 /// forever if a user rapidly cycles through many build environments.
-pub const FINGERPRINT_KEEP: usize = 10;
+pub(crate) const FINGERPRINT_KEEP: usize = 10;
 
 /// Upsert `fingerprint`'s `last_seen` to now. Creates the row if absent; this
 /// is safe for writes (we just inserted data under this fingerprint) but
@@ -247,7 +252,13 @@ fn batch_delete_tests<'a>(
     const CHUNK: usize = 400;
     for chunk in tests.chunks(CHUNK) {
         let predicate = (0..chunk.len())
-            .map(|i| format!("(binary_id = ?{} AND test_name = ?{})", 2 + i * 2, 3 + i * 2))
+            .map(|i| {
+                format!(
+                    "(binary_id = ?{} AND test_name = ?{})",
+                    2 + i * 2,
+                    3 + i * 2
+                )
+            })
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!(
@@ -322,7 +333,7 @@ fn insert_mappings(
     Ok(())
 }
 
-pub struct Db {
+pub(crate) struct Db {
     conn: Connection,
 }
 
@@ -335,7 +346,7 @@ impl Db {
     /// shape is wrong. Old rows can't be retroactively tagged with missing
     /// columns, and `target/affected/` is cargo-clean territory, so the
     /// reset is safe — the user re-collects.
-    pub fn open(project_root: &Path) -> Result<Self> {
+    pub(crate) fn open(project_root: &Path) -> Result<Self> {
         let path = db_path(project_root);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -367,7 +378,7 @@ impl Db {
     ///
     /// Leaves rows from other fingerprints alone — they remain queryable if
     /// the user switches environments.
-    pub fn store_coverage(
+    pub(crate) fn store_coverage(
         &mut self,
         fingerprint: &str,
         components: &[FingerprintComponent],
@@ -393,7 +404,7 @@ impl Db {
     /// `new_collect_sha`. Other tests' rows under the same fingerprint stay
     /// put — that's the whole point of `collect --diff`. Component hashes
     /// are refreshed to match `components` (the current build environment).
-    pub fn update_coverage_for_tests(
+    pub(crate) fn update_coverage_for_tests(
         &mut self,
         fingerprint: &str,
         components: &[FingerprintComponent],
@@ -415,7 +426,7 @@ impl Db {
     /// is not in `present`. Used by `collect --diff` to clear out tests that
     /// were renamed or deleted between collects. Returns the number of
     /// distinct tests pruned.
-    pub fn prune_missing_tests(
+    pub(crate) fn prune_missing_tests(
         &mut self,
         fingerprint: &str,
         present: &BTreeSet<TestId>,
@@ -431,7 +442,10 @@ impl Db {
             )?;
             let rows: BTreeSet<TestId> = stmt
                 .query_map([fingerprint], |row| {
-                    Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok(TestId::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             rows
@@ -475,7 +489,7 @@ impl Db {
     /// them in Rust rather than running 2 queries per hunk: rows-per-file is
     /// bounded by hit functions in the file (small), and SQLite round-trips
     /// dominate the per-hunk cost.
-    pub fn tests_covering_ranges(
+    pub(crate) fn tests_covering_ranges(
         &self,
         fingerprint: &str,
         collect_sha: &str,
@@ -558,17 +572,17 @@ impl Db {
     /// (`run`, `status`) should invoke this once per invocation rather
     /// than once per query — `tests_covering_ranges` no longer touches
     /// it implicitly, since it can be called many times per command.
-    pub fn touch(&self, fingerprint: &str) -> Result<()> {
+    pub(crate) fn touch(&self, fingerprint: &str) -> Result<()> {
         touch_fingerprint(&self.conn, fingerprint)
     }
 
     /// Distinct `collect_sha` values present in `test_regions` for this
     /// fingerprint. Empty when no coverage has been collected yet for the
     /// current environment.
-    pub fn collect_shas(&self, fingerprint: &str) -> Result<BTreeSet<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT collect_sha FROM test_regions WHERE env_fingerprint = ?1",
-        )?;
+    pub(crate) fn collect_shas(&self, fingerprint: &str) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT collect_sha FROM test_regions WHERE env_fingerprint = ?1")?;
         let shas = stmt
             .query_map([fingerprint], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -576,7 +590,7 @@ impl Db {
     }
 
     /// Count of distinct tests tracked under the current fingerprint.
-    pub fn test_count(&self, fingerprint: &str) -> Result<usize> {
+    pub(crate) fn test_count(&self, fingerprint: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM \
              (SELECT DISTINCT binary_id, test_name FROM test_regions WHERE env_fingerprint = ?1)",
@@ -587,7 +601,7 @@ impl Db {
     }
 
     /// Count of (test, file, range) rows under the current fingerprint.
-    pub fn region_count(&self, fingerprint: &str) -> Result<usize> {
+    pub(crate) fn region_count(&self, fingerprint: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM test_regions WHERE env_fingerprint = ?1",
             [fingerprint],
@@ -601,7 +615,7 @@ impl Db {
     /// files the cache "knows about" at the reachable shas — used by
     /// the diagnostic report to set `tracked_by_coverage` on each
     /// changed file in one query rather than N×files lookups.
-    pub fn tracked_files_at_shas(
+    pub(crate) fn tracked_files_at_shas(
         &self,
         fingerprint: &str,
         shas: &BTreeSet<String>,
@@ -624,7 +638,7 @@ impl Db {
     }
 
     /// Whether a source file has coverage data under the current fingerprint.
-    pub fn file_tracked(&self, fingerprint: &str, file: &str) -> Result<bool> {
+    pub(crate) fn file_tracked(&self, fingerprint: &str, file: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM test_regions \
              WHERE env_fingerprint = ?1 AND source_file = ?2",
@@ -638,7 +652,7 @@ impl Db {
     /// timestamp and component hashes. Used by the diagnostic report to
     /// compute "which input differs?" diffs against the current
     /// fingerprint. Empty when the DB has never been written to.
-    pub fn stored_fingerprint_snapshots(&self) -> Result<Vec<StoredFingerprintRow>> {
+    pub(crate) fn stored_fingerprint_snapshots(&self) -> Result<Vec<StoredFingerprintRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT fingerprint, last_seen FROM fingerprints \
              ORDER BY last_seen DESC, fingerprint ASC",
@@ -676,10 +690,7 @@ impl Db {
     /// `test_regions` row counts per `collect_sha`, scoped to one
     /// fingerprint. Used by the report to show how much data is
     /// anchored at each sha. One query — diagnostic, not a hot path.
-    pub fn row_counts_by_sha(
-        &self,
-        fingerprint: &str,
-    ) -> Result<BTreeMap<String, usize>> {
+    pub(crate) fn row_counts_by_sha(&self, fingerprint: &str) -> Result<BTreeMap<String, usize>> {
         let mut stmt = self.conn.prepare(
             "SELECT collect_sha, COUNT(*) FROM test_regions \
              WHERE env_fingerprint = ?1 \
@@ -701,16 +712,16 @@ impl Db {
     /// (in DB but only at currently-missing shas) from "genuinely new"
     /// tests (not in DB at all): if a listed test appears here but not
     /// in [`Db::all_tests_at_shas`] for the reachable subset, it's stranded.
-    pub fn all_tests_for_fingerprint(
-        &self,
-        fingerprint: &str,
-    ) -> Result<BTreeSet<TestId>> {
+    pub(crate) fn all_tests_for_fingerprint(&self, fingerprint: &str) -> Result<BTreeSet<TestId>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT binary_id, test_name FROM test_regions \
              WHERE env_fingerprint = ?1",
         )?;
         let rows = stmt.query_map([fingerprint], |row| {
-            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(TestId::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<BTreeSet<TestId>>>()
             .map_err(Into::into)
@@ -721,7 +732,7 @@ impl Db {
     /// known to the cache *and reachable*" — tests anchored only at diverged
     /// shas appear missing here, so selection surfaces them as stranded and
     /// reruns them.
-    pub fn all_tests_at_shas(
+    pub(crate) fn all_tests_at_shas(
         &self,
         fingerprint: &str,
         shas: &BTreeSet<String>,
@@ -737,7 +748,10 @@ impl Db {
         let mut stmt = self.conn.prepare(&sql)?;
         let params = std::iter::once(fingerprint).chain(shas.iter().map(String::as_str));
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok(TestId::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(TestId::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<BTreeSet<TestId>>>()
             .map_err(Into::into)
@@ -746,7 +760,7 @@ impl Db {
     /// Count of `test_regions` rows under `fingerprint` whose `collect_sha`
     /// is one of `shas`. Used by `status` to quantify diverged-row bloat so
     /// the user knows when `cargo affected clean` is worth running.
-    pub fn region_count_at_shas(
+    pub(crate) fn region_count_at_shas(
         &self,
         fingerprint: &str,
         shas: &BTreeSet<String>,
@@ -771,7 +785,7 @@ impl Db {
     /// `MissFingerprint` via [`Db::stored_fingerprint_snapshots`], which
     /// lets the same query also drive the components-diff diagnostic.
     #[cfg(test)]
-    pub fn has_any_coverage(&self) -> Result<bool> {
+    pub(crate) fn has_any_coverage(&self) -> Result<bool> {
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM test_regions", [], |r| r.get(0))?;
@@ -784,7 +798,7 @@ impl Db {
     /// the file) means we acquire the normal write lock — so a concurrent
     /// `collect` finishes cleanly before its data is discarded, instead of
     /// being orphaned onto an unlinked inode.
-    pub fn clear(&mut self) -> Result<()> {
+    pub(crate) fn clear(&mut self) -> Result<()> {
         let tx = self
             .conn
             .transaction()
@@ -800,7 +814,7 @@ impl Db {
 
     /// Evict the least-recently-used fingerprints beyond `keep`, never
     /// evicting `current`. Returns the number evicted.
-    pub fn gc(&mut self, current: &str, keep: usize) -> Result<usize> {
+    pub(crate) fn gc(&mut self, current: &str, keep: usize) -> Result<usize> {
         let tx = self
             .conn
             .transaction()
@@ -835,7 +849,7 @@ impl Db {
     }
 
     /// Count of distinct tracked fingerprints (after any GC).
-    pub fn fingerprint_count(&self) -> Result<usize> {
+    pub(crate) fn fingerprint_count(&self) -> Result<usize> {
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))?;
@@ -843,7 +857,7 @@ impl Db {
     }
 
     /// Return the last collection timestamp, if any.
-    pub fn last_collected(&self) -> Result<Option<String>> {
+    pub(crate) fn last_collected(&self) -> Result<Option<String>> {
         let result = self.conn.query_row(
             "SELECT value FROM meta WHERE key = 'last_collected'",
             [],
@@ -859,7 +873,7 @@ impl Db {
 
 /// Warn (to stderr) about changed `.rs` files that have no coverage data under
 /// the current fingerprint.
-pub fn warn_untracked_rs_files(
+pub(crate) fn warn_untracked_rs_files(
     db: &Db,
     fingerprint: &str,
     changed_files: &[String],
@@ -1081,16 +1095,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let a_ranges = BTreeSet::from([
-            rng("src/lib.rs", 10, 20),
-            rng("src/utils.rs", 5, 15),
-        ]);
+        let a_ranges = BTreeSet::from([rng("src/lib.rs", 10, 20), rng("src/utils.rs", 5, 15)]);
         let b_ranges = BTreeSet::from([rng("src/lib.rs", 50, 60)]);
         db.store_coverage(
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), a_ranges), (tid(BIN_A, "test_b"), b_ranges)],
+            &[
+                (tid(BIN_A, "test_a"), a_ranges),
+                (tid(BIN_A, "test_b"), b_ranges),
+            ],
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 2);
@@ -1106,9 +1120,12 @@ mod tests {
         assert_eq!(hits, BTreeSet::from([tid(BIN_A, "test_b")]));
 
         // Multiple hunks in same file → union.
-        let hits = ids(
-            db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18), hunk(55, 55)])?,
-        );
+        let hits = ids(db.tests_covering_ranges(
+            FP_A,
+            SHA_A,
+            "src/lib.rs",
+            &[hunk(15, 18), hunk(55, 55)],
+        )?);
         assert_eq!(
             hits,
             BTreeSet::from([tid(BIN_A, "test_a"), tid(BIN_A, "test_b")])
@@ -1133,8 +1150,14 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)])),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/lib.rs", 50, 60)])),
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([rng("src/lib.rs", 10, 20)]),
+                ),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/lib.rs", 50, 60)]),
+                ),
             ],
         )?;
 
@@ -1199,14 +1222,17 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 10)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 1, 10)]),
+            )],
         )?;
 
         assert_eq!(db.test_count(FP_B)?, 0);
         assert_eq!(db.region_count(FP_B)?, 0);
         assert!(db
             .tests_covering_ranges(FP_B, SHA_A, "src/lib.rs", &[hunk(1, 5)])?
-            .is_empty());  // Vec<TestHit>::is_empty()
+            .is_empty()); // Vec<TestHit>::is_empty()
         assert!(!db.file_tracked(FP_B, "src/lib.rs")?);
         assert!(db
             .all_tests_at_shas(FP_B, &BTreeSet::from([SHA_A.to_string()]))?
@@ -1225,13 +1251,19 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 1, 5)]),
+            )],
         )?;
         db.store_coverage(
             FP_B,
             &comps_for(FP_B),
             SHA_B,
-            &[(tid(BIN_A, "test_b"), BTreeSet::from([rng("src/other.rs", 10, 15)]))],
+            &[(
+                tid(BIN_A, "test_b"),
+                BTreeSet::from([rng("src/other.rs", 10, 15)]),
+            )],
         )?;
 
         // Rewriting FP_A leaves FP_B alone.
@@ -1239,7 +1271,10 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/new.rs", 1, 1)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/new.rs", 1, 1)]),
+            )],
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 1);
@@ -1270,15 +1305,23 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "builds"), BTreeSet::from([rng("crate_a/tests/builds.rs", 1, 5)])),
-                (tid(BIN_B, "builds"), BTreeSet::from([rng("crate_b/tests/builds.rs", 1, 5)])),
+                (
+                    tid(BIN_A, "builds"),
+                    BTreeSet::from([rng("crate_a/tests/builds.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_B, "builds"),
+                    BTreeSet::from([rng("crate_b/tests/builds.rs", 1, 5)]),
+                ),
             ],
         )?;
 
         assert_eq!(db.test_count(FP_A)?, 2);
-        let a = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?);
+        let a =
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_a/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(a, BTreeSet::from([tid(BIN_A, "builds")]));
-        let b = ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?);
+        let b =
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "crate_b/tests/builds.rs", &[hunk(2, 3)])?);
         assert_eq!(b, BTreeSet::from([tid(BIN_B, "builds")]));
         Ok(())
     }
@@ -1288,8 +1331,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(
+            tid(BIN_A, "test_a"),
+            BTreeSet::from([rng("src/lib.rs", 1, 5)]),
+        )];
         db.store_coverage(FP_A, &comps_for(FP_A), SHA_A, &mappings)?;
         db.store_coverage(FP_B, &comps_for(FP_B), SHA_B, &mappings)?;
         assert!(db.has_any_coverage()?);
@@ -1311,14 +1356,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         for fp in ["fp1", "fp2", "fp3", "fp4"] {
             db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
             db.conn.execute(
                 "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
-                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+                rusqlite::params![
+                    fp,
+                    format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')
+                ],
             )?;
         }
         assert_eq!(db.fingerprint_count()?, 4);
@@ -1421,9 +1468,18 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/b.rs", 1, 5)])),
-                (tid(BIN_A, "test_c"), BTreeSet::from([rng("src/c.rs", 1, 5)])),
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([rng("src/a.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/b.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_c"),
+                    BTreeSet::from([rng("src/c.rs", 1, 5)]),
+                ),
             ],
         )?;
         assert_eq!(db.collect_shas(FP_A)?, BTreeSet::from([SHA_A.to_string()]));
@@ -1433,7 +1489,10 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_B,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 10, 20)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/a.rs", 10, 20)]),
+            )],
         )?;
 
         // Both shas now coexist for FP_A.
@@ -1477,9 +1536,18 @@ mod tests {
             &comps_for(FP_A),
             SHA_A,
             &[
-                (tid(BIN_A, "test_a"), BTreeSet::from([rng("src/a.rs", 1, 5)])),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/b.rs", 1, 5)])),
-                (tid(BIN_A, "test_c"), BTreeSet::from([rng("src/c.rs", 1, 5)])),
+                (
+                    tid(BIN_A, "test_a"),
+                    BTreeSet::from([rng("src/a.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/b.rs", 1, 5)]),
+                ),
+                (
+                    tid(BIN_A, "test_c"),
+                    BTreeSet::from([rng("src/c.rs", 1, 5)]),
+                ),
             ],
         )?;
 
@@ -1584,7 +1652,10 @@ mod tests {
             FP_A,
             &comps,
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 1, 5)]),
+            )],
         )?;
 
         assert_eq!(
@@ -1604,8 +1675,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         db.store_coverage(
             FP_A,
@@ -1638,14 +1708,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut db = Db::open(dir.path())?;
 
-        let mappings =
-            vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
+        let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
         for fp in ["fp1", "fp2", "fp3", "fp4"] {
             db.store_coverage(fp, &comps_for(fp), SHA_A, &mappings)?;
             db.conn.execute(
                 "UPDATE fingerprints SET last_seen = ?2 WHERE fingerprint = ?1",
-                rusqlite::params![fp, format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')],
+                rusqlite::params![
+                    fp,
+                    format!("2020-01-01T00:00:{:02}Z", fp.as_bytes()[2] - b'0')
+                ],
             )?;
         }
         // Sanity: every fingerprint has a components row.
@@ -1815,7 +1887,10 @@ mod tests {
             FP_A,
             &comps_for(FP_A),
             SHA_A,
-            &[(tid(BIN_A, "test_a"), BTreeSet::from([rng("src/lib.rs", 10, 20)]))],
+            &[(
+                tid(BIN_A, "test_a"),
+                BTreeSet::from([rng("src/lib.rs", 10, 20)]),
+            )],
         )?;
 
         let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(15, 18)])?;
@@ -1849,7 +1924,10 @@ mod tests {
         let hits = db.tests_covering_ranges(FP_A, SHA_A, "src/lib.rs", &[hunk(7, 7)])?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].reason.kind, HitKind::CrateRootSentinel);
-        assert_eq!(hits[0].reason.stored_range, Some((1, CRATE_ROOT_SENTINEL_END)));
+        assert_eq!(
+            hits[0].reason.stored_range,
+            Some((1, CRATE_ROOT_SENTINEL_END))
+        );
         Ok(())
     }
 
@@ -1872,12 +1950,12 @@ mod tests {
             &[
                 (
                     tid(BIN_A, "test_a"),
-                    BTreeSet::from([
-                        rng("src/lib.rs", 10, 15),
-                        rng("src/lib.rs", 30, 35),
-                    ]),
+                    BTreeSet::from([rng("src/lib.rs", 10, 15), rng("src/lib.rs", 30, 35)]),
                 ),
-                (tid(BIN_A, "test_b"), BTreeSet::from([rng("src/lib.rs", 50, 55)])),
+                (
+                    tid(BIN_A, "test_b"),
+                    BTreeSet::from([rng("src/lib.rs", 50, 55)]),
+                ),
             ],
         )?;
 

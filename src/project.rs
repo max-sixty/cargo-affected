@@ -1,4 +1,44 @@
 //! Shared project utilities: root detection and git queries.
+//!
+//! Two jobs sit together here because they answer the same question from
+//! different directions — *what is this project, right now*. `cargo metadata`
+//! says which crates it contains and where its root is; git says what has
+//! changed and which snapshots are still addressable.
+//!
+//! ## Line numbers are in the collect_sha's coordinate system
+//!
+//! The invariant everything downstream rests on. [`git_changed_line_ranges`]
+//! returns **OLD-side** line numbers — positions in the `collect_sha`
+//! snapshot, not in the working tree — because that is the coordinate system
+//! `test_regions` rows were recorded in. Overlap queries compare the two
+//! directly, so a switch to NEW-side numbers wouldn't fail loudly; it would
+//! quietly select the wrong tests, more wrongly the further HEAD drifts from
+//! the anchor.
+//!
+//! [`relation_to_head`] is what lets that hold for shas that aren't ancestors
+//! of HEAD. Only a sha genuinely absent from the repo is `Missing`; a sibling
+//! or post-`reset` orphan stays `Reachable`, because `git diff <sha> HEAD`
+//! resolves either way and the ranges still live in `<sha>`'s coordinates.
+//! `Reachable { commits_ahead: 0 }` is such a sibling — it resolves, but its
+//! tree differs from HEAD's, which is why callers treat it as divergence
+//! rather than an exact hit.
+//!
+//! ## Git failure is never "nothing changed"
+//!
+//! Every query here propagates a non-zero git exit rather than degrading to an
+//! empty result. An empty change set is indistinguishable from a clean tree,
+//! so a swallowed error would select zero tests and report success — silent
+//! under-selection, the one failure this tool cannot detect downstream.
+//!
+//! ## Paths must match what the compiler recorded
+//!
+//! [`canonicalize_no_verbatim`] exists because the two platforms fail in
+//! opposite directions: macOS needs canonicalization (temp dirs reached via
+//! `/var` are recorded under `/private/var`), while Windows needs its absence
+//! (`Path::canonicalize` adds a `\\?\` prefix and expands 8.3 names, neither
+//! of which cargo or llvm-cov produce). Getting this wrong makes
+//! `strip_prefix` against the project root discard every function — see
+//! `tests/functional/remapped_paths.rs` for what that costs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,9 +51,9 @@ use crate::coverage::to_db_relative;
 
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LineRange {
-    pub start: i64,
-    pub end: i64,
+pub(crate) struct LineRange {
+    pub(crate) start: i64,
+    pub(crate) end: i64,
 }
 
 /// How a stored sha relates to the current `HEAD`.
@@ -33,24 +73,24 @@ pub struct LineRange {
 /// or beyond a shallow clone boundary). The diff has no anchor and the cache
 /// is unusable; tests anchored at this sha rerun as new.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShaRelation {
+pub(crate) enum ShaRelation {
     Equal,
     Reachable { commits_ahead: u32 },
     Missing,
 }
 
 /// Project root information.
-pub struct ProjectRoot {
+pub(crate) struct ProjectRoot {
     /// Workspace root directory. Git operations and the DB live here.
     /// For single-crate projects this equals the crate root.
-    pub workspace_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
     /// All Cargo.toml files belonging to the workspace — the root manifest
     /// plus every member's manifest. Sorted, deduplicated. Used for
     /// environment fingerprinting.
-    pub manifest_paths: Vec<PathBuf>,
+    pub(crate) manifest_paths: Vec<PathBuf>,
     /// Raw `cargo metadata --no-deps` JSON. Parsed once at root detection so
     /// less-common lookups (test src paths) don't have to re-spawn cargo.
-    pub metadata: serde_json::Value,
+    pub(crate) metadata: serde_json::Value,
 }
 
 /// `Path::canonicalize` adapted for cross-platform path-prefix arithmetic.
@@ -66,7 +106,7 @@ pub struct ProjectRoot {
 /// or llvm-cov's path forms — `strip_prefix` against the canonicalized
 /// root drops every match. Cargo's own tooling doesn't canonicalize, so
 /// the cargo-given path matches itself fine without help.
-pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
     #[cfg(windows)]
     {
         Ok(path.to_path_buf())
@@ -82,7 +122,7 @@ pub fn canonicalize_no_verbatim(path: &Path) -> Result<PathBuf> {
 ///
 /// Uses `cargo metadata --no-deps --format-version=1` to reliably determine
 /// the workspace root, which handles both single-crate and workspace projects.
-pub fn find_project_root() -> Result<ProjectRoot> {
+pub(crate) fn find_project_root() -> Result<ProjectRoot> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version=1"])
         .output()
@@ -153,7 +193,7 @@ impl ProjectRoot {
     /// `TestId.binary_id` from `cargo nextest list` is exact.
     ///
     /// Reads from the cached `metadata` JSON — no cargo spawn.
-    pub fn crate_root_sentinels_by_binary_id(
+    pub(crate) fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
         // No canonicalize: `workspace_root` and `target.src_path` both come
@@ -286,7 +326,10 @@ impl TestTarget {
 }
 
 fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
-    let is_test = target.get("test").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_test = target
+        .get("test")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !is_test {
         return None;
     }
@@ -310,7 +353,11 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
     let src_path = to_db_relative(rel)?;
-    Some(TestTarget { name, kind, src_path })
+    Some(TestTarget {
+        name,
+        kind,
+        src_path,
+    })
 }
 
 /// Construct nextest's stable `binary_id` for a workspace target. Mirrors
@@ -359,7 +406,7 @@ fn transitive_closure<'a>(
 /// Returns paths relative to the project root. A non-zero git exit (corrupt
 /// repo, missing object, permissions) is a hard error: silently returning "no
 /// changed files" would look like a clean tree and select zero tests.
-pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
+pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for args in [
         vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
@@ -401,7 +448,7 @@ pub fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
 /// structural-edit backstop hides some of the damage but only when a hunk
 /// overlaps no stored range; point edits within a function silently
 /// mis-select.
-pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
+pub(crate) fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
     // `--porcelain=v1 -z` emits one NUL-terminated entry per changed path
     // (renames split into two entries; we only care about emptiness).
     // Untracked files are reported by default; ignored files are not. That's
@@ -415,7 +462,7 @@ pub fn git_working_tree_dirty(project_root: &Path) -> Result<bool> {
 /// Capture the current git HEAD sha. Hard error if HEAD is unreachable —
 /// detached/initial-commit repos can't anchor function-level coverage and
 /// silently using "" would later fail with a confusing diff error.
-pub fn git_head_sha(project_root: &Path) -> Result<String> {
+pub(crate) fn git_head_sha(project_root: &Path) -> Result<String> {
     let lines = run_git(project_root, &["rev-parse", "HEAD"])?;
     let sha = lines
         .into_iter()
@@ -437,7 +484,7 @@ pub fn git_head_sha(project_root: &Path) -> Result<String> {
 /// orphans, the PR-vs-main-tip shape) is still `Reachable`: `git diff <sha>
 /// HEAD` resolves the trees fine, and stored coverage ranges live in `sha`'s
 /// coordinate system, which matches the diff's OLD side either way.
-pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
+pub(crate) fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
     let head = git_head_sha(project_root)?;
     if head == sha {
         return Ok(ShaRelation::Equal);
@@ -461,12 +508,15 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
         .trim()
         .parse::<u32>()
         .context("git rev-list --count returned non-numeric output")?;
-    Ok(ShaRelation::Reachable { commits_ahead: count })
+    Ok(ShaRelation::Reachable {
+        commits_ahead: count,
+    })
 }
 
 /// Per-file changed line ranges between `collect_sha` and the working tree.
 ///
-/// Runs `git diff -U0 --no-color --no-ext-diff <collect_sha>` and parses
+/// Runs `git diff -U0 --no-color --no-ext-diff --no-renames <collect_sha>`
+/// (plus prefix and quotePath settings — see the invocation) and parses
 /// `@@ -A,B +C,D @@` headers. Returns OLD-side line ranges (i.e. line
 /// numbers in the `collect_sha` snapshot, which is what `test_regions`
 /// stores). Pure insertions (`@@ -A,0 +C,D @@`) collapse to the single line
@@ -478,15 +528,23 @@ pub fn relation_to_head(project_root: &Path, sha: &str) -> Result<ShaRelation> {
 ///
 /// Errors are loud — git failure (bad sha, corrupt repo, etc.) is propagated
 /// rather than silently emitting an empty map.
-pub fn git_changed_line_ranges(
+pub(crate) fn git_changed_line_ranges(
     project_root: &Path,
     collect_sha: &str,
 ) -> Result<BTreeMap<String, Vec<LineRange>>> {
     // `--src-prefix=a/ --dst-prefix=b/` forces the standard prefixes — without
     // them, `git diff <commit>` against the working tree uses `c/` and `w/`
-    // and our parser would skip every `--- ` line.
+    // and our parser would skip every `--- ` line. `core.quotePath=false`
+    // stops git from octal-escaping non-ASCII path bytes into a C-quoted
+    // string our parser can't read. Paths git still quotes (embedded quotes,
+    // backslashes, control characters) stay unparsed and their ranges are
+    // dropped — accepted, since such names essentially never reach rustc,
+    // and config-rule matching still sees them verbatim via
+    // `git_changed_files`' `-z`.
     let output = Command::new("git")
         .args([
+            "-c",
+            "core.quotePath=false",
             "diff",
             "-U0",
             "--no-color",
@@ -512,9 +570,7 @@ pub fn git_changed_line_ranges(
         );
     }
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .context("git diff stdout was not valid UTF-8")?;
-    parse_unified_diff(stdout)
+    parse_unified_diff(&output.stdout)
 }
 
 /// Files added between `collect_sha` and the working tree (status `A`).
@@ -523,10 +579,7 @@ pub fn git_changed_line_ranges(
 /// additions, the diagnostic report needs this dedicated query to know
 /// the file existed in the diff at all. Returns paths relative to the
 /// project root.
-pub fn git_added_files_since(
-    project_root: &Path,
-    collect_sha: &str,
-) -> Result<Vec<String>> {
+pub(crate) fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
     let mut out = run_git(
         project_root,
         &[
@@ -544,25 +597,69 @@ pub fn git_added_files_since(
     Ok(out)
 }
 
-fn parse_unified_diff(diff: &str) -> Result<BTreeMap<String, Vec<LineRange>>> {
+/// Operates on bytes because content lines can carry arbitrary non-UTF-8
+/// data: git diffs a file as text whenever its leading bytes look text-like,
+/// so a fixture with binary content later in the file lands verbatim in the
+/// diff. Only the `--- ` and `@@ ` header lines are decoded; content lines
+/// are never interpreted. Diff framing is LF even on Windows, so splitting
+/// on `\n` is exact.
+fn parse_unified_diff(diff: &[u8]) -> Result<BTreeMap<String, Vec<LineRange>>> {
     let mut map: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
     let mut current_file: Option<String> = None;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("--- ") {
+    // Content lines still owed by the current hunk, per side. While either
+    // is outstanding the incoming line is hunk content and must not be
+    // header-matched: a deleted line whose content starts with `-- ` (an SQL
+    // comment, say) renders as `--- ...` and would otherwise be mistaken for
+    // a file header, silently dropping the file's remaining hunks.
+    let (mut rem_old, mut rem_new) = (0i64, 0i64);
+    for line in diff.split(|&b| b == b'\n') {
+        if rem_old > 0 || rem_new > 0 {
+            match line.first() {
+                Some(b'-') => rem_old -= 1,
+                Some(b'+') => rem_new -= 1,
+                // `\ No newline at end of file` — annotation, not content.
+                Some(b'\\') => {}
+                // `-U0` emits no context lines, so anything else means the
+                // budgets are out of sync with the stream; guessing would
+                // corrupt them silently.
+                _ => bail!(
+                    "unexpected line in git diff hunk content: {}",
+                    String::from_utf8_lossy(line)
+                ),
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(b"--- ") {
             // `--- a/path/to/file` or `--- /dev/null` for new files. We don't
             // emit ranges for /dev/null (the new file's lines all live on the
-            // NEW side, with no OLD-side coordinates).
-            current_file = parse_diff_path(rest);
-        } else if line.starts_with("@@ ") {
-            let Some(file) = current_file.clone() else { continue };
+            // NEW side, with no OLD-side coordinates). A path that isn't
+            // valid UTF-8 can't have coverage rows — cargo and llvm-cov both
+            // model paths as UTF-8 (camino) — so skipping it loses no
+            // selection.
+            current_file = std::str::from_utf8(rest).ok().and_then(parse_diff_path);
+        } else if line.starts_with(b"@@ ") {
+            // The function-name context after the closing `@@` is file
+            // content and can be non-UTF-8; lossy decode keeps the ASCII
+            // numeric part intact.
+            let text = String::from_utf8_lossy(line);
+            let Some(hunk) = parse_hunk_header(&text) else {
+                // Content lines are consumed by the budgets above, so an
+                // unparsable `@@ ` line here is a corrupt header — and
+                // without its counts the following content would be
+                // header-matched.
+                bail!("malformed hunk header in git diff output: {text}");
+            };
+            // Set the budgets even when the hunk's ranges are skipped, so
+            // its content lines are still consumed above.
+            (rem_old, rem_new) = (hunk.old_count, hunk.new_count);
+            let Some(file) = current_file.clone() else {
+                continue;
+            };
             // /dev/null sentinel — skip.
             if file == "/dev/null" {
                 continue;
             }
-            let Some(range) = parse_hunk_header(line) else {
-                continue;
-            };
-            map.entry(file).or_default().push(range);
+            map.entry(file).or_default().push(hunk.old_range);
         }
     }
 
@@ -596,11 +693,20 @@ fn parse_diff_path(rest: &str) -> Option<String> {
     path.strip_prefix("a/").map(String::from)
 }
 
-/// Parse `@@ -OLD_START[,OLD_COUNT] +NEW_START[,NEW_COUNT] @@ ...` and return
-/// the OLD-side inclusive line range. For pure insertions (`OLD_COUNT == 0`),
-/// returns `[OLD_START, OLD_START]` — the line before which content was
-/// inserted, so functions containing that line are still picked up.
-fn parse_hunk_header(line: &str) -> Option<LineRange> {
+/// A parsed `@@` hunk header: the OLD-side range plus both sides' line
+/// counts (the number of `-`/`+` content lines that follow the header).
+struct Hunk {
+    old_range: LineRange,
+    old_count: i64,
+    new_count: i64,
+}
+
+/// Parse `@@ -OLD_START[,OLD_COUNT] +NEW_START[,NEW_COUNT] @@ ...`. The
+/// OLD-side range is inclusive; for pure insertions (`OLD_COUNT == 0`) it
+/// collapses to `[OLD_START, OLD_START]` — the line before which content was
+/// inserted, so functions containing that line are still picked up (slight
+/// over-select at file edges, acceptable).
+fn parse_hunk_header(line: &str) -> Option<Hunk> {
     // Stripping leading "@@ " and finding the next " @@" boundary keeps
     // surrounding context (function name on inline-context lines) out of
     // the parse.
@@ -610,26 +716,32 @@ fn parse_hunk_header(line: &str) -> Option<LineRange> {
     // body looks like: "-OLD +NEW" — split on space.
     let mut parts = body.split_whitespace();
     let old = parts.next()?;
-    let _new = parts.next()?;
-    let old = old.strip_prefix('-')?;
-    let (start, count) = match old.split_once(',') {
-        Some((s, c)) => (s.parse::<i64>().ok()?, c.parse::<i64>().ok()?),
-        None => (old.parse::<i64>().ok()?, 1),
+    let new = parts.next()?;
+    let parse_side = |side: &str, sign: char| -> Option<(i64, i64)> {
+        let side = side.strip_prefix(sign)?;
+        match side.split_once(',') {
+            Some((s, c)) => Some((s.parse().ok()?, c.parse().ok()?)),
+            None => Some((side.parse().ok()?, 1)),
+        }
     };
-    if count == 0 {
-        // Pure insertion: line `start` is the line before the insert. Use it
-        // as a single-line range so functions containing line `start` are
-        // selected — slight over-select at file edges, acceptable.
-        Some(LineRange {
-            start,
-            end: start,
-        })
+    let (old_start, old_count) = parse_side(old, '-')?;
+    let (_, new_count) = parse_side(new, '+')?;
+    let old_range = if old_count == 0 {
+        LineRange {
+            start: old_start,
+            end: old_start,
+        }
     } else {
-        Some(LineRange {
-            start,
-            end: start + count - 1,
-        })
-    }
+        LineRange {
+            start: old_start,
+            end: old_start + old_count - 1,
+        }
+    };
+    Some(Hunk {
+        old_range,
+        old_count,
+        new_count,
+    })
 }
 
 /// Run `git <args>` in `project_root` and return NUL-separated stdout entries.
@@ -760,17 +872,17 @@ mod tests {
         // Commit a file with 10 lines, then modify line 5 in the working tree.
         let lines: String = (1..=10).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.path().join("a.txt"), &lines)?;
-        Command::new("git")
-            .args(["add", "a.txt"])
-            .current_dir(dir.path())
-            .output()?;
-        Command::new("git")
-            .args(["commit", "-q", "-m", "add a"])
-            .current_dir(dir.path())
-            .output()?;
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "add a"]);
 
         let modified: String = (1..=10)
-            .map(|i| if i == 5 { "modified\n".into() } else { format!("line {i}\n") })
+            .map(|i| {
+                if i == 5 {
+                    "modified\n".into()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
             .collect();
         std::fs::write(dir.path().join("a.txt"), &modified)?;
 
@@ -788,14 +900,8 @@ mod tests {
 
         let lines: String = (1..=5).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.path().join("a.txt"), &lines)?;
-        Command::new("git")
-            .args(["add", "a.txt"])
-            .current_dir(dir.path())
-            .output()?;
-        Command::new("git")
-            .args(["commit", "-q", "-m", "add a"])
-            .current_dir(dir.path())
-            .output()?;
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "add a"]);
 
         // Insert two lines after line 3 (pure insertion: old_count=0).
         let modified = "line 1\nline 2\nline 3\nINSERTED A\nINSERTED B\nline 4\nline 5\n";
@@ -810,21 +916,163 @@ mod tests {
     }
 
     #[test]
+    fn line_ranges_tolerate_binary_content_in_diff() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+
+        // Non-UTF-8 bytes but no NUL: git's binary heuristic (NUL in the
+        // first 8000 bytes) doesn't fire, so the raw bytes land in the diff
+        // as text. Deleting such a committed fixture used to abort the whole
+        // run with "git diff stdout was not valid UTF-8".
+        let payload: Vec<u8> = (0..40u32)
+            .flat_map(|i| {
+                let mut line = format!("line {i} ").into_bytes();
+                line.extend_from_slice(&[0xFF, 0xFE, 0xFA, b'\n']);
+                line
+            })
+            .collect();
+        // Extension-less name so a stray `*.bin binary` gitattributes rule on
+        // the host can't flip git's text detection.
+        std::fs::write(dir.path().join("binfixture"), &payload)?;
+        git(dir.path(), &["add", "binfixture"]);
+        git(dir.path(), &["commit", "-q", "-m", "add fixture"]);
+
+        let head = git_head_sha(dir.path())?;
+        std::fs::remove_file(dir.path().join("binfixture"))?;
+
+        let map = git_changed_line_ranges(dir.path(), &head)?;
+        let ranges = map.get("binfixture").expect("binfixture should appear");
+        assert_eq!(ranges, &vec![LineRange { start: 1, end: 40 }]);
+        Ok(())
+    }
+
+    #[test]
+    fn line_ranges_content_masquerading_as_file_header() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+
+        // Line 2 starts with `-- `; deleted, it renders as `--- SQL ...` in
+        // the diff. Without hunk-budget tracking the parser mistook it for a
+        // file header, resetting `current_file` and silently dropping the
+        // file's remaining hunks (the line-9 edit here).
+        let lines: String = (1..=10)
+            .map(|i| {
+                if i == 2 {
+                    "-- SQL comment style\n".to_string()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        std::fs::write(dir.path().join("a.sql"), &lines)?;
+        git(dir.path(), &["add", "a.sql"]);
+        git(dir.path(), &["commit", "-q", "-m", "add a.sql"]);
+
+        let modified: String = (1..=10)
+            .map(|i| {
+                if i == 2 || i == 9 {
+                    format!("changed {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        std::fs::write(dir.path().join("a.sql"), &modified)?;
+
+        let head = git_head_sha(dir.path())?;
+        let map = git_changed_line_ranges(dir.path(), &head)?;
+        let ranges = map.get("a.sql").expect("a.sql should appear");
+        assert_eq!(
+            ranges,
+            &vec![
+                LineRange { start: 2, end: 2 },
+                LineRange { start: 9, end: 9 }
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn line_ranges_non_ascii_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+
+        // Under git's default `core.quotePath=true` a non-ASCII path is
+        // octal-escaped into a C-quoted string the parser can't read; the
+        // diff invocation disables that. Em-dash rather than an accented
+        // letter so macOS's NFD normalization can't change the bytes.
+        let awkward = "a b — weird-name.txt";
+        let lines: String = (1..=5).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join(awkward), &lines)?;
+        git(dir.path(), &["add", awkward]);
+        git(dir.path(), &["commit", "-q", "-m", "add awkward"]);
+
+        let modified = lines.replace("line 3", "changed 3");
+        std::fs::write(dir.path().join(awkward), &modified)?;
+
+        let head = git_head_sha(dir.path())?;
+        let map = git_changed_line_ranges(dir.path(), &head)?;
+        let ranges = map.get(awkward).expect("awkward path should appear");
+        assert_eq!(ranges, &vec![LineRange { start: 3, end: 3 }]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_unified_diff_tolerates_non_utf8_bytes() -> Result<()> {
+        let mut diff = Vec::new();
+        diff.extend_from_slice(b"--- a/data.bin\n");
+        diff.extend_from_slice(b"+++ b/data.bin\n");
+        // Non-UTF-8 function-name context after the closing `@@`.
+        diff.extend_from_slice(b"@@ -3,2 +3,2 @@ \xff\xfe\n");
+        diff.extend_from_slice(b"-old \xf0\x28\x8c\x28 payload\n");
+        diff.extend_from_slice(b"-old second line\n");
+        diff.extend_from_slice(b"+new \xff payload\n");
+        diff.extend_from_slice(b"+new second line\n");
+        // A path that isn't valid UTF-8 (possible on Linux with
+        // `core.quotePath=false`): skipped, with its hunk content consumed.
+        diff.extend_from_slice(b"--- a/b\xffad\n");
+        diff.extend_from_slice(b"+++ b/b\xffad\n");
+        diff.extend_from_slice(b"@@ -1,1 +1,1 @@\n");
+        diff.extend_from_slice(b"-x\n");
+        diff.extend_from_slice(b"+y\n");
+
+        let map = parse_unified_diff(&diff)?;
+        assert_eq!(
+            map.get("data.bin"),
+            Some(&vec![LineRange { start: 3, end: 4 }])
+        );
+        assert_eq!(map.len(), 1, "undecodable path should be skipped");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_unified_diff_rejects_corrupt_input() {
+        // A malformed hunk header has no counts to budget with, so the
+        // parser can't safely skip past its content.
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ garbage @@\n-x\n+y\n").unwrap_err();
+        assert!(err.to_string().contains("malformed hunk header"), "{err}");
+
+        // A hunk content line without a -/+/\ prefix means the budgets are
+        // out of sync with the stream.
+        let err = parse_unified_diff(b"--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n-x\nzz\n").unwrap_err();
+        assert!(err.to_string().contains("unexpected line"), "{err}");
+    }
+
+    #[test]
     fn parse_hunk_header_variants() {
-        assert_eq!(
-            parse_hunk_header("@@ -10,3 +20,1 @@"),
-            Some(LineRange { start: 10, end: 12 })
-        );
+        let h = parse_hunk_header("@@ -10,3 +20,1 @@").unwrap();
+        assert_eq!(h.old_range, LineRange { start: 10, end: 12 });
+        assert_eq!((h.old_count, h.new_count), (3, 1));
+
         // No comma → count of 1.
-        assert_eq!(
-            parse_hunk_header("@@ -7 +7 @@ fn foo()"),
-            Some(LineRange { start: 7, end: 7 })
-        );
-        // Pure insertion → single-line.
-        assert_eq!(
-            parse_hunk_header("@@ -5,0 +6,2 @@"),
-            Some(LineRange { start: 5, end: 5 })
-        );
+        let h = parse_hunk_header("@@ -7 +7 @@ fn foo()").unwrap();
+        assert_eq!(h.old_range, LineRange { start: 7, end: 7 });
+        assert_eq!((h.old_count, h.new_count), (1, 1));
+
+        // Pure insertion → single-line range, zero old-side budget.
+        let h = parse_hunk_header("@@ -5,0 +6,2 @@").unwrap();
+        assert_eq!(h.old_range, LineRange { start: 5, end: 5 });
+        assert_eq!((h.old_count, h.new_count), (0, 2));
     }
 
     /// Run `git <args>` in `dir`, asserting success. Used by tests that
@@ -1062,9 +1310,13 @@ mod tests {
         // build-dep (which is excluded).
         assert_eq!(
             map.get("math").unwrap(),
-            &[p("math/src/lib.rs"), p("strings/src/lib.rs"), p("utils/src/lib.rs")]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+            &[
+                p("math/src/lib.rs"),
+                p("strings/src/lib.rs"),
+                p("utils/src/lib.rs")
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         );
 
         // math::integration: own crate root + math's lib + transitive deps.
