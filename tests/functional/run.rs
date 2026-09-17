@@ -464,3 +464,72 @@ fn run_reports_a_filtered_out_selection_as_filtered() {
         );
     }
 }
+
+/// The mirror of the scenario above: a genuinely uncovered change must still
+/// be reported as uncovered, in a project that owns a permanently-excluded
+/// test.
+///
+/// An `#[ignore]`d test never runs, so it never gains a coverage row and
+/// never enters the DB — it is listed-but-excluded on *every* invocation,
+/// whatever the diff says and with no filter passed. The project's own
+/// nextest `default-filter` does the same to whatever it cuts. Counting
+/// those as a selection the filter took away makes `filter_excluded`
+/// permanently non-empty, which would hand every uncovered change in such a
+/// project the filter message instead of the `cargo affected collect` remedy
+/// that actually applies.
+#[test]
+fn uncovered_change_is_not_blamed_on_a_permanently_excluded_test() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_run_uncovered_with_ignored");
+
+    // A module no test touches, so an edit inside it selects nothing. Not a
+    // crate root, so no sentinel widens the selection either.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod math;\npub mod strings;\npub mod untested;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/untested.rs"),
+        "pub fn untested(x: i32) -> i32 {\n    x + 1\n}\n",
+    )
+    .unwrap();
+    // The permanently-excluded test.
+    replace_in_file(
+        &dir.join("src/strings.rs"),
+        "    #[test]\n    fn test_greet",
+        "    #[test]\n    #[ignore]\n    fn test_ignored_helper() {\n        \
+         assert_eq!(greet(\"x\"), \"hello, x\");\n    }\n\n    #[test]\n    fn test_greet",
+    );
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    replace_in_file(&dir.join("src/untested.rs"), "x + 1", "x + 2");
+
+    for (cmd, out) in [
+        ("run", cargo_affected(dir, &["affected", "run", "-v"])),
+        ("status", cargo_affected(dir, &["affected", "status", "-v"])),
+    ] {
+        assert!(
+            out.status.success(),
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = combined_output(&out);
+        assert!(
+            text.contains("no tests cover the changed lines"),
+            "expected {cmd} to report the change as uncovered, got:\n{text}"
+        );
+        assert!(
+            !text.contains("the current filter"),
+            "expected {cmd} not to blame a filter when none is in play, got:\n{text}"
+        );
+    }
+}

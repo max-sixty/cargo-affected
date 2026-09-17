@@ -73,12 +73,19 @@ pub(crate) struct Selection {
     /// used by `collect --diff` to prune rows for tests that were renamed
     /// or removed.
     pub(crate) listed: BTreeSet<TestId>,
-    /// Tests one of the three sources above would have selected, dropped
-    /// because `listing.excluded` holds them. Carried only so an empty
-    /// selection can be explained: "nothing covers the change" and "the
-    /// current filter removed what does" are different states, and
+    /// Tests *this change* pulled in — by coverage overlap or by a config
+    /// rule — that `listing.excluded` then dropped. Carried only so an
+    /// empty selection can be explained: "nothing covers the change" and
+    /// "the current filter removed what does" are different states, and
     /// `run`/`status` reported the first for both. Not itself a selection —
     /// every member is a test `nextest run` would skip.
+    ///
+    /// Excluded `new`/`stranded` tests are *not* counted, even though the
+    /// filter cost a selection there too: an excluded test that has never
+    /// been collected (`#[ignore]`d, or cut by the project's own
+    /// `default-filter`) is listed-but-excluded on every run whatever the
+    /// diff says, so counting it would make this set permanently non-empty
+    /// and blame the filter for every uncovered change in such a project.
     pub(crate) filter_excluded: BTreeSet<TestId>,
     /// Per-file/per-test diagnostics retained at the level requested by
     /// the caller. See [`SelectionDiagnostics`].
@@ -528,12 +535,13 @@ pub(crate) fn compute(
             // / `-E` / default-filter), so it never gains coverage — must
             // not be treated as a new/stranded test to rerun. Stays in
             // `listed` (above) so `collect --diff`'s prune keeps its rows.
-            // Record only what the filter actually cost: a reachable-known
-            // test reaches this loop and is dropped by it either way, so
-            // only the new/stranded arms below lose a selection here.
-            if !reachable_known.contains(t) {
-                filter_excluded.insert(t.clone());
-            }
+            // Deliberately *not* recorded in `filter_excluded`: a test
+            // excluded here is excluded on every run regardless of what
+            // changed (an `#[ignore]`d test never enters the DB, so it is
+            // permanently listed-but-excluded), and counting it would blame
+            // the filter for every genuinely uncovered change in a project
+            // that has one. Only the two change-driven sources below can
+            // lose a selection *to this change's* filter.
             continue;
         }
         if reachable_known.contains(t) {
