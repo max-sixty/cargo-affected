@@ -226,6 +226,12 @@ pub(crate) fn status(
             println!(
                 "\nno changes since the newest collect_sha and no new tests — nothing would run"
             );
+        } else if !sel.filter_excluded.is_empty() {
+            // Same third arm as `run` — see `filter_excluded_notice`.
+            println!(
+                "\nno tests would run: {}",
+                selection::filter_excluded_notice(sel.filter_excluded.len(), "would exclude")
+            );
         } else {
             println!("\nno tests cover the changed lines and no new tests");
         }

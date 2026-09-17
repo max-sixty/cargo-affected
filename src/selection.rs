@@ -73,6 +73,13 @@ pub(crate) struct Selection {
     /// used by `collect --diff` to prune rows for tests that were renamed
     /// or removed.
     pub(crate) listed: BTreeSet<TestId>,
+    /// Tests one of the three sources above would have selected, dropped
+    /// because `listing.excluded` holds them. Carried only so an empty
+    /// selection can be explained: "nothing covers the change" and "the
+    /// current filter removed what does" are different states, and
+    /// `run`/`status` reported the first for both. Not itself a selection —
+    /// every member is a test `nextest run` would skip.
+    pub(crate) filter_excluded: BTreeSet<TestId>,
     /// Per-file/per-test diagnostics retained at the level requested by
     /// the caller. See [`SelectionDiagnostics`].
     pub(crate) diagnostics: SelectionDiagnostics,
@@ -242,6 +249,28 @@ pub(crate) fn phantom_notice(count: usize, verb_phrase: &str) -> String {
         "note: {count} selected test{plural} {is_are} no longer in the nextest \
          listing (renamed or deleted since collect) and {verb_phrase}; \
          run `cargo affected collect` to drop the stale rows"
+    )
+}
+
+/// Format the filtered-out-selection notice shared by `run` and `status`.
+///
+/// The empty-selection arm in both commands used to have two states to
+/// explain — nothing changed, or nothing covers what changed — and told the
+/// user to run `cargo affected collect` in the second. Forwarding the
+/// caller's filters into the listing added a third: the change *is* covered,
+/// and the filter the caller passed is what removed the tests covering it.
+/// Reporting that as "no tests cover the changed lines" is false, and the
+/// remedy it names does nothing. `verb_phrase` slots into "the current
+/// filter VERB_PHRASE the N tests…" — "excludes" for `run`, "would exclude"
+/// for `status`; both are number-neutral, so the count's own plural is the
+/// only agreement to get right. Returns the body without a trailing newline
+/// so callers can `eprintln!`/`println!` it directly.
+pub(crate) fn filter_excluded_notice(count: usize, verb_phrase: &str) -> String {
+    format!(
+        "the current filter {verb_phrase} the {count} test{} this change \
+         selects (a filter passed after `--`, `#[ignore]`, or the project's \
+         nextest `default-filter`)",
+        plural_s(count),
     )
 }
 
@@ -492,12 +521,19 @@ pub(crate) fn compute(
 
     let mut new_tests = BTreeSet::new();
     let mut stranded_tests = BTreeSet::new();
+    let mut filter_excluded = BTreeSet::new();
     for t in &listed {
         if listing.excluded.contains(t) {
             // Skipped by `nextest run` (ignored, or excluded by a positional
             // / `-E` / default-filter), so it never gains coverage — must
             // not be treated as a new/stranded test to rerun. Stays in
             // `listed` (above) so `collect --diff`'s prune keeps its rows.
+            // Record only what the filter actually cost: a reachable-known
+            // test reaches this loop and is dropped by it either way, so
+            // only the new/stranded arms below lose a selection here.
+            if !reachable_known.contains(t) {
+                filter_excluded.insert(t.clone());
+            }
             continue;
         }
         if reachable_known.contains(t) {
@@ -541,6 +577,7 @@ pub(crate) fn compute(
                     // `collect --diff` flow uses the live/phantom split
                     // in `handle_no_profraw_dirs` to discriminate them
                     // from a runner-shim failure.
+                    filter_excluded.insert(hit.test_id);
                     continue;
                 }
                 affected.insert(hit.test_id.clone());
@@ -570,10 +607,16 @@ pub(crate) fn compute(
     let mut config_tests = BTreeSet::new();
     for (path, tests) in config_hits {
         for test in tests {
-            if listing.excluded.contains(test)
-                || affected.contains(test)
-                || !reachable_known.contains(test)
-            {
+            if listing.excluded.contains(test) {
+                // The rule would have rescued it — `affected` can't already
+                // hold an excluded test, so reachable-known is the whole
+                // condition left.
+                if reachable_known.contains(test) {
+                    filter_excluded.insert(test.clone());
+                }
+                continue;
+            }
+            if affected.contains(test) || !reachable_known.contains(test) {
                 continue;
             }
             config_tests.insert(test.clone());
@@ -613,6 +656,7 @@ pub(crate) fn compute(
         config_tests,
         reachable_known_count,
         listed,
+        filter_excluded,
         diagnostics,
     })
 }
@@ -707,6 +751,7 @@ mod tests {
             config_tests: config_tests.iter().cloned().collect(),
             reachable_known_count,
             listed,
+            filter_excluded: BTreeSet::new(),
             diagnostics: SelectionDiagnostics {
                 per_file: BTreeMap::new(),
                 per_test: None,
@@ -777,6 +822,13 @@ mod tests {
 
         assert_eq!(sel.selected().len(), 2);
         assert_eq!(sel.live_selected(), BTreeSet::from([live]));
+    }
+
+    #[test]
+    fn filter_excluded_notice_agrees_in_number() {
+        assert!(filter_excluded_notice(1, "excludes").contains("excludes the 1 test this change"));
+        assert!(filter_excluded_notice(2, "would exclude")
+            .contains("would exclude the 2 tests this change"));
     }
 
     #[test]

@@ -221,6 +221,15 @@ pub(crate) fn run(
         // covers them on every run until `clean`.
         if plan.changed_paths.since_newest.is_empty() {
             eprintln!("no changes since the newest collect_sha and no new tests — nothing to run");
+        } else if !sel.filter_excluded.is_empty() {
+            // The change *is* covered; the caller's own filter took the
+            // covering tests out. Saying "no tests cover the changed lines"
+            // here is false, and the `collect` it points at would change
+            // nothing.
+            eprintln!(
+                "no tests to run: {}",
+                selection::filter_excluded_notice(sel.filter_excluded.len(), "excludes")
+            );
         } else {
             eprintln!(
                 "no tests cover the changed lines and no new tests \

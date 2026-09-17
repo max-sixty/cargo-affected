@@ -388,3 +388,79 @@ fn run_after_diff_collect_reports_no_changes() {
         );
     }
 }
+
+/// A selection the *caller's own filter* emptied must not be reported as an
+/// absence of coverage.
+///
+/// Forwarding the post-`--` filters into the listing (so `nextest run` and the
+/// selection agree on what is runnable) means a positional substring can now
+/// empty `Selection::selected()`. That lands in the same arm as a genuinely
+/// uncovered change, which told the user "no tests cover the changed lines …
+/// run `cargo affected collect` to update" — false, since `test_greet` covers
+/// the edit and is right there in the unfiltered selection, and pointing at a
+/// remedy that changes nothing. `cargo affected run -- <substring>` is the
+/// ordinary way to narrow a run, so this is the steady state for anyone whose
+/// filter doesn't intersect the affected set. The exit code is not the
+/// regression: it is 0 either way here, which is what this branch fixed.
+#[test]
+fn run_reports_a_filtered_out_selection_as_filtered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_run_filtered_out");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // `greet` lives in strings.rs, so only `test_greet` is affected — and
+    // strings.rs is not a crate root, so no sentinel widens the selection.
+    replace_in_file(
+        &dir.join("src/strings.rs"),
+        "format!(\"hello, {name}\")",
+        "format!(\"hello, {name}\") /* edited */",
+    );
+
+    // Control: unfiltered, the change *is* covered.
+    let baseline = cargo_affected(dir, &["affected", "status", "-v"]);
+    let baseline_text = combined_output(&baseline);
+    assert!(
+        baseline_text.contains("test_greet"),
+        "the edit should be covered by test_greet: {baseline_text}"
+    );
+
+    // `test_add` doesn't cover the edit, so the filter removes the one test
+    // that does and leaves the selection empty.
+    for (cmd, out) in [
+        (
+            "run",
+            cargo_affected(dir, &["affected", "run", "-v", "--", "test_add"]),
+        ),
+        (
+            "status",
+            cargo_affected(dir, &["affected", "status", "-v", "--", "test_add"]),
+        ),
+    ] {
+        assert!(
+            out.status.success(),
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = combined_output(&out);
+        assert!(
+            !text.contains("no tests cover the changed lines"),
+            "expected {cmd} to blame the filter, not the coverage cache, got:\n{text}"
+        );
+        assert!(
+            text.contains("the current filter"),
+            "expected {cmd} to name the filter as the reason nothing runs, got:\n{text}"
+        );
+        assert!(
+            text.contains("1 test this change selects"),
+            "expected {cmd} to count the filtered-out test, got:\n{text}"
+        );
+    }
+}
