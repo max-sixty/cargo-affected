@@ -200,3 +200,61 @@ fn run_with_no_changes_reports_nothing_to_do() {
         "expected 'nothing to run' message on clean tree, got:\n{stderr}"
     );
 }
+
+/// Deleting a test makes its own coverage rows the only thing the resulting
+/// hunk overlaps, so the selection collapses to a single "phantom" — a test
+/// still in the DB but gone from the nextest listing. The generated filterset
+/// matches nothing for it, and nextest's "no tests to run" exit 4 used to
+/// propagate: `cargo affected run` reported a failure for a stale cache.
+///
+/// `collect --diff` has handled this since it started keeping phantoms
+/// deliberately (`diff_collect_all_phantom_selection_prunes_cleanly`); `run`
+/// had no equivalent, and hands nextest only the live subset now.
+#[test]
+fn run_with_all_phantom_selection_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_run_phantom");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Delete test_multiply outright. The deletion hunk covers exactly the
+    // lines of its own stored range, so test_multiply is the whole selection
+    // — and it no longer exists for nextest to run. test_add's ranges (the
+    // `add` body and its own test fn) sit outside the hunk, so it stays
+    // unselected and can't rescue the run.
+    replace_in_file(
+        &dir.join("src/math.rs"),
+        "    #[test]\n    fn test_multiply() {\n        assert_eq!(multiply(3, 4), 12);\n    }\n",
+        "",
+    );
+
+    let run = cargo_affected(dir, &["affected", "run", "-v"]);
+    let combined = combined_output(&run);
+    assert!(
+        run.status.success(),
+        "run with an all-phantom selection must exit 0, got {:?}:\n{combined}",
+        run.status.code()
+    );
+
+    assert!(
+        combined.contains("no longer in the nextest listing"),
+        "expected the phantom notice, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("no tests to run: every selected test is absent"),
+        "expected the all-phantom short-circuit message, got:\n{combined}"
+    );
+    // The short-circuit happens before nextest is invoked, so nextest's own
+    // failure line must not appear.
+    assert!(
+        !combined.contains("error: no tests to run"),
+        "nextest must not be asked to run a phantom-only filterset, got:\n{combined}"
+    );
+}

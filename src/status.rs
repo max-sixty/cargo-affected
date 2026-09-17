@@ -229,5 +229,16 @@ pub(crate) fn status(
 
     println!("\n{}", selection::format_summary(sel, "would run", verbose));
 
+    // `run` drops phantoms from the filterset it hands nextest, so say so
+    // here too — otherwise the prediction over-counts by exactly the tests
+    // that can't run.
+    let phantoms = sel.selected().len() - sel.live_selected().len();
+    if phantoms > 0 {
+        println!(
+            "{}",
+            selection::phantom_notice(phantoms, "would be skipped")
+        );
+    }
+
     Ok(())
 }
