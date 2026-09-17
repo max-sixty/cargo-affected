@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::Listing;
+use crate::collect::{plural_s, Listing};
 use crate::db::{Db, HitKind, HitReason, TestId};
 use crate::project::{
     git_added_files_since, git_changed_line_ranges, relation_to_head, LineRange, ShaRelation,
@@ -74,14 +74,40 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
-    /// Union of affected, stranded, new, and config-rule tests — what nextest
-    /// will be asked to run.
+    /// Union of affected, stranded, new, and config-rule tests — the full
+    /// selection, including tests nextest can no longer run. Callers building
+    /// a filterset for `nextest run` want [`live_selected`] instead.
+    ///
+    /// [`live_selected`]: Self::live_selected
     pub(crate) fn selected(&self) -> BTreeSet<TestId> {
         let mut out = self.affected.clone();
         out.extend(self.new_tests.iter().cloned());
         out.extend(self.stranded_tests.iter().cloned());
         out.extend(self.config_tests.iter().cloned());
         out
+    }
+
+    /// Selected tests still present in the current nextest listing.
+    ///
+    /// The complement is "phantoms": tests whose coverage rows survive in the
+    /// DB but that were renamed or deleted since the last `collect`. Deleting
+    /// a test produces a hunk over the very lines its stored range covers, so
+    /// a phantom lands in [`affected`] as a matter of course — and a change
+    /// that touches nothing else makes the whole selection phantom. The
+    /// generated filterset matches nothing for those, which is nextest's
+    /// "no tests to run" exit 4: a stale cache reported as a test failure.
+    ///
+    /// `collect --diff` deliberately keeps phantoms in its own filterset (it
+    /// uses the live/phantom split afterwards to tell an empty rerun from a
+    /// runner-shim failure, and prunes their rows). `run` and `status` have
+    /// no such use for them.
+    ///
+    /// [`affected`]: Self::affected
+    pub(crate) fn live_selected(&self) -> BTreeSet<TestId> {
+        self.selected()
+            .into_iter()
+            .filter(|t| self.listed.contains(t))
+            .collect()
     }
 
     /// Known tests not selected this round. Both `affected` and `config_tests`
@@ -190,13 +216,27 @@ pub(crate) struct Reachability {
 /// rerun as 'new'" for `status`. Returns the body without a trailing
 /// newline so callers can `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {
-    let plural = if missing.len() == 1 { "" } else { "s" };
+    let plural = plural_s(missing.len());
     let list = missing.iter().cloned().collect::<Vec<_>>().join(", ");
     format!(
         "note: {} collect_sha{plural} not in the repo ({list}) — \
          tests anchored only there {verb_phrase}; \
          run `cargo affected clean` to clear stale rows",
         missing.len(),
+    )
+}
+
+/// Format the phantom-selection notice shared by `run` and `status`.
+/// `verb_phrase` slots into "…since collect and VERB_PHRASE" — "will be
+/// skipped" for `run`, "would be skipped" for `status`. Returns the body
+/// without a trailing newline so callers can `eprintln!`/`println!` it
+/// directly.
+pub(crate) fn phantom_notice(count: usize, verb_phrase: &str) -> String {
+    let (plural, is_are) = if count == 1 { ("", "is") } else { ("s", "are") };
+    format!(
+        "note: {count} selected test{plural} {is_are} no longer in the nextest \
+         listing (renamed or deleted since collect) and {verb_phrase}; \
+         run `cargo affected collect` to drop the stale rows"
     )
 }
 
@@ -590,9 +630,10 @@ fn aggregate_per_file_counts(
 pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> String {
     let selected = sel.selected();
     let mut out = format!(
-        "{} tests {verb} ({} affected + {} config + {} new + {} stranded, \
+        "{} test{} {verb} ({} affected + {} config + {} new + {} stranded, \
          {} skipped of {} reachable-known)",
         selected.len(),
+        plural_s(selected.len()),
         sel.affected.len(),
         sel.config_tests.len(),
         sel.new_tests.len(),
@@ -673,6 +714,20 @@ mod tests {
         );
     }
 
+    /// A one-test selection says "1 test", not "1 tests". This is the single
+    /// most-printed line in the tool, and the `-v` breakdown right next to it
+    /// already pluralizes correctly, so the mismatch was visible on any run
+    /// that selected exactly one test.
+    #[test]
+    fn summary_singular_test_count() {
+        let sel = selection_with(&[tid("crate_a", "test_a")], &[], &[], &[], 5);
+        let out = format_summary(&sel, "to run", false);
+        assert!(
+            out.starts_with("1 test to run ("),
+            "expected a singular noun for a one-test selection, got:\n{out}"
+        );
+    }
+
     #[test]
     fn summary_verbose_tags_categories() {
         let sel = selection_with(
@@ -692,6 +747,25 @@ mod tests {
              crate_a::test_c (stranded)\n  \
              crate_a::test_d (config)"
         );
+    }
+
+    #[test]
+    fn live_selected_drops_tests_missing_from_the_listing() {
+        let live = tid("crate_a", "still_here");
+        let phantom = tid("crate_a", "deleted");
+        let mut sel = selection_with(&[live.clone(), phantom.clone()], &[], &[], &[], 2);
+        // `selection_with` lists everything it selects; a phantom is exactly
+        // the case where the DB holds a test the listing no longer does.
+        sel.listed.remove(&phantom);
+
+        assert_eq!(sel.selected().len(), 2);
+        assert_eq!(sel.live_selected(), BTreeSet::from([live]));
+    }
+
+    #[test]
+    fn phantom_notice_agrees_in_number() {
+        assert!(phantom_notice(1, "will be skipped").contains("1 selected test is no longer"));
+        assert!(phantom_notice(3, "would be skipped").contains("3 selected tests are no longer"));
     }
 
     #[test]

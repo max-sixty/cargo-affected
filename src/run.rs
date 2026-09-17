@@ -28,7 +28,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::collect::{
-    cargo_build_args, nextest_filter_expr, require_nextest, write_nextest_config,
+    cargo_build_args, nextest_filter_expr, plural_s, require_nextest, write_nextest_config,
 };
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
@@ -228,7 +228,27 @@ pub(crate) fn run(
 
     eprintln!("\n{}\n", selection::format_summary(sel, "to run", verbose));
 
-    let tests: Vec<TestId> = selected.into_iter().collect();
+    // Phantoms — selected but gone from the listing — can't be run, and
+    // naming them in the filterset only widens the gap between what we asked
+    // for and what nextest matched. Hand it the live subset; if that leaves
+    // nothing, there is no run to make and nextest would exit 4 on a stale
+    // cache rather than on a failing test.
+    let live = sel.live_selected();
+    if live.len() < selected.len() {
+        eprintln!(
+            "{}",
+            selection::phantom_notice(selected.len() - live.len(), "will be skipped")
+        );
+    }
+    if live.is_empty() {
+        eprintln!(
+            "no tests to run: every selected test is absent from the current \
+             nextest listing"
+        );
+        return Ok(0);
+    }
+
+    let tests: Vec<TestId> = live.into_iter().collect();
     run_tests(project_root, Some(&tests), nextest_args)
 }
 
@@ -266,7 +286,11 @@ fn run_tests(
     cmd.arg("nextest").arg("run");
     let filter_config = match tests {
         Some(ts) => {
-            eprintln!("running {} tests with nextest", ts.len());
+            eprintln!(
+                "running {} test{} with nextest",
+                ts.len(),
+                plural_s(ts.len())
+            );
             let config = write_nextest_config(project_root, &nextest_filter_expr(ts))?;
             cmd.arg("--config-file").arg(&config);
             Some(config)
