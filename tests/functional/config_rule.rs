@@ -506,3 +506,95 @@ fn config_rule_resolves_under_a_libtest_passthrough() {
         "the rule still resolves to its own test: {text}"
     );
 }
+
+/// Crate shaped like [`write_multi_test_golden_project`] but splitting its
+/// tests across two integration targets, so a cargo target flag (`--test
+/// <name>`) can scope the listing without naming any test.
+fn write_two_target_golden_project(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "config-rule-scoped-sample"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
+
+    let tests = dir.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("golden.rs"),
+        r#"#[test]
+fn golden_matches() {
+    let expected = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
+    )
+    .unwrap();
+    assert_eq!(config_rule_scoped_sample::GREETING, expected.trim());
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("other.rs"),
+        r#"#[test]
+fn other_test() {
+    assert_eq!(2 + 2, 4);
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// A caller's *build* scoping must not make the rule report itself broken.
+///
+/// The "filterset matched no tests" warning diagnoses a typo, and that
+/// diagnosis only follows on a listing holding the whole project. A name
+/// filter leaves the rule's test listed-but-mismatched, which nextest tags
+/// `reason: "string"`; a cargo target flag like `--test <name>` drops it from
+/// the listing outright, so there is no verdict to read and nothing is tagged
+/// `"string"` anywhere. Keying suppression on that tag therefore left every
+/// build-scoped invocation — `-p <member>` in a workspace, `--features`,
+/// `--lib`, `--test <name>` — blaming a filterset that is not at fault.
+#[test]
+fn config_rule_does_not_warn_when_the_caller_scopes_the_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_target_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    // `--test other` builds only the `other` target, so `golden_matches` is
+    // absent from the rule's listing entirely rather than mismatched in it.
+    let out = cargo_affected(dir, &["affected", "status", "-v", "--", "--test", "other"]);
+    let text = combined_output(&out);
+    assert!(
+        out.status.success(),
+        "a build-scoped passthrough must not fail rule resolution: {text}"
+    );
+    assert!(
+        !text.contains("matched no tests"),
+        "the rule's filterset is valid — the caller's `--test other` merely \
+         scoped its test out of the listing, so no filterset warning should \
+         fire: {text}"
+    );
+}

@@ -176,17 +176,29 @@ pub(crate) fn config_rule_hits(
 ///
 /// A rule whose filterset matches zero tests is surfaced as a warning rather
 /// than swallowed: a typo'd filterset would otherwise silently reopen the gap
-/// it exists to close. The warning is suppressed when a positional filter
-/// rejected something in this listing ([`Listing::name_filter_mismatch`]),
-/// because then the empty set is not evidence against the filterset: nextest
-/// reports one mismatch reason per testcase, chosen in a fixed filter order
-/// that puts name filters ahead of filtersets, so `cargo affected run --
-/// <substring>` — the ordinary way to narrow a run — would otherwise blame a
-/// filterset that is not at fault on every invocation. Keying the hit set on
-/// `reason: "expression"` instead is the mirror-image mistake: the same
-/// ordering hides the expression's verdict behind `"ignored"` too, so one
-/// `#[ignore]`d test anywhere in the project would keep the set non-empty and
-/// the warning would never fire at all.
+/// it exists to close. That diagnosis only follows when the listing is the
+/// whole project — an empty match set indicts the filterset only if every
+/// test was there to be matched. Any caller passthrough that survives into
+/// `listing_args` breaks that premise, in either of two ways nextest does not
+/// distinguish for us:
+///
+/// - a *name* filter (`cargo affected run -- <substring>`, or the libtest
+///   `-- -- --skip <name>` spelling) leaves the test listed but tagged
+///   `filter-match: { status: "mismatch", reason: "string" }`, and nextest
+///   reports one reason per testcase in a fixed order that puts name filters
+///   ahead of filtersets, so the rule's own verdict is hidden behind it;
+/// - a *build* flag (`-p`, `--lib`, `--test <name>`, `--features`) drops the
+///   testcase from the listing outright, leaving no verdict to read at all.
+///
+/// So the warning fires only on an unscoped listing — `listing_args.is_empty()`.
+/// The caller's own `-E` never counts, since [`args_without_filtersets`] has
+/// already taken it out. The cost is a missed warning on a passthrough that
+/// narrows nothing (`-- --release`); the alternative is a wrong one on every
+/// narrowed invocation, which is the failure mode this rule exists to avoid.
+/// Keying the hit set on `reason: "expression"` instead is the mirror-image
+/// mistake: the same ordering hides the expression's verdict behind
+/// `"ignored"` too, so one `#[ignore]`d test anywhere in the project would
+/// keep the set non-empty and the warning would never fire at all.
 pub(crate) fn resolve_config_hits(
     project_root: &Path,
     build_args: &[String],
@@ -218,17 +230,14 @@ pub(crate) fn resolve_config_hits(
             )
         })?;
         let Listing {
-            tests,
-            excluded,
-            name_filter_mismatch,
-            ..
+            tests, excluded, ..
         } = listing;
         let tests: BTreeSet<TestId> = tests
             .into_iter()
             .filter(|t| !excluded.contains(t))
             .collect();
         if tests.is_empty() {
-            if !name_filter_mismatch {
+            if listing_args.is_empty() {
                 eprintln!(
                     "warning: {TABLE} rule matched {} but its filterset ({:?}) \
                      matched no tests — those input changes may go untested",
