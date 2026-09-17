@@ -457,3 +457,52 @@ fn config_rule_warns_for_a_filterset_that_matches_nothing() {
          tagged `ignored` rather than `expression`: {out}"
     );
 }
+
+/// A caller's libtest-compat passthrough must not break rule resolution.
+///
+/// `args_for_listing` forwards the post-`--` args verbatim, and `--exact` /
+/// `--skip` are only accepted by `cargo nextest list` after a *second* `--`,
+/// as test-binary arguments. The rule's own `-E` used to be appended after
+/// that whole vector, landing in test-binary-argument position where nextest
+/// refuses it ("failed to parse test binary arguments `-E`"). Every
+/// `cargo affected run -- -- --skip <name>` on a project whose rule matched a
+/// changed path then died with a listing failure blamed on a filterset that
+/// was never at fault.
+#[test]
+fn config_rule_resolves_under_a_libtest_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = cargo_affected(
+        dir,
+        &[
+            "affected",
+            "status",
+            "-v",
+            "--",
+            "--",
+            "--skip",
+            "unrelated",
+        ],
+    );
+    let text = combined_output(&out);
+    assert!(
+        out.status.success(),
+        "a libtest passthrough must not fail rule resolution: {text}"
+    );
+    assert!(
+        text.contains("golden_matches (config)"),
+        "the rule still resolves to its own test: {text}"
+    );
+}

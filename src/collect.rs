@@ -1117,6 +1117,32 @@ fn drop_flags(
     out
 }
 
+/// Splice a tool-supplied `-E <expr>` into the caller's listing args, ahead of
+/// any `--` separator rather than after the whole vector.
+///
+/// Everything past a `--` in the passthrough is a *test binary* argument — the
+/// only position `cargo nextest list` accepts the libtest-compat spellings
+/// [`args_for_listing`] forwards (`--exact`, `--skip`). nextest rejects one of
+/// its own flags there outright — "failed to parse test binary arguments
+/// `-E`: arguments are unsupported" — so appending blindly turned
+/// `cargo affected run -- -- --skip foo` on a project with a matching
+/// `[*.metadata.affected]` rule into a hard listing failure — reported against
+/// a filterset that was never at fault.
+fn splice_filter_expr(list_args: &[String], filter_expr: Option<&str>) -> Vec<String> {
+    let Some(expr) = filter_expr else {
+        return list_args.to_vec();
+    };
+    let split = list_args
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(list_args.len());
+    let mut out = list_args[..split].to_vec();
+    out.push("-E".to_string());
+    out.push(expr.to_string());
+    out.extend_from_slice(&list_args[split..]);
+    out
+}
+
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
 /// pair, the subset nextest's filter excludes, plus per-binary metadata.
 pub(crate) struct Listing {
@@ -1179,9 +1205,11 @@ pub(crate) struct BinaryEntry {
 /// tag each testcase with `filter-match.status` so the selection layer can
 /// honor positional/`-E` filters the same way nextest run will.
 ///
-/// `filter_expr`, when set, passes `-E <expr>` so the listing is restricted to
-/// tests matching a nextest filterset — used to resolve `[workspace.metadata.affected]`
-/// rules to concrete tests. Leave `None` for a full listing.
+/// `filter_expr`, when set, passes `-E <expr>` so each testcase is tagged
+/// against a nextest filterset — used to resolve `[workspace.metadata.affected]`
+/// rules to concrete tests. It restricts nothing about *which* testcases the
+/// JSON reports (see [`Listing::excluded`]); it is spliced ahead of any `--`
+/// in `list_args` by [`splice_filter_expr`]. Leave `None` for a full listing.
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
@@ -1204,11 +1232,8 @@ pub(crate) fn nextest_list(
         cmd.arg("--target-dir").arg(dir);
         cmd.env("LLVM_PROFILE_FILE", dir.join("build-%p-%m.profraw"));
     }
-    for a in list_args {
+    for a in splice_filter_expr(list_args, filter_expr) {
         cmd.arg(a);
-    }
-    if let Some(expr) = filter_expr {
-        cmd.arg("-E").arg(expr);
     }
     let output = cmd
         .spawn()
@@ -1686,6 +1711,47 @@ mod tests {
             args_without_filtersets(&args),
             vec!["--features=a,b", "-p", "mycrate", "some_test_filter"],
         );
+    }
+
+    /// A rule's `-E` must land ahead of the caller's libtest separator.
+    ///
+    /// `args_for_listing` forwards a post-`--` passthrough verbatim, including
+    /// a second `--` and the `--exact`/`--skip` spellings that only work
+    /// there. Appending the rule's filterset after that vector put `-E` in
+    /// test-binary-argument position, where nextest fails the listing outright
+    /// — so `cargo affected run -- -- --skip foo` errored on any project whose
+    /// `[*.metadata.affected]` rule matched a changed path.
+    #[test]
+    fn splice_filter_expr_lands_before_a_libtest_separator() {
+        let args: Vec<String> = ["-p", "mycrate", "--", "--skip", "slow"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            splice_filter_expr(&args, Some("test(=a)")),
+            vec!["-p", "mycrate", "-E", "test(=a)", "--", "--skip", "slow"],
+        );
+    }
+
+    #[test]
+    fn splice_filter_expr_appends_without_a_separator() {
+        let args: Vec<String> = ["-p", "mycrate", "positional"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            splice_filter_expr(&args, Some("test(=a)")),
+            vec!["-p", "mycrate", "positional", "-E", "test(=a)"],
+        );
+    }
+
+    #[test]
+    fn splice_filter_expr_passes_through_without_an_expression() {
+        let args: Vec<String> = ["-p", "mycrate", "--", "--skip", "slow"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(splice_filter_expr(&args, None), args);
     }
 
     /// Regression for the Windows command-line overflow: a large affected set
