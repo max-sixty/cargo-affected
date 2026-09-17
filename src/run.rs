@@ -186,13 +186,11 @@ pub(crate) fn run(
         plan::write_selection_report(
             SelectionReport {
                 command: "run",
-                project: &project,
                 db: &db,
                 fingerprint: &fingerprint,
                 stored,
                 reach: &reach,
                 plan: &plan,
-                changed_files: &changed_files,
             },
             path,
         )?;
@@ -209,8 +207,16 @@ pub(crate) fn run(
 
     let selected = sel.selected();
     if selected.is_empty() {
-        if changed_files.is_empty() {
-            eprintln!("no uncommitted changes and no new tests — nothing to run");
+        // `since_newest`, not `changed_files`: the latter is the working tree
+        // alone, so a change committed since the last collect — the
+        // `max_commits_ahead > 0` case narrated above — would land in the
+        // "nothing changed" arm and flatly contradict that notice. Not
+        // `changed_paths.all` either: after a `collect --diff` the older
+        // anchor stays reachable, so the union permanently holds paths that
+        // collect has already accounted for, and this would claim nothing
+        // covers them on every run until `clean`.
+        if plan.changed_paths.since_newest.is_empty() {
+            eprintln!("no changes since the newest collect_sha and no new tests — nothing to run");
         } else {
             eprintln!(
                 "no tests cover the changed lines and no new tests \
