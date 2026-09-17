@@ -991,9 +991,12 @@ const RUN_ONLY_BARE: &[&str] = &[
 /// Long `cargo nextest run`-only flags that consume a value. The value may
 /// follow as a separate token (`--flag value`) or be joined (`--flag=value`).
 ///
-/// `--message-format` appears on both `list` and `run` but with disjoint
-/// value sets — `nextest_list` always passes its own `--message-format json`,
-/// so forwarding the user's would either duplicate or break the listing.
+/// Two entries are not run-only — `list` accepts them too, but forwarding
+/// them would corrupt the listing: `--message-format` appears on both with
+/// disjoint value sets (`nextest_list` always passes its own
+/// `--message-format json`, so the user's would duplicate or break it), and
+/// `--partition` must be applied exactly once, at run time (see its comment
+/// below).
 const RUN_ONLY_VALUED: &[&str] = &[
     "--retries",
     "--max-fail",
@@ -1018,6 +1021,19 @@ const RUN_ONLY_VALUED: &[&str] = &[
     // shared with `list`, which is why a filter-forwarding denylist has to
     // name this one explicitly — `cargo nextest list` rejects it.
     "--rerun",
+    // `list` shares `--partition`, but it has to be applied *once*, to the
+    // selection, at run time. Forwarded, it applies twice: the listing tags
+    // the tests outside the shard's bucket `filter-match: { status:
+    // "mismatch", reason: "partition" }`, so they land in `Listing::excluded`
+    // and drop out of the selection, and `nextest run --partition` then
+    // splits that already-split set again. With `count:`/`slice:` the buckets
+    // are positional, so the second split lands on different tests than the
+    // first: on a 4-test crate where every test is affected, `count:1/2` and
+    // `count:2/2` together run two of the four and exit 0 on both — affected
+    // tests silently skipped, which is the one failure mode this tool cannot
+    // detect downstream. (`hash:` happens to be idempotent, but the flag is
+    // one value space and is denylisted whole.)
+    "--partition",
 ];
 
 /// Short `cargo nextest run`-only flags that consume a value: `-j`
@@ -1029,9 +1045,10 @@ const RUN_ONLY_SHORT_VALUED: &[&str] = &["-j", "-R"];
 /// set as the eventual `cargo nextest run`. Everything else — cargo build
 /// flags, positional substring filters, `-E`/`--filterset` expressions,
 /// `--exact`/`--skip`/`--run-ignored` libtest-compatible options — is shared
-/// between `list` and `run` and passes through unchanged. The lone exception
-/// is `-R`/`--rerun`, a filter option `run` alone accepts; it sits in the
-/// denylist with the execution flags.
+/// between `list` and `run` and passes through unchanged. Two filter options
+/// are exceptions and sit in the denylist with the execution flags:
+/// `-R`/`--rerun`, which `run` alone accepts, and `--partition`, which both
+/// accept but which must be applied only once, to the run's selection.
 ///
 /// Run-only flags govern execution: failure handling (`--retries`,
 /// `--no-fail-fast`, `--max-fail`), test parallelism (`-j`/`--test-threads`),
@@ -1048,6 +1065,12 @@ const RUN_ONLY_SHORT_VALUED: &[&str] = &["-j", "-R"];
 /// step. That matches this repo's prefer-loud-over-silent stance: the
 /// previous build-flag *allowlist* dropped any unknown flag, so a future
 /// build flag silently produced a listing that did not match the run.
+///
+/// The `--message-format`/`--partition` class is the one that fails quietly,
+/// since `list` accepts both: a shared flag that means something different to
+/// a listing than to a run has to be recognised as such and denylisted by
+/// hand. Adding a shared *filter* flag is the case to watch — ask whether
+/// applying it to the listing and again to the run yields the same test set.
 pub(crate) fn args_for_listing(nextest_args: &[String]) -> Vec<String> {
     drop_flags(
         nextest_args,
@@ -1636,6 +1659,21 @@ mod tests {
             vec!["--rerun=latest", "--keep"],
             vec!["-R", "latest", "--keep"],
             vec!["-Rlatest", "--keep"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(args_for_listing(&args), vec!["--keep"], "for {args:?}");
+        }
+    }
+
+    #[test]
+    fn args_for_listing_drops_partition() {
+        // `--partition` is shared with `cargo nextest list`, which is exactly
+        // the problem: forwarded, the listing buckets the tests and the run
+        // buckets what's left, so `count:`/`slice:` shards together skip
+        // affected tests. Both spellings have to go.
+        for args in [
+            vec!["--partition", "count:1/2", "--keep"],
+            vec!["--partition=slice:1/3", "--keep"],
         ] {
             let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             assert_eq!(args_for_listing(&args), vec!["--keep"], "for {args:?}");
