@@ -243,12 +243,19 @@ pub(crate) fn status(
     // `run` drops phantoms from the filterset it hands nextest, so say so
     // here too — otherwise the prediction over-counts by exactly the tests
     // that can't run.
-    let phantoms = sel.selected().len() - sel.live_selected().len();
+    let live = sel.live_selected();
+    let phantoms = sel.selected().len() - live.len();
     if phantoms > 0 {
         println!(
             "{}",
             selection::phantom_notice(phantoms, "would be skipped")
         );
+    }
+    // And when the drop takes the count to zero, say that outright rather
+    // than leaving "N would run" as the last count on screen: `run`
+    // short-circuits here without invoking nextest at all.
+    if live.is_empty() {
+        println!("{}", selection::all_phantom_notice("would run"));
     }
 
     Ok(())

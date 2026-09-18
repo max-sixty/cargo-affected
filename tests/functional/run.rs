@@ -210,8 +210,13 @@ fn run_with_no_changes_reports_nothing_to_do() {
 /// `collect --diff` has handled this since it started keeping phantoms
 /// deliberately (`diff_collect_all_phantom_selection_prunes_cleanly`); `run`
 /// had no equivalent, and hands nextest only the live subset now.
+///
+/// `status` is asserted alongside because the all-phantom case is exactly
+/// where the two can disagree: the selection is non-empty, so `status` takes
+/// the "N would run" arm while `run` executes nothing. Predicting what `run`
+/// does is the invariant the shared `plan` exists to hold.
 #[test]
-fn run_with_all_phantom_selection_exits_zero() {
+fn all_phantom_selection_runs_nothing_and_status_predicts_it() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_two_module_project(dir, "sample_run_phantom");
@@ -256,6 +261,21 @@ fn run_with_all_phantom_selection_exits_zero() {
     assert!(
         !combined.contains("error: no tests to run"),
         "nextest must not be asked to run a phantom-only filterset, got:\n{combined}"
+    );
+
+    // `status` must reach the same conclusion in the conditional tense. The
+    // phantom note alone leaves the headline count contradicting it — "1 test
+    // would run" above a note saying the only selected test would be skipped.
+    let status = cargo_affected(dir, &["affected", "status"]);
+    let status_text = combined_output(&status);
+    assert!(status.status.success(), "status failed: {status_text}");
+    assert!(
+        status_text.contains("no longer in the nextest listing"),
+        "expected status to carry the phantom notice, got:\n{status_text}"
+    );
+    assert!(
+        status_text.contains("no tests would run: every selected test is absent"),
+        "expected status to predict the all-phantom short-circuit, got:\n{status_text}"
     );
 }
 

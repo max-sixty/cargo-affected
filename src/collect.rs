@@ -462,11 +462,11 @@ const STAGING_DIR_PREFIXES: &[&str] = &[
     FUNCTION_MAPS_DIR_PREFIX,
 ];
 
-/// "1 binary" / "2 binaries". The plural split lands mid-word, so this can't
-/// be a suffix interpolated after the noun the way [`plural_s`] does — doing
-/// that is what produced "1 binaryy" in the map-export line.
+/// "1 binary" / "2 binaries". The plural splits mid-word, so the noun is
+/// selected whole rather than suffixed the way [`plural_s`] does — suffixing
+/// it is what produced "1 binaryy" in the map-export line.
 fn binaries_phrase(n: usize) -> String {
-    format!("{n} binar{}", if n == 1 { "y" } else { "ies" })
+    format!("{n} {}", if n == 1 { "binary" } else { "binaries" })
 }
 
 /// The `s` in `{n} test{s}` — empty at one, `"s"` otherwise. Only correct for
@@ -1465,7 +1465,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn binaries_phrase_splits_the_noun_not_the_suffix() {
+    fn binaries_phrase_selects_the_whole_noun() {
         assert_eq!(binaries_phrase(0), "0 binaries");
         assert_eq!(binaries_phrase(1), "1 binary");
         assert_eq!(binaries_phrase(2), "2 binaries");

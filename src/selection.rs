@@ -281,6 +281,21 @@ pub(crate) fn filter_excluded_notice(count: usize, verb_phrase: &str) -> String 
     )
 }
 
+/// Format the conclusion `run` and `status` reach when *every* selected test
+/// is a phantom: there is nothing live to hand nextest, so no run happens.
+/// `verb_phrase` is "to run" for `run` and "would run" for `status`.
+///
+/// It lives beside [`phantom_notice`] because the two are halves of one
+/// statement — the note explains why the count drops, this says the drop took
+/// it to zero — and because `status` predicting something other than what
+/// `run` does is the failure [`crate::plan`] exists to prevent.
+pub(crate) fn all_phantom_notice(verb_phrase: &str) -> String {
+    format!(
+        "no tests {verb_phrase}: every selected test is absent from the \
+         current nextest listing"
+    )
+}
+
 /// Classify each `collect_sha` in `shas` against HEAD. See [`Reachability`].
 pub(crate) fn check_shas_reachable(
     project_root: &Path,
