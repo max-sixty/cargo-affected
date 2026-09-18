@@ -241,10 +241,7 @@ pub(crate) fn run(
         );
     }
     if live.is_empty() {
-        eprintln!(
-            "no tests to run: every selected test is absent from the current \
-             nextest listing"
-        );
+        eprintln!("{}", selection::all_phantom_notice("to run"));
         return Ok(0);
     }
 
