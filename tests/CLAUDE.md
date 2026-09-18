@@ -28,8 +28,10 @@ initial commit — and CI, which signs nothing, never sees it).
 Helpers in `main.rs`: `cargo_affected`, `cargo_affected_with_env` (for scenarios
 that need to influence the build, e.g. `RUSTFLAGS`), `git`, `git_head`,
 `combined_output`, `replace_in_file`, `init_git_with_initial_commit`,
-`write_two_module_project`. Scenario-specific project shapes stay private to the
-scenario file that needs them.
+`write_two_module_project`, `assert_no_staging_dirs` (no `profraw-*`,
+`results-*` or `function-maps-*` dir survives under `target/affected/`).
+Scenario-specific project shapes stay private to the scenario file that needs
+them.
 
 ## Assertions
 
