@@ -14,13 +14,26 @@ Requires `rustup component add llvm-tools` and `cargo-nextest` — both used by
 the functional test suite. Scenario conventions (unique package names, scratch-repo
 git config, assertion style, the two under-selection tripwires): `tests/CLAUDE.md`.
 
-`pre-commit run --all-files` runs the same fmt/clippy/typos gates CI does.
+`pre-commit run --all-files` runs the fmt and clippy gates CI runs, plus a
+`typos` spell check CI has no equivalent of.
 
 `benches/collect.rs` generates a deliberately *wide* crate (20,000 functions,
 120 tests) under `target/affected-bench/` and times `collect` over it, because
 collect's per-test cost scales with the binary's coverage-map size rather than
 with the test. A benchmark on a small crate measures nothing. It reports the
 fastest of several serial runs; see the file's module docs for why.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml`; `cargo update -p cargo-affected --offline`
+   carries it into `Cargo.lock`.
+2. Open a PR titled `chore: release X.Y.Z`, whose body covers the user-visible
+   changes since the last tag.
+3. Once it merges, tag the squash commit `vX.Y.Z` and push the tag.
+
+Pushing the tag is what publishes: `release.yaml` triggers on it and runs
+`cargo publish` under crates.io Trusted Publishing (GitHub OIDC, `release`
+environment), so no API token is stored. Nothing creates a GitHub release.
 
 ## Architecture
 

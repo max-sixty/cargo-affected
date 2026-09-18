@@ -4,3 +4,7 @@
 mis = "mis"
 # "raison d'être" — tokenizes to `raison`, which typos maps to "reason"/"raisin".
 raison = "raison"
+# `format!("{n} binar{}", …)` in collect.rs — the binary/binaries plural splits
+# mid-word, so the stem is deliberate. Left to typos, `--write-changes` rewrites
+# it to "binary" and the line renders "1 binaryy".
+binar = "binar"
