@@ -288,7 +288,6 @@ pub(crate) fn write_selection_report(inputs: SelectionReport, path: &Path) -> Re
             &plan.changed_ranges,
             &plan.changed_paths.all,
         )?,
-        include_changed_files: true,
     };
     Report::build_selection(report_inputs).write_json(path)
 }
