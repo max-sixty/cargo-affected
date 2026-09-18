@@ -14,8 +14,8 @@ Requires `rustup component add llvm-tools` and `cargo-nextest` — both used by
 the functional test suite. Scenario conventions (unique package names, scratch-repo
 git config, assertion style, the two under-selection tripwires): `tests/CLAUDE.md`.
 
-`pre-commit run --all-files` runs the fmt and clippy gates CI runs, plus a
-`typos` spell check CI has no equivalent of.
+`pre-commit run --all-files` runs fmt and clippy alongside `typos`, a `dbg!`
+check, and the whitespace/YAML fixers.
 
 `benches/collect.rs` generates a deliberately *wide* crate (20,000 functions,
 120 tests) under `target/affected-bench/` and times `collect` over it, because
