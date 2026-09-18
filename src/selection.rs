@@ -34,17 +34,22 @@ use crate::project::{
 /// Result of the selection computation.
 pub(crate) struct Selection {
     /// Known tests selected by line-range overlap with the changed hunks.
-    /// Excludes `#[ignore]`d tests: their coverage rows can persist from
-    /// an earlier (non-ignored) collect, but `nextest run` would skip them
-    /// — same all-ignored-selection rationale as [`new_tests`].
-    ///
-    /// [`new_tests`]: Self::new_tests
+    /// Excludes tests with `filter-match.status == "mismatch"` — `#[ignore]`d
+    /// tests whose coverage rows persisted from an earlier collect, tests
+    /// not matched by a positional/`-E` filter the user passed, and tests
+    /// the project's own `default-filter` excludes. `nextest run` would
+    /// skip every one of them; selecting them anyway can collapse the
+    /// effective set to nothing and trip nextest's "no tests to run" exit.
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
     /// `collect`. Always selected because we have no coverage data.
-    /// Excludes `#[ignore]`d tests: `nextest run` skips them, so they
-    /// never gain coverage and would otherwise read as "new" on every run.
+    /// Excludes filter-mismatched tests for the same reason as
+    /// [`affected`] above: an `#[ignore]`d or filter-excluded test would
+    /// otherwise read as `(new)` forever, since it never runs and never
+    /// gains a coverage row.
+    ///
+    /// [`affected`]: Self::affected
     pub(crate) new_tests: BTreeSet<TestId>,
     /// Tests present in the nextest listing AND in the DB, but only
     /// anchored at currently-missing collect_shas. Functionally identical
@@ -68,6 +73,20 @@ pub(crate) struct Selection {
     /// used by `collect --diff` to prune rows for tests that were renamed
     /// or removed.
     pub(crate) listed: BTreeSet<TestId>,
+    /// Tests *this change* pulled in — by coverage overlap or by a config
+    /// rule — that `listing.excluded` then dropped. Carried only so an
+    /// empty selection can be explained: "nothing covers the change" and
+    /// "the current filter removed what does" are different states, and
+    /// `run`/`status` reported the first for both. Not itself a selection —
+    /// every member is a test `nextest run` would skip.
+    ///
+    /// Excluded `new`/`stranded` tests are *not* counted, even though the
+    /// filter cost a selection there too: an excluded test that has never
+    /// been collected (`#[ignore]`d, or cut by the project's own
+    /// `default-filter`) is listed-but-excluded on every run whatever the
+    /// diff says, so counting it would make this set permanently non-empty
+    /// and blame the filter for every uncovered change in such a project.
+    pub(crate) filter_excluded: BTreeSet<TestId>,
     /// Per-file/per-test diagnostics retained at the level requested by
     /// the caller. See [`SelectionDiagnostics`].
     pub(crate) diagnostics: SelectionDiagnostics,
@@ -237,6 +256,28 @@ pub(crate) fn phantom_notice(count: usize, verb_phrase: &str) -> String {
         "note: {count} selected test{plural} {is_are} no longer in the nextest \
          listing (renamed or deleted since collect) and {verb_phrase}; \
          run `cargo affected collect` to drop the stale rows"
+    )
+}
+
+/// Format the filtered-out-selection notice shared by `run` and `status`.
+///
+/// The empty-selection arm in both commands used to have two states to
+/// explain — nothing changed, or nothing covers what changed — and told the
+/// user to run `cargo affected collect` in the second. Forwarding the
+/// caller's filters into the listing added a third: the change *is* covered,
+/// and the filter the caller passed is what removed the tests covering it.
+/// Reporting that as "no tests cover the changed lines" is false, and the
+/// remedy it names does nothing. `verb_phrase` slots into "the current
+/// filter VERB_PHRASE the N tests…" — "excludes" for `run`, "would exclude"
+/// for `status`; both are number-neutral, so the count's own plural is the
+/// only agreement to get right. Returns the body without a trailing newline
+/// so callers can `eprintln!`/`println!` it directly.
+pub(crate) fn filter_excluded_notice(count: usize, verb_phrase: &str) -> String {
+    format!(
+        "the current filter {verb_phrase} the {count} test{} this change \
+         selects (a filter passed after `--`, `#[ignore]`, or the project's \
+         nextest `default-filter`)",
+        plural_s(count),
     )
 }
 
@@ -466,11 +507,15 @@ fn newest_reachable_sha(reach: &Reachability) -> Option<&String> {
 /// - `stranded_tests = listed ∩ (all_db_tests - reachable_known_tests)`
 ///   (in DB but only at currently-missing shas).
 ///
-/// `#[ignore]`d tests are dropped from all three sets: `nextest run` skips
-/// them, so a selection of nothing but ignored tests makes `nextest run` exit
-/// non-zero. New/stranded would re-select an ignored test on every run only
-/// for it to be skipped again; `affected` would re-select a test whose
-/// coverage rows survived from a previous (non-ignored) collect after a hunk
+/// Filter-mismatched tests (`listing.excluded`) are dropped from all three
+/// sets: `nextest run` skips every one of them, so a selection of nothing
+/// but mismatched tests makes `nextest run` exit non-zero. `excluded` covers
+/// `#[ignore]`d tests, tests not matching the user's positional substring
+/// filter, tests not matching a `-E`/`--filterset` expression, and tests the
+/// project's own `default-filter` excludes — `nextest run`'s exact filter
+/// surface. New/stranded would re-select a mismatched test on every run
+/// only for it to be skipped again; `affected` would re-select a test whose
+/// coverage rows survived from a previous (matching) collect after a hunk
 /// happens to overlap them.
 ///
 /// Both `new` and `stranded` get rerun (and re-anchored, in `collect
@@ -498,11 +543,20 @@ pub(crate) fn compute(
 
     let mut new_tests = BTreeSet::new();
     let mut stranded_tests = BTreeSet::new();
+    let mut filter_excluded = BTreeSet::new();
     for t in &listed {
-        if listing.ignored.contains(t) {
-            // Skipped by `nextest run`, so it never gains coverage — must
+        if listing.excluded.contains(t) {
+            // Skipped by `nextest run` (ignored, or excluded by a positional
+            // / `-E` / default-filter), so it never gains coverage — must
             // not be treated as a new/stranded test to rerun. Stays in
             // `listed` (above) so `collect --diff`'s prune keeps its rows.
+            // Deliberately *not* recorded in `filter_excluded`: a test
+            // excluded here is excluded on every run regardless of what
+            // changed (an `#[ignore]`d test never enters the DB, so it is
+            // permanently listed-but-excluded), and counting it would blame
+            // the filter for every genuinely uncovered change in a project
+            // that has one. Only the two change-driven sources below can
+            // lose a selection *to this change's* filter.
             continue;
         }
         if reachable_known.contains(t) {
@@ -531,14 +585,22 @@ pub(crate) fn compute(
             }
             let hits = db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
-                if listing.ignored.contains(&hit.test_id) {
-                    // Coverage rows from a previous (non-ignored) collect
-                    // can survive into a state where the test is now
-                    // `#[ignore]`d (the `--diff` prune deliberately keeps
-                    // them — see `diff_collect_keeps_ignored_test_rows`).
-                    // Selecting it anyway produces the same all-ignored
+                if listing.excluded.contains(&hit.test_id) {
+                    // Coverage rows from a previous matching collect can
+                    // survive into a state where the test now fails the
+                    // current filter (newly `#[ignore]`d, dropped by a
+                    // positional / `-E` / default-filter); the `--diff`
+                    // prune deliberately keeps them (see
+                    // `diff_collect_keeps_ignored_test_rows`). Selecting
+                    // such a test anyway produces the same all-excluded
                     // → nextest exit 4 we filter against above for
-                    // new/stranded.
+                    // new/stranded. Phantoms (in the DB but absent from
+                    // the listing entirely — renamed/deleted) are NOT in
+                    // `listing.excluded` and stay in `affected`; the
+                    // `collect --diff` flow uses the live/phantom split
+                    // in `handle_no_profraw_dirs` to discriminate them
+                    // from a runner-shim failure.
+                    filter_excluded.insert(hit.test_id);
                     continue;
                 }
                 affected.insert(hit.test_id.clone());
@@ -564,14 +626,20 @@ pub(crate) fn compute(
     // `[workspace.metadata.affected]` rule. Coverage can't link these inputs to tests, so
     // the rule supplies the edge. A reachable-known test that isn't already
     // `affected` would otherwise be skipped — rescue it as a `config_test`.
-    // New/stranded matches already run; ignored ones stay skipped by nextest.
+    // New/stranded matches already run; filter-excluded ones stay skipped by nextest.
     let mut config_tests = BTreeSet::new();
     for (path, tests) in config_hits {
         for test in tests {
-            if listing.ignored.contains(test)
-                || affected.contains(test)
-                || !reachable_known.contains(test)
-            {
+            if listing.excluded.contains(test) {
+                // The rule would have rescued it — `affected` can't already
+                // hold an excluded test, so reachable-known is the whole
+                // condition left.
+                if reachable_known.contains(test) {
+                    filter_excluded.insert(test.clone());
+                }
+                continue;
+            }
+            if affected.contains(test) || !reachable_known.contains(test) {
                 continue;
             }
             config_tests.insert(test.clone());
@@ -611,6 +679,7 @@ pub(crate) fn compute(
         config_tests,
         reachable_known_count,
         listed,
+        filter_excluded,
         diagnostics,
     })
 }
@@ -705,6 +774,7 @@ mod tests {
             config_tests: config_tests.iter().cloned().collect(),
             reachable_known_count,
             listed,
+            filter_excluded: BTreeSet::new(),
             diagnostics: SelectionDiagnostics {
                 per_file: BTreeMap::new(),
                 per_test: None,
@@ -775,6 +845,13 @@ mod tests {
 
         assert_eq!(sel.selected().len(), 2);
         assert_eq!(sel.live_selected(), BTreeSet::from([live]));
+    }
+
+    #[test]
+    fn filter_excluded_notice_agrees_in_number() {
+        assert!(filter_excluded_notice(1, "excludes").contains("excludes the 1 test this change"));
+        assert!(filter_excluded_notice(2, "would exclude")
+            .contains("would exclude the 2 tests this change"));
     }
 
     #[test]

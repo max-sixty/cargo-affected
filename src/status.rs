@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::{cargo_build_args, plural_s, require_nextest};
+use crate::collect::{args_for_listing, plural_s, require_nextest};
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
 use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
@@ -187,7 +187,7 @@ pub(crate) fn status(
         &fingerprint.hex,
         &reach,
         &changed_files,
-        &cargo_build_args(nextest_args),
+        &args_for_listing(nextest_args),
         detail,
     )?;
     let sel = &plan.selection;
@@ -225,6 +225,12 @@ pub(crate) fn status(
         if plan.changed_paths.since_newest.is_empty() {
             println!(
                 "\nno changes since the newest collect_sha and no new tests — nothing would run"
+            );
+        } else if !sel.filter_excluded.is_empty() {
+            // Same third arm as `run` — see `filter_excluded_notice`.
+            println!(
+                "\nno tests would run: {}",
+                selection::filter_excluded_notice(sel.filter_excluded.len(), "would exclude")
             );
         } else {
             println!("\nno tests cover the changed lines and no new tests");

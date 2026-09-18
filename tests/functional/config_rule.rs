@@ -188,3 +188,413 @@ fn config_rule_inert_when_no_glob_matches() {
         "the GREETING edit should still select the test via coverage: {out}"
     );
 }
+
+/// Same golden-file shape, but with two tests the rule's filterset does *not*
+/// name — the shape that catches a rule resolving to the whole project.
+fn write_multi_test_golden_project(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "config-rule-multi-sample"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
+
+    let tests = dir.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("golden.rs"),
+        r#"#[test]
+fn golden_matches() {
+    let expected = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
+    )
+    .unwrap();
+    assert_eq!(config_rule_multi_sample::GREETING, expected.trim());
+}
+
+#[test]
+fn unrelated_one() {
+    assert_eq!(2 + 2, 4);
+}
+
+#[test]
+fn unrelated_two() {
+    assert_eq!(3 * 3, 9);
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// A rule resolves to the tests its filterset *matches*, not to every test in
+/// the project.
+///
+/// `cargo nextest list -E <filterset>` reports every testcase and tags the
+/// non-matches `filter-match: { status: "mismatch", reason: "expression" }` —
+/// it does not omit them. Reading the listing's test set whole made a rule that
+/// matched one changed path force-select the entire suite, which is both wrong
+/// (unrelated tests run) and invisible (they pass).
+#[test]
+fn config_rule_selects_only_the_tests_its_filterset_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
+    assert!(
+        out.contains("selection=1/3"),
+        "only the filterset's test should be selected (1 of 3): {out}"
+    );
+    assert!(
+        out.contains("1 config"),
+        "expected exactly one config hit: {out}"
+    );
+    assert!(
+        out.contains("golden_matches (config)"),
+        "golden_matches is the test the filterset names: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_one") && !out.contains("unrelated_two"),
+        "tests the filterset doesn't name must not be config-selected: {out}"
+    );
+}
+
+/// The caller's own `-E` must not leak into the rule-resolution listing.
+///
+/// `run`/`status` forward the post-`--` filters to `cargo nextest list` so the
+/// listing matches what `nextest run` will admit — but nextest *unions*
+/// repeated `-E` flags, so passing the user's expression alongside a rule's
+/// filterset would make every test the user's expression matches a hit for
+/// that rule. Here `-E test(=unrelated_one)` is the user's filter and the
+/// rule names `golden_matches`: the rule's test is filtered out by the user,
+/// so nothing is config-selected — and `unrelated_one` in particular must not
+/// be, since no rule names it.
+#[test]
+fn config_rule_ignores_the_callers_filterset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(
+        dir,
+        &[
+            "affected",
+            "status",
+            "-v",
+            "--",
+            "-E",
+            "test(=unrelated_one)",
+        ],
+    ));
+    assert!(
+        out.contains("selection=0/3"),
+        "the rule's own test is excluded by the caller's filter, so nothing is \
+         selected: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_one"),
+        "the caller's filterset must not turn its own matches into config hits: {out}"
+    );
+}
+
+/// A caller's positional filter must not make the rule report itself broken.
+///
+/// The rule listing keeps the caller's positional substring filters (nextest
+/// intersects them with the rule's filterset, so they can only narrow the rule
+/// toward what `nextest run` will admit). Resolving the rule against the whole
+/// `filter-match: mismatch` set therefore made the rule's own test look like a
+/// non-match whenever a positional excluded it, collapsing the rule to nothing
+/// and firing the "matched no tests" warning — whose whole purpose is catching
+/// a typo'd filterset — against a filterset that is not at fault. The `-E`
+/// spelling of the same narrowing never warned, because the caller's filtersets
+/// are stripped from the rule listing.
+#[test]
+fn config_rule_does_not_warn_when_the_caller_filters_its_test_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(
+        dir,
+        &["affected", "status", "-v", "--", "unrelated"],
+    ));
+    assert!(
+        !out.contains("matched no tests"),
+        "the rule's filterset is valid — only the caller's positional excluded \
+         its test, so no filterset warning should fire: {out}"
+    );
+    assert!(
+        out.contains("selection=0/3"),
+        "the rule's test is filtered out by the caller, so nothing runs: {out}"
+    );
+    assert!(
+        !out.contains("unrelated_one") && !out.contains("unrelated_two"),
+        "the caller's positional must not turn its own matches into config \
+         hits: {out}"
+    );
+}
+
+/// Crate shaped like [`write_multi_test_golden_project`] but carrying an
+/// `#[ignore]`d test, which is what makes the filterset warning's keying
+/// observable.
+fn write_ignored_test_golden_project(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "config-rule-ignored-sample"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
+
+    let tests = dir.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("golden.rs"),
+        r#"#[test]
+fn golden_matches() {
+    let expected = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
+    )
+    .unwrap();
+    assert_eq!(config_rule_ignored_sample::GREETING, expected.trim());
+}
+
+#[test]
+#[ignore]
+fn ignored_one() {}
+"#,
+    )
+    .unwrap();
+}
+
+/// A filterset that matches nothing must warn even when some other filter
+/// rejected a test first.
+///
+/// nextest reports exactly one `filter-match` reason per testcase, chosen in a
+/// fixed filter order that puts `#[ignore]` and positional substring filters
+/// ahead of filtersets. So a test the rule's own `-E` rejects comes back
+/// tagged `ignored` (or `string`) whenever one of those rejects it too, and a
+/// rule's hit set computed as "everything not tagged `expression`" stays
+/// non-empty no matter how broken the filterset is: one `#[ignore]`d test
+/// anywhere in the project was enough to swallow the warning entirely, which
+/// is the only thing standing between a typo'd filterset and inputs that
+/// silently go untested.
+#[test]
+fn config_rule_warns_for_a_filterset_that_matches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_ignored_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=no_such_test)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
+    assert!(
+        out.contains("matched no tests"),
+        "a filterset matching nothing must warn even though `ignored_one` is \
+         tagged `ignored` rather than `expression`: {out}"
+    );
+}
+
+/// A caller's libtest-compat passthrough must not break rule resolution.
+///
+/// `args_for_listing` forwards the post-`--` args verbatim, and `--exact` /
+/// `--skip` are only accepted by `cargo nextest list` after a *second* `--`,
+/// as test-binary arguments. The rule's own `-E` used to be appended after
+/// that whole vector, landing in test-binary-argument position where nextest
+/// refuses it ("failed to parse test binary arguments `-E`"). Every
+/// `cargo affected run -- -- --skip <name>` on a project whose rule matched a
+/// changed path then died with a listing failure blamed on a filterset that
+/// was never at fault.
+#[test]
+fn config_rule_resolves_under_a_libtest_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_multi_test_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    let out = cargo_affected(
+        dir,
+        &[
+            "affected",
+            "status",
+            "-v",
+            "--",
+            "--",
+            "--skip",
+            "unrelated",
+        ],
+    );
+    let text = combined_output(&out);
+    assert!(
+        out.status.success(),
+        "a libtest passthrough must not fail rule resolution: {text}"
+    );
+    assert!(
+        text.contains("golden_matches (config)"),
+        "the rule still resolves to its own test: {text}"
+    );
+}
+
+/// Crate shaped like [`write_multi_test_golden_project`] but splitting its
+/// tests across two integration targets, so a cargo target flag (`--test
+/// <name>`) can scope the listing without naming any test.
+fn write_two_target_golden_project(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "config-rule-scoped-sample"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
+
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("golden.txt"), "hello\n").unwrap();
+
+    let tests = dir.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("golden.rs"),
+        r#"#[test]
+fn golden_matches() {
+    let expected = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
+    )
+    .unwrap();
+    assert_eq!(config_rule_scoped_sample::GREETING, expected.trim());
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("other.rs"),
+        r#"#[test]
+fn other_test() {
+    assert_eq!(2 + 2, 4);
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// A caller's *build* scoping must not make the rule report itself broken.
+///
+/// The "filterset matched no tests" warning diagnoses a typo, and that
+/// diagnosis only follows on a listing holding the whole project. A name
+/// filter leaves the rule's test listed-but-mismatched, which nextest tags
+/// `reason: "string"`; a cargo target flag like `--test <name>` drops it from
+/// the listing outright, so there is no verdict to read and nothing is tagged
+/// `"string"` anywhere. Keying suppression on that tag therefore left every
+/// build-scoped invocation — `-p <member>` in a workspace, `--features`,
+/// `--lib`, `--test <name>` — blaming a filterset that is not at fault.
+#[test]
+fn config_rule_does_not_warn_when_the_caller_scopes_the_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_target_golden_project(dir);
+    add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+    // `--test other` builds only the `other` target, so `golden_matches` is
+    // absent from the rule's listing entirely rather than mismatched in it.
+    let out = cargo_affected(dir, &["affected", "status", "-v", "--", "--test", "other"]);
+    let text = combined_output(&out);
+    assert!(
+        out.status.success(),
+        "a build-scoped passthrough must not fail rule resolution: {text}"
+    );
+    assert!(
+        !text.contains("matched no tests"),
+        "the rule's filterset is valid — the caller's `--test other` merely \
+         scoped its test out of the listing, so no filterset warning should \
+         fire: {text}"
+    );
+}
