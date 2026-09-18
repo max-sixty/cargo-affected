@@ -40,10 +40,17 @@ seconds, so a snapshot would need enough redaction to be worth less than the
 targeted assertion it replaced. That is why there is no `insta` dependency here,
 notwithstanding the general Rust preference for it.
 
-Stderr carries selection summaries and notices, stdout carries `status` output
-and nextest's PASS/FAIL lines. `combined_output` concatenates stderr-then-stdout
-so a scenario can grep both without caring which side a message landed on; reach
-for `out.stdout` directly only when the stream itself is the thing under test.
+Stderr carries selection summaries and notices — `run`'s and `collect`'s — *and*
+nextest's own PASS/FAIL lines, since nextest writes its entire human-readable
+run to stderr. `status` splits the other way: only its `cargo-affected: cache=…`
+summary line, `checking for new tests...` and the `warning:` lines (an untracked
+`.rs` file, a config rule whose filterset selected nothing) go to stderr, and
+everything else it prints goes to stdout — the inventory, the full-suite miss
+explanations, the stale-sha and divergence `note:` lines, the changed-files
+list, the conditional-tense plan. `combined_output` concatenates
+stderr-then-stdout so a scenario can grep both without caring which side a
+message landed on; reach for `out.stdout` directly only when the stream itself
+is the thing under test.
 
 ## Regression tests
 
