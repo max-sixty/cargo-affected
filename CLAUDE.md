@@ -14,13 +14,26 @@ Requires `rustup component add llvm-tools` and `cargo-nextest` — both used by
 the functional test suite. Scenario conventions (unique package names, scratch-repo
 git config, assertion style, the two under-selection tripwires): `tests/CLAUDE.md`.
 
-`pre-commit run --all-files` runs the same fmt/clippy/typos gates CI does.
+`pre-commit run --all-files` runs fmt and clippy alongside `typos`, a `dbg!`
+check, and the whitespace/YAML fixers.
 
 `benches/collect.rs` generates a deliberately *wide* crate (20,000 functions,
 120 tests) under `target/affected-bench/` and times `collect` over it, because
 collect's per-test cost scales with the binary's coverage-map size rather than
 with the test. A benchmark on a small crate measures nothing. It reports the
 fastest of several serial runs; see the file's module docs for why.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml`; `cargo update -p cargo-affected --offline`
+   carries it into `Cargo.lock`.
+2. Open a PR titled `chore: release X.Y.Z`, whose body covers the user-visible
+   changes since the last tag.
+3. Once it merges, tag the squash commit `vX.Y.Z` and push the tag.
+
+Pushing the tag is what publishes: `release.yaml` triggers on it and runs
+`cargo publish` under crates.io Trusted Publishing (GitHub OIDC, `release`
+environment), so no API token is stored. Nothing creates a GitHub release.
 
 ## Architecture
 
@@ -34,7 +47,8 @@ fastest of several serial runs; see the file's module docs for why.
 - `selection.rs` — Shared between `run`, `status`, and `collect --diff`. Owns reachability classification (`check_shas_reachable`), per-sha diff collection (`changed_ranges_per_sha`), the divergence notice, and the selection itself: affected + config + new + stranded, where config hits (from `config.rs`) are a disjoint category that never inflates the coverage-overlap counts.
 - `config.rs` — Declarative input→test rules from `[workspace.metadata.affected]` (or `[package.metadata.affected]` for single-crate projects). Each `[[rule]]` pairs input globs with a nextest filterset; when a changed path matches, `cargo nextest list -E` resolves the filterset and those tests are force-selected. Closes the blind spot where a test reads a non-Rust file at runtime (an insta `.snap`, a doc `.md`) that has no coverage row, so a change to it would otherwise select no test. No rules means no extra `nextest list` call.
 - `plan.rs` — The decision `run` and `status` share, held in one place so a dry run can't predict something other than what runs: list tests, diff against every reachable `collect_sha`, apply config rules, select, classify `hit-exact` vs `hit-with-divergence`, and assemble either report shape. It was two hand-maintained copies annotated "mirrors the other", and they had drifted — `run` listed with the caller's build flags while `status` listed with none, so a feature-gated test was invisible to `status` and visible to `run`. `run.rs` and `status.rs` now hold only what differs for real: which stream, which tense, and whether anything gets executed at the end.
-- `run.rs` — `collect_shas` → reachability → [`plan`] → `nextest run` against the generated filter config. Widens to all tests only when every sha is diverged.
+- `report.rs` — Both renderings of what `plan` decided. `summary_line` builds the `cargo-affected: cache=… selection=…` line `run` and `status` print to stderr; `fingerprint_miss_clause` is its sibling, formatting the parenthetical in the separate `no coverage data for the current environment …` message those two print on a fingerprint miss — `run` on stderr under a `note:` prefix, `status` bare on stdout. On that path `summary_line` itself renders `cache=miss-fingerprint mode=full-suite`, with no `selection=` field, so the two never compose. The `Report` struct is the artifact they write to `--report-json PATH`. The JSON is versioned (`schema_version`, currently v1) and exists to make selection self-explanatory: on a hit, which file pulled which test in by which mechanism; on a miss, which fingerprint component differs from the closest stored snapshot. `--report-detail` picks the depth — `summary` (default) keeps bounded per-file aggregates, `full` adds per-test reason vectors, which run to megabytes on a large suite. `write_json` stages at a sibling `.json.tmp` path and renames, so a killed process never leaves a half-written artifact at the requested path. Schema reference: `docs/report-json.md`.
+- `run.rs` — `collect_shas` → reachability → [`plan`] → `nextest run` against the generated filter config. Widens to all tests whenever the cache can't anchor a diff — no coverage, fingerprint miss, or no reachable `collect_sha` (all missing from the repo); a reachable-but-diverged sha keeps the partial selection (`hit-with-divergence`).
 - `status.rs` — The conditional-tense rendering of the same plan, plus a database inventory on stdout. Takes the same post-`--` passthrough as `run`, because the build flags decide which tests exist to predict about.
 
 ## Principles

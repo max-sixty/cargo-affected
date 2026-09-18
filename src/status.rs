@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::{cargo_build_args, require_nextest};
+use crate::collect::{cargo_build_args, plural_s, require_nextest};
 use crate::db::{db_path, warn_untracked_rs_files, Db};
 use crate::fingerprint;
 use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
@@ -108,7 +108,7 @@ pub(crate) fn status(
             println!(
                 "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
                 selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
-                if reach.missing.len() == 1 { "" } else { "s" },
+                plural_s(reach.missing.len()),
             );
         }
     }
@@ -196,13 +196,11 @@ pub(crate) fn status(
         plan::write_selection_report(
             SelectionReport {
                 command: "status",
-                project: &project,
                 db: &db,
                 fingerprint: &fingerprint,
                 stored,
                 reach: &reach,
                 plan: &plan,
-                changed_files: &changed_files,
             },
             report_path,
         )?;
@@ -219,8 +217,15 @@ pub(crate) fn status(
     );
 
     if sel.selected().is_empty() {
-        if changed_files.is_empty() {
-            println!("\nno uncommitted changes and no new tests — nothing would run");
+        // See the matching arm in `run` for why this is `since_newest` rather
+        // than either `changed_files` (the working tree alone, which would
+        // call a committed-but-uncollected change "no changes" one line under
+        // the "N commit(s) since collect" notice) or `changed_paths.all`
+        // (which never empties again after a `collect --diff`).
+        if plan.changed_paths.since_newest.is_empty() {
+            println!(
+                "\nno changes since the newest collect_sha and no new tests — nothing would run"
+            );
         } else {
             println!("\nno tests cover the changed lines and no new tests");
         }
@@ -228,6 +233,17 @@ pub(crate) fn status(
     }
 
     println!("\n{}", selection::format_summary(sel, "would run", verbose));
+
+    // `run` drops phantoms from the filterset it hands nextest, so say so
+    // here too — otherwise the prediction over-counts by exactly the tests
+    // that can't run.
+    let phantoms = sel.selected().len() - sel.live_selected().len();
+    if phantoms > 0 {
+        println!(
+            "{}",
+            selection::phantom_notice(phantoms, "would be skipped")
+        );
+    }
 
     Ok(())
 }

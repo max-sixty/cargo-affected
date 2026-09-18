@@ -26,7 +26,6 @@ use serde_json::Value;
 use crate::collect::nextest_list;
 use crate::db::TestId;
 use crate::project::ProjectRoot;
-use crate::selection::{changed_paths_since, ChangedRangesBySha, Reachability};
 
 /// Where rules live, for user-facing error messages. The `*` shorthand covers
 /// both locations — `[workspace.metadata.affected]` and the single-crate
@@ -125,32 +124,29 @@ impl InputRule {
     }
 }
 
-/// Load the `affected` rules for `project`, and if any, resolve them against the
-/// paths changed since any reachable `collect_sha` (plus working-tree changes).
-/// Returns the path→tests map [`compute`](crate::selection::compute) folds in.
+/// Load the `affected` rules for `project`, and if any, resolve them against
+/// `changed_paths` — every path that differs from any reachable `collect_sha`
+/// or from HEAD, unioned by [`changed_paths_since`](crate::selection::changed_paths_since)
+/// in [`crate::plan::plan`]. Returns the path→tests map
+/// [`compute`](crate::selection::compute) folds in.
 ///
-/// The no-rules fast path returns an empty map without computing changed paths
-/// or invoking nextest, so a project without the table pays nothing.
+/// The no-rules fast path returns an empty map without invoking nextest, so a
+/// project without the table still pays nothing for the expensive half. It no
+/// longer skips computing the changed paths — those moved up to `plan`, which
+/// needs them anyway to tell "nothing changed" from "nothing covers what
+/// changed" — but that's one `git diff --name-only` per reachable sha against
+/// a `nextest list` that has to build the test binaries.
 pub(crate) fn config_rule_hits(
     project: &ProjectRoot,
     build_args: &[String],
-    reach: &Reachability,
-    changed_ranges_by_sha: &ChangedRangesBySha,
-    working_tree_files: &[String],
+    changed_paths: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let rules =
         AffectedConfig::from_metadata(&project.metadata, &project.workspace_root)?.compile()?;
     if rules.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let project_root = &project.workspace_root;
-    let changed_paths = changed_paths_since(
-        project_root,
-        reach,
-        changed_ranges_by_sha,
-        working_tree_files,
-    )?;
-    resolve_config_hits(project_root, build_args, &rules, &changed_paths)
+    resolve_config_hits(&project.workspace_root, build_args, &rules, changed_paths)
 }
 
 /// Resolve compiled rules against the changed paths, returning a map from each
