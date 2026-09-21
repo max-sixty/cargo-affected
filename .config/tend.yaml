@@ -17,10 +17,14 @@ workflows:
 # json` schema, `filter-match.status`, the generated `default-filter` config),
 # so a sandbox on a newer release would let a session report "verified" against
 # a nextest that CI never runs. Bump both together.
-# `shell: bash` is not redundant with the runner default: it selects
-# `bash --noprofile --norc -eo pipefail`, and the `pipefail` half is what makes
-# the `curl | tar` line fail on a bad download instead of reporting tar's
-# success. GitHub's default `run:` shell is `bash -e`, which would mask it.
+#
+# `shell: bash` is carried over from what `sandbox_setup` emitted, which is why
+# the regenerated workflows are byte-identical. It selects
+# `bash --noprofile --norc -eo pipefail`, where a bare `run:` would get the
+# runner default of `bash -e` and report only `tar`'s status for the
+# `curl | tar` line. `tar` exits non-zero on a truncated or empty stream, so
+# `-e` alone already catches an ordinary bad download; `pipefail` covers the
+# residue — a `curl` that fails after `tar` has the whole archive.
 setup:
   - run: |-
       rustup component add llvm-tools
