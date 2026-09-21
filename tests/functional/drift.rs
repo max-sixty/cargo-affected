@@ -65,8 +65,9 @@ fn sibling_collect_sha_status_uses_selection() {
     // undetectable downstream. Pin the two halves the name claims
     // positively: the cache stayed usable, and it produced a selection.
     assert!(
-        combined.contains("cache=hit"),
-        "sibling collect_sha must leave the cache usable, got:\n{combined}"
+        combined.contains("cache=hit-with-divergence"),
+        "sibling collect_sha must leave the cache usable and be classified \
+         as diverged, got:\n{combined}"
     );
     assert!(
         combined.contains("tests would run"),
@@ -75,11 +76,13 @@ fn sibling_collect_sha_status_uses_selection() {
     );
 }
 
-/// The other half of the pair. Every other assertion in the suite about the
-/// missing-sha notice is a negative one (`!contains("not in the repo")`), so
-/// nothing pinned the wording — or the emission — of the path those negatives
-/// are defined against. This asserts it positively: a collect_sha the repo has
-/// genuinely lost must both raise the notice and widen to the full suite.
+/// The other half of the pair. The missing-sha notice itself is already pinned
+/// positively by `run_unions_affected_and_stranded_when_sha_is_missing` in
+/// `diff_collect.rs` — but only on the partial-divergence path, where a second
+/// sha survives and the lost one's tests come back as `stranded`. The branch
+/// where the *only* collect_sha is gone is what nothing covers: it reaches
+/// `CacheMiss::NoReachableSha` and widens to the full suite, and
+/// `"would run all tests"` is asserted positively nowhere else in the suite.
 #[test]
 fn missing_collect_sha_status_widens_to_all_tests() {
     let tmp = tempfile::tempdir().unwrap();
