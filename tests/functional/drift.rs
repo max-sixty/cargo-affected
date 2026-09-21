@@ -6,7 +6,8 @@
 //! "would run all tests" path.
 
 use crate::{
-    cargo_affected, git, git_head, init_git_with_initial_commit, write_two_module_project,
+    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit,
+    write_two_module_project,
 };
 
 #[test]
@@ -47,14 +48,30 @@ fn sibling_collect_sha_status_uses_selection() {
         String::from_utf8_lossy(&status.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&status.stdout);
+    let combined = combined_output(&status);
     assert!(
-        !stdout.contains("would run all tests"),
-        "sibling collect_sha must not trigger full-suite widening, got:\n{stdout}"
+        !combined.contains("would run all tests"),
+        "sibling collect_sha must not trigger full-suite widening, got:\n{combined}"
     );
     assert!(
-        !stdout.contains("not in the repo"),
-        "sibling collect_sha must not be reported as missing, got:\n{stdout}"
+        !combined.contains("not in the repo"),
+        "sibling collect_sha must not be reported as missing, got:\n{combined}"
+    );
+    // Those two negatives hold just as well on an *empty* selection: that
+    // path prints "no tests cover the changed lines and no new tests" and
+    // neither forbidden string, so on its own the scenario would stay green
+    // through a sibling sha that stopped anchoring the diff at all — silent
+    // under-selection, the failure mode `tests/CLAUDE.md` calls out as
+    // undetectable downstream. Pin the two halves the name claims
+    // positively: the cache stayed usable, and it produced a selection.
+    assert!(
+        combined.contains("cache=hit"),
+        "sibling collect_sha must leave the cache usable, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("tests would run"),
+        "sibling collect_sha must still select the tests covering the diff, \
+         got:\n{combined}"
     );
 }
 
