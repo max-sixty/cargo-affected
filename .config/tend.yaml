@@ -6,18 +6,25 @@ workflows:
 
 # The functional suite shells out to `cargo nextest` and to the `llvm-tools`
 # binaries (`llvm-profdata`, `llvm-cov`) — see CLAUDE.md. Neither ships with the
-# runner image, and a `setup:` install lands under the *runner's* home, which the
-# sandbox does not inherit, so they belong here. Each install is followed by an
-# assertion so a broken toolchain fails setup rather than surfacing mid-session,
-# per this repo's "fail loudly, no fallback paths" principle.
+# runner image, so they are installed here, before the agent starts: the agent
+# sees the job's own checkout and home, so what this step installs is on its
+# PATH. Each install is followed by an assertion so a broken toolchain fails
+# setup rather than surfacing mid-session, per this repo's "fail loudly, no
+# fallback paths" principle.
 #
 # The nextest version tracks the `=0.9.132` pin in `ci.yaml` — what agents
 # verify against nextest is nextest's own surface (the `list --message-format
 # json` schema, `filter-match.status`, the generated `default-filter` config),
 # so a sandbox on a newer release would let a session report "verified" against
 # a nextest that CI never runs. Bump both together.
-sandbox_setup:
-  - rustup component add llvm-tools
-  - test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
-  - curl -sSfL https://get.nexte.st/0.9.132/linux | tar zxf - -C "$HOME/.cargo/bin"
-  - cargo nextest --version
+# `shell: bash` is not redundant with the runner default: it selects
+# `bash --noprofile --norc -eo pipefail`, and the `pipefail` half is what makes
+# the `curl | tar` line fail on a bad download instead of reporting tar's
+# success. GitHub's default `run:` shell is `bash -e`, which would mask it.
+setup:
+  - run: |-
+      rustup component add llvm-tools
+      test -x "$(rustc --print target-libdir)/../bin/llvm-profdata"
+      curl -sSfL https://get.nexte.st/0.9.132/linux | tar zxf - -C "$HOME/.cargo/bin"
+      cargo nextest --version
+    shell: bash
