@@ -142,4 +142,18 @@ fn missing_collect_sha_status_widens_to_all_tests() {
         stdout.contains("would run all tests"),
         "the only collect_sha being missing must widen to the full suite, got:\n{stdout}"
     );
+    // The missing-sha notice is shared with the case where *some* sha still
+    // anchors a diff, and there its tests do come back as the `stranded`
+    // selection category. Here there is no selection at all, so promising
+    // `stranded` contradicts the widening notice printed right after it.
+    assert!(
+        !stdout.contains("stranded"),
+        "with no reachable sha nothing is selected, so the missing-sha \
+         notice must not promise the 'stranded' category, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("would rerun as part of the full suite"),
+        "the missing-sha notice should say the full suite covers those \
+         tests, got:\n{stdout}"
+    );
 }

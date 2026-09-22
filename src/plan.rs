@@ -83,6 +83,19 @@ impl CacheState {
             Self::Miss(CacheMiss::NoCoverage | CacheMiss::Fingerprint { .. }) => None,
         }
     }
+
+    /// Whether tests anchored only at a missing `collect_sha` come back as
+    /// the `stranded` selection category.
+    ///
+    /// The missing-sha notice is emitted from one place for both states
+    /// [`reachability`](Self::reachability) answers for, but their outcomes
+    /// differ: with a surviving sha there is a selection to join, so those
+    /// tests are `stranded`; with none there is no selection at all and the
+    /// whole suite runs. The callers own the wording (and its tense), so
+    /// this owns the distinction they both branch on.
+    pub(crate) fn strands_missing_sha_tests(&self) -> bool {
+        matches!(self, Self::Usable(_))
+    }
 }
 
 impl CacheMiss {

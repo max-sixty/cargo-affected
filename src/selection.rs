@@ -210,11 +210,17 @@ pub(crate) struct Reachability {
     pub(crate) max_commits_ahead: u32,
 }
 
-/// Format the partial-divergence notice shared by `run`, `status`, and
+/// Format the missing-sha notice shared by `run`, `status`, and
 /// `collect --diff`. `verb_phrase` slots into "tests anchored only there
-/// VERB_PHRASE" — "will rerun as 'new'" for `run`/`collect --diff`, "would
-/// rerun as 'new'" for `status`. Returns the body without a trailing
-/// newline so callers can `eprintln!`/`println!` it directly.
+/// VERB_PHRASE", and the caller picks it: those tests' fate turns on both
+/// the command and whether any other sha survived, so it is not derivable
+/// here. `run` and `status` say "rerun as 'stranded'" when one did and
+/// "rerun as part of the full suite" when none did (see
+/// [`CacheState::strands_missing_sha_tests`](crate::plan::CacheState::strands_missing_sha_tests)),
+/// each in its own tense; `collect --diff` says "will be rerun and
+/// re-anchored at the new HEAD", and bails outright when no sha survives.
+/// Returns the body without a trailing newline so callers can
+/// `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {
     let plural = plural_s(missing.len());
     let list = missing.iter().cloned().collect::<Vec<_>>().join(", ");
