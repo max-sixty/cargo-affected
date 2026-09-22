@@ -105,9 +105,14 @@ pub(crate) fn status(
     if let Some(reach) = state.reachability() {
         if !reach.missing.is_empty() {
             let stale_rows = db.region_count_at_shas(&fingerprint.hex, &reach.missing)?;
+            let fate = if state.strands_missing_sha_tests() {
+                "would rerun as 'stranded'"
+            } else {
+                "would rerun as part of the full suite"
+            };
             println!(
                 "\n{}\nstale rows: {stale_rows} (anchored at missing sha{})",
-                selection::missing_shas_notice(&reach.missing, "would rerun as 'stranded'"),
+                selection::missing_shas_notice(&reach.missing, fate),
                 plural_s(reach.missing.len()),
             );
         }

@@ -771,6 +771,15 @@ fn plan_diff_collect(
         );
     }
     let reach = selection::check_shas_reachable(project_root, &prior_shas)?;
+    if reach.reachable.is_empty() {
+        bail!(
+            "no reachable collect_sha for the current environment (every \
+             stored sha is rebased away or otherwise unreachable from HEAD); \
+             run `cargo affected collect` to re-anchor"
+        );
+    }
+    // Below the bail, not above it: the notice promises a rerun and a
+    // re-anchor, and on that path neither happens.
     if !reach.missing.is_empty() {
         eprintln!(
             "{}",
@@ -778,13 +787,6 @@ fn plan_diff_collect(
                 &reach.missing,
                 "will be rerun and re-anchored at the new HEAD",
             ),
-        );
-    }
-    if reach.reachable.is_empty() {
-        bail!(
-            "no reachable collect_sha for the current environment (every \
-             stored sha is rebased away or otherwise unreachable from HEAD); \
-             run `cargo affected collect` to re-anchor"
         );
     }
     if reach.max_commits_ahead > 0 {
