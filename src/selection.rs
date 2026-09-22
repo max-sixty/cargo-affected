@@ -217,8 +217,10 @@ pub(crate) struct Reachability {
 /// here. `run` and `status` say "rerun as 'stranded'" when one did and
 /// "rerun as part of the full suite" when none did (see
 /// [`CacheState::strands_missing_sha_tests`](crate::plan::CacheState::strands_missing_sha_tests)),
-/// each in its own tense; `collect --diff` says "will be rerun and
-/// re-anchored at the new HEAD", and bails outright when no sha survives.
+/// each in its own tense; `collect --diff` bails when no sha survives and
+/// otherwise says "will be rerun and re-anchored at the new HEAD" — it emits
+/// the notice below that bail, so the promise is only ever made where it
+/// holds.
 /// Returns the body without a trailing newline so callers can
 /// `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {

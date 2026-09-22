@@ -758,3 +758,65 @@ fn diff_collect_clean_tree_exits_zero() {
         "clean-tree --diff should leave test_regions row count unchanged"
     );
 }
+
+/// The second error path the module doc names — every stored `collect_sha`
+/// gone from the repo — which nothing pinned;
+/// [`diff_collect_errors_with_no_prior_collect`] covers the other one. It is
+/// also where the missing-sha notice meets the bail: nothing is rerun or
+/// re-anchored here, so the notice must not promise that it will be.
+#[test]
+fn diff_collect_errors_when_every_sha_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_all_shas_missing");
+    init_git_with_initial_commit(dir);
+    let init_sha = git_head(dir);
+
+    // Collect at a *second* commit so the only stored sha is one the prune
+    // below can actually delete — HEAD's own commit can't be pruned.
+    replace_in_file(&dir.join("src/math.rs"), "a + b", "a + b /* v2 */");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "edit add"]);
+    let collect_commit = git_head(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Same prune as `run_unions_affected_and_stranded_when_sha_is_missing`:
+    // the reset alone leaves the commit findable through the reflog, which
+    // is the sibling case, not this one.
+    git(dir, &["reset", "--hard", "-q", &init_sha]);
+    git(dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git(dir, &["gc", "--prune=now", "--quiet"]);
+    assert!(
+        !std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{collect_commit}^{{commit}}")])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "collect_sha {collect_commit} survived the prune, so this scenario \
+         would exercise the sibling path instead of the missing one",
+    );
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    let combined = combined_output(&diff);
+    assert!(
+        !diff.status.success(),
+        "--diff with no reachable collect_sha must bail, got success:\n{combined}"
+    );
+    assert!(
+        combined.contains("no reachable collect_sha"),
+        "expected the unreachable-sha bail, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("will be rerun and re-anchored at the new HEAD"),
+        "the bail cancels the rerun, so the missing-sha notice must not \
+         promise one, got:\n{combined}"
+    );
+}
