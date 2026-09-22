@@ -30,6 +30,7 @@
 //! requested path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -545,12 +546,11 @@ impl Report {
         }
     }
 
-    /// Serialize and write to `path` atomically: write to
-    /// `path.with_extension("json.tmp")`, then rename. The extension is
-    /// replaced rather than appended, so `--report-json out.txt` stages
-    /// at `out.json.tmp`. A partial write (process killed, disk full)
-    /// leaves the previous artifact intact rather than a truncated JSON
-    /// file.
+    /// Serialize and write to `path` atomically: write to a uniquely named
+    /// temporary file in the destination directory, then rename. A partial
+    /// write (process killed, disk full) leaves the previous artifact intact
+    /// rather than a truncated JSON file, without claiming a predictable
+    /// sibling path that might already belong to the user.
     pub(crate) fn write_json(&self, path: &Path) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("failed to serialize report to JSON")?;
@@ -558,10 +558,14 @@ impl Report {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+        tmp.write_all(json.as_bytes())
+            .with_context(|| format!("failed to write temporary report for {}", path.display()))?;
+        tmp.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to persist report to {}", path.display()))?;
         Ok(())
     }
 }
@@ -965,5 +969,31 @@ mod tests {
         assert!(json["selection"]["changed_files"].is_null());
         assert!(json["selection"]["selected_tests"].is_null());
         assert_eq!(json["cache"]["status"], "forced-all");
+    }
+
+    #[test]
+    fn write_json_preserves_unrelated_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("out.txt");
+        let sibling_path = dir.path().join("out.json.tmp");
+        std::fs::write(&sibling_path, "unrelated data\n").unwrap();
+        let report = Report::build_full_suite(FullSuiteInputs {
+            command: "status",
+            current_fingerprint: None,
+            current_components: None,
+            stored_fingerprints: vec![],
+            collect_shas: vec![],
+            status: CacheStatus::MissNoCoverage,
+        });
+
+        report.write_json(&report_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(sibling_path).unwrap(),
+            "unrelated data\n"
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(written["command"], "status");
     }
 }
