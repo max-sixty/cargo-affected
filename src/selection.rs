@@ -15,9 +15,9 @@
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
 //! from several distinct collect points at once for a single fingerprint.
-//! Reachability is per-sha — diverged shas are skipped and tests stranded
-//! only there surface as `new_tests` so they're rerun rather than silently
-//! dropped.
+//! Reachability is per-sha — diverged shas are skipped and tests anchored
+//! only there surface as `stranded_tests` so they're rerun rather than
+//! silently dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -188,9 +188,10 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// than treating any divergence as all-or-nothing — important under `collect
 /// --diff`, where rows from several shas coexist for one fingerprint and a
 /// single rebase shouldn't invalidate unrelated tests' rows. Tests anchored
-/// at missing shas remain in the DB; queries skip them, and selection
-/// surfaces them as "new tests" so they get rerun (and re-anchored, in
-/// `collect --diff`'s case). Old rows accumulate as bloat — clear with
+/// at missing shas remain in the DB; queries skip them, so selection finds
+/// them absent from the reachable set but present in the DB and surfaces
+/// them as [`Selection::stranded_tests`] — rerun, and re-anchored in
+/// `collect --diff`'s case. Old rows accumulate as bloat — clear with
 /// `cargo affected clean`.
 pub(crate) struct Reachability {
     /// Per-sha relation to HEAD for every checked sha. Lets the report
