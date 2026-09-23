@@ -2,8 +2,6 @@ bot_name: cargo-affected-bot
 harness: codex
 model: gpt-6-sol
 workflows:
-  codex-auth-refresh:
-    enabled: false
   ci-fix:
     watched_workflows:
     - ci
