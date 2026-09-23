@@ -30,6 +30,7 @@
 //! requested path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -37,7 +38,7 @@ use serde::Serialize;
 
 use crate::db::{Db, HitKind, HitReason, StoredFingerprintRow, TestId};
 use crate::fingerprint::FingerprintComponent;
-use crate::project::{git_added_files_since, LineRange, ShaRelation};
+use crate::project::{LineRange, ShaRelation};
 use crate::selection::{FileReasonCounts, Reachability, Selection};
 
 /// JSON schema version. Bump on any incompatible field-shape change so
@@ -376,41 +377,28 @@ pub(crate) fn collect_sha_snapshots(
 ///   - `changed_ranges_by_sha`: the per-sha hunk maps already computed
 ///     by selection (avoids re-diffing each reachable sha — selection
 ///     and the report consume the same data).
-///   - `working_tree_files`: working-tree changes (uncommitted /
-///     staged / untracked) so files that selection considered but
-///     produced no hunks are still in the report.
-///   - committed-added files (via `git_added_files_since(sha)` per
-///     reachable sha) — these have no OLD-side and the unified-diff
-///     parser skips them, but the report should surface them.
+///   - `changed_paths`: every path that changed, unioned once by
+///     [`crate::selection::changed_paths_since`]. It is a superset of
+///     the hunk maps' keys: working-tree changes selection considered
+///     but that produced no hunks, and committed-added files (no
+///     OLD-side, so the unified-diff parser skips them) both reach the
+///     report only through here.
 ///
 /// `tracked_by_coverage` is set in one DB query
 /// ([`Db::tracked_files_at_shas`]) instead of one query per file.
 pub(crate) fn build_changed_file_inputs(
-    project_root: &std::path::Path,
     db: &Db,
     fingerprint: &str,
     reach: &Reachability,
     changed_ranges_by_sha: &BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
-    working_tree_files: &[String],
+    changed_paths: &BTreeSet<String>,
 ) -> Result<Vec<ChangedFileInput>> {
-    let mut all_files: BTreeSet<String> = working_tree_files.iter().cloned().collect();
-    for by_file in changed_ranges_by_sha.values() {
-        for path in by_file.keys() {
-            all_files.insert(path.clone());
-        }
-    }
-    for sha in &reach.reachable {
-        for added in git_added_files_since(project_root, sha)? {
-            all_files.insert(added);
-        }
-    }
-
     // One query for "which files does the cache know about?", indexed
     // by path lookup below.
     let tracked = db.tracked_files_at_shas(fingerprint, &reach.reachable)?;
 
     let mut out = Vec::new();
-    for path in all_files {
+    for path in changed_paths.iter().cloned() {
         let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
         for (sha, by_file) in changed_ranges_by_sha {
             if let Some(hunks) = by_file.get(&path) {
@@ -558,10 +546,11 @@ impl Report {
         }
     }
 
-    /// Serialize and write to `path` atomically: write to
-    /// `<path>.tmp`, then rename. A partial write (process killed,
-    /// disk full) leaves the previous artifact intact rather than a
-    /// truncated JSON file.
+    /// Serialize and write to `path` atomically: write to a uniquely named
+    /// temporary file in the destination directory, then rename. A partial
+    /// write (process killed, disk full) leaves the previous artifact intact
+    /// rather than a truncated JSON file, without claiming a predictable
+    /// sibling path that might already belong to the user.
     pub(crate) fn write_json(&self, path: &Path) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("failed to serialize report to JSON")?;
@@ -569,10 +558,14 @@ impl Report {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+        tmp.write_all(json.as_bytes())
+            .with_context(|| format!("failed to write temporary report for {}", path.display()))?;
+        tmp.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to persist report to {}", path.display()))?;
         Ok(())
     }
 }
@@ -976,5 +969,31 @@ mod tests {
         assert!(json["selection"]["changed_files"].is_null());
         assert!(json["selection"]["selected_tests"].is_null());
         assert_eq!(json["cache"]["status"], "forced-all");
+    }
+
+    #[test]
+    fn write_json_preserves_unrelated_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("out.txt");
+        let sibling_path = dir.path().join("out.json.tmp");
+        std::fs::write(&sibling_path, "unrelated data\n").unwrap();
+        let report = Report::build_full_suite(FullSuiteInputs {
+            command: "status",
+            current_fingerprint: None,
+            current_components: None,
+            stored_fingerprints: vec![],
+            collect_shas: vec![],
+            status: CacheStatus::MissNoCoverage,
+        });
+
+        report.write_json(&report_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(sibling_path).unwrap(),
+            "unrelated data\n"
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(written["command"], "status");
     }
 }

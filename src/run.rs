@@ -28,7 +28,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::collect::{
-    cargo_build_args, nextest_filter_expr, require_nextest, write_nextest_config,
+    cargo_build_args, nextest_filter_expr, plural_s, require_nextest, write_nextest_config,
 };
 use crate::db::{warn_untracked_rs_files, Db, TestId};
 use crate::fingerprint;
@@ -92,10 +92,12 @@ pub(crate) fn run(
     // goes here rather than inside the two arms that could emit it.
     if let Some(reach) = state.reachability() {
         if !reach.missing.is_empty() {
-            eprintln!(
-                "{}",
-                selection::missing_shas_notice(&reach.missing, "will rerun as 'stranded'")
-            );
+            let fate = if state.strands_missing_sha_tests() {
+                "will rerun as 'stranded'"
+            } else {
+                "will rerun as part of the full suite"
+            };
+            eprintln!("{}", selection::missing_shas_notice(&reach.missing, fate));
         }
     }
 
@@ -186,13 +188,11 @@ pub(crate) fn run(
         plan::write_selection_report(
             SelectionReport {
                 command: "run",
-                project: &project,
                 db: &db,
                 fingerprint: &fingerprint,
                 stored,
                 reach: &reach,
                 plan: &plan,
-                changed_files: &changed_files,
             },
             path,
         )?;
@@ -209,8 +209,16 @@ pub(crate) fn run(
 
     let selected = sel.selected();
     if selected.is_empty() {
-        if changed_files.is_empty() {
-            eprintln!("no uncommitted changes and no new tests — nothing to run");
+        // `since_newest`, not `changed_files`: the latter is the working tree
+        // alone, so a change committed since the last collect — the
+        // `max_commits_ahead > 0` case narrated above — would land in the
+        // "nothing changed" arm and flatly contradict that notice. Not
+        // `changed_paths.all` either: after a `collect --diff` the older
+        // anchor stays reachable, so the union permanently holds paths that
+        // collect has already accounted for, and this would claim nothing
+        // covers them on every run until `clean`.
+        if plan.changed_paths.since_newest.is_empty() {
+            eprintln!("no changes since the newest collect_sha and no new tests — nothing to run");
         } else {
             eprintln!(
                 "no tests cover the changed lines and no new tests \
@@ -222,7 +230,24 @@ pub(crate) fn run(
 
     eprintln!("\n{}\n", selection::format_summary(sel, "to run", verbose));
 
-    let tests: Vec<TestId> = selected.into_iter().collect();
+    // Phantoms — selected but gone from the listing — can't be run, and
+    // naming them in the filterset only widens the gap between what we asked
+    // for and what nextest matched. Hand it the live subset; if that leaves
+    // nothing, there is no run to make and nextest would exit 4 on a stale
+    // cache rather than on a failing test.
+    let live = sel.live_selected();
+    if live.len() < selected.len() {
+        eprintln!(
+            "{}",
+            selection::phantom_notice(selected.len() - live.len(), "will be skipped")
+        );
+    }
+    if live.is_empty() {
+        eprintln!("{}", selection::all_phantom_notice("to run"));
+        return Ok(0);
+    }
+
+    let tests: Vec<TestId> = live.into_iter().collect();
     run_tests(project_root, Some(&tests), nextest_args)
 }
 
@@ -260,7 +285,11 @@ fn run_tests(
     cmd.arg("nextest").arg("run");
     let filter_config = match tests {
         Some(ts) => {
-            eprintln!("running {} tests with nextest", ts.len());
+            eprintln!(
+                "running {} test{} with nextest",
+                ts.len(),
+                plural_s(ts.len())
+            );
             let config = write_nextest_config(project_root, &nextest_filter_expr(ts))?;
             cmd.arg("--config-file").arg(&config);
             Some(config)
