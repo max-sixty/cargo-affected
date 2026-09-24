@@ -14,8 +14,9 @@ use std::path::Path;
 
 use crate::{cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file};
 
-/// Crate whose only test reads `golden.txt` at runtime and compares it to a
-/// `const` — a hermetic stand-in for an insta snapshot or doc-sync test.
+/// Crate whose only test reads `golden.txt` at runtime and compares it to what
+/// `greeting()` returns — a hermetic stand-in for an insta snapshot or doc-sync
+/// test.
 fn write_golden_project(dir: &Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -32,7 +33,24 @@ edition = "2021"
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         src.join("lib.rs"),
-        "pub const GREETING: &str = \"hello\";\n",
+        "pub mod greeting;\n\npub const GREETING: &str = \"hello\";\n",
+    )
+    .unwrap();
+
+    // A function in a *non-root* module. The crate already had a real stored
+    // range before this — `golden_matches` is an instrumented function, so it
+    // gets one of its own — but every crate root (`src/lib.rs`,
+    // `tests/golden.rs`) also carries the sentinel `(1, i64::MAX)`, which
+    // matches any hunk in that file regardless of what it touches. Only a
+    // non-root file can hold an edit that has to overlap a function range to
+    // select — see `config_rule_inert_when_no_glob_matches`, which edits this
+    // body.
+    std::fs::write(
+        src.join("greeting.rs"),
+        r#"pub fn greeting() -> &'static str {
+    crate::GREETING
+}
+"#,
     )
     .unwrap();
 
@@ -50,7 +68,7 @@ fn golden_matches() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
     )
     .unwrap();
-    assert_eq!(config_rule_sample::GREETING, expected.trim());
+    assert_eq!(config_rule_sample::greeting::greeting(), expected.trim());
 }
 "#,
     )
@@ -75,8 +93,9 @@ fn config_rule_selects_test_for_non_rust_input_change() {
     write_golden_project(dir);
     init_git_with_initial_commit(dir);
 
-    // Seed coverage: `golden_matches` runs, covering `GREETING` and the test
-    // body — but nothing links `golden.txt` to it.
+    // Seed coverage: `golden_matches` runs, covering `greeting()` and the test
+    // body — but nothing links `golden.txt` to it. (`GREETING` is a `const`:
+    // it instruments no function, so it gets no range of its own.)
     let collect = cargo_affected(dir, &["affected", "collect"]);
     assert!(
         collect.status.success(),
@@ -177,7 +196,17 @@ fn config_rule_inert_when_no_glob_matches() {
 
     // Edit a Rust file (not golden.txt). The rule's glob doesn't match, so the
     // config category stays empty and selection is driven purely by coverage.
-    replace_in_file(&dir.join("src/lib.rs"), "hello", "hello world");
+    //
+    // The hunk lands inside `greeting`'s body, which `golden_matches` executes
+    // — a genuine range overlap. Editing `src/lib.rs` instead would prove less
+    // than it reads: that file is the crate root, and its sentinel row
+    // `(1, i64::MAX)` selects for *any* edit to it, so the assertion below
+    // would hold even for a line no test could reach.
+    replace_in_file(
+        &dir.join("src/greeting.rs"),
+        "    crate::GREETING\n",
+        "    crate::GREETING.trim()\n",
+    );
     let out = combined_output(&cargo_affected(dir, &["affected", "status", "-v"]));
     assert!(
         out.contains("0 config"),
@@ -185,6 +214,6 @@ fn config_rule_inert_when_no_glob_matches() {
     );
     assert!(
         out.contains("golden_matches"),
-        "the GREETING edit should still select the test via coverage: {out}"
+        "the greeting edit should still select the test via coverage: {out}"
     );
 }
