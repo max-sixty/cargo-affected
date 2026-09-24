@@ -34,6 +34,7 @@ mod lib_bin_collision;
 mod narrowing;
 mod new_test;
 mod no_profraw_leak;
+mod partition;
 mod remapped_paths;
 mod run;
 mod structural;
