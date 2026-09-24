@@ -221,6 +221,75 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     );
 }
 
+/// Regression for #94. After a `--diff`, a clean working tree must select
+/// nothing — that steady state is the whole point of `--diff`.
+///
+/// `write_two_module_project` keeps `add` and `multiply` in the same
+/// `src/math.rs`, so after `--diff` re-anchors `test_add` at the new HEAD the
+/// rows left at the initial sha no longer cover `add`'s lines. The initial
+/// sha's diff still shows the committed edit to `add`, that hunk now overlaps
+/// no stored range there, and the structural-edit backstop broadens to every
+/// test with rows for `src/math.rs` at that sha — `test_multiply`. It reruns
+/// on every `run` until the next `collect`, even though nothing changed and
+/// `test_multiply` never touches `add`.
+///
+/// **This test fails today** — #94 is unfixed, so it is `#[ignore]`d to keep
+/// the suite green rather than turning `main` red for a defect no PR here
+/// introduced. It still runs on demand (`cargo test -- --ignored`), and the
+/// fix for #94 should remove the attribute in the same commit; the reason
+/// lives here rather than only in the attribute string so it survives an
+/// edit to either.
+#[test]
+#[ignore = "reproduction for #94 — fails today; un-ignore with the fix"]
+fn run_after_diff_collect_selects_nothing_on_a_clean_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_steady_state_backstop");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    replace_in_file(&dir.join("src/math.rs"), "a + b", "a + b /* edited */");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "edit add"]);
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert!(
+        diff.status.success(),
+        "collect --diff failed: stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+
+    // Working tree is clean and HEAD is the sha `--diff` just anchored at.
+    // Nothing should run — and nothing should run on the invocation after
+    // it either, since `run` never writes coverage rows.
+    for attempt in 1..=2 {
+        let run = cargo_affected(dir, &["affected", "run", "-v"]);
+        assert!(
+            run.status.success(),
+            "run #{attempt} failed: stderr=\n{}\nstdout=\n{}",
+            String::from_utf8_lossy(&run.stderr),
+            String::from_utf8_lossy(&run.stdout),
+        );
+        let combined = combined_output(&run);
+        assert!(
+            !combined.contains("test_multiply"),
+            "run #{attempt}: test_multiply doesn't touch `add` and the tree is \
+             clean — it must not be selected, got:\n{combined}"
+        );
+        assert!(
+            combined.contains("nothing to run"),
+            "run #{attempt}: expected an empty selection on a clean tree, got:\n{combined}"
+        );
+    }
+}
+
 #[test]
 fn diff_collect_errors_with_no_prior_collect() {
     let tmp = tempfile::tempdir().unwrap();
