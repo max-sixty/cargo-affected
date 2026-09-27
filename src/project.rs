@@ -61,9 +61,10 @@ pub(crate) struct LineRange {
 /// `Equal` — same commit, no drift.
 /// `Reachable` — sha exists in the repo. `commits_ahead` is the number of
 /// commits in `HEAD` that aren't in the sha (`git rev-list --count
-/// {sha}..HEAD`); zero when sha is the immediate parent of HEAD or shares its
-/// tip. The OLD-side line numbers in `git diff <sha> HEAD` still belong to
-/// the sha's coordinate system, which matches stored coverage ranges, so
+/// {sha}..HEAD`); one when sha is the immediate parent of HEAD, and zero when
+/// it shares HEAD's tip. The OLD-side line numbers in `git diff <sha> HEAD`
+/// still belong to the sha's coordinate system, which matches stored coverage
+/// ranges, so
 /// selection works whether the sha is a strict ancestor or a sibling on a
 /// different branch (CI's typical PR shape: cached collect ran on the latest
 /// main commit, which is *ahead of* the PR's merge-base rather than behind
