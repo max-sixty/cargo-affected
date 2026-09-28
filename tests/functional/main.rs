@@ -35,6 +35,7 @@ mod narrowing;
 mod new_test;
 mod no_profraw_leak;
 mod remapped_paths;
+mod report_json;
 mod run;
 mod structural;
 mod workspace;
