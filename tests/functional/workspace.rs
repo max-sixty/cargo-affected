@@ -7,18 +7,15 @@
 //!
 //! 1. **Discovery**: `collect` enumerates tests across both members and
 //!    across both target kinds in `math` (lib unit test + integration test).
-//! 2. **Cross-member narrowing (no dep)**: editing `strings/src/fmt.rs`
-//!    (which `math` does not transitively depend on for its unit tests'
-//!    coverage outside the dep path) does not over-select unrelated tests.
-//!    Strings's tests run; math's lib unit test does not.
+//! 2. **Within-package structural guarantee + cross-member narrowing**:
+//!    editing `math/src/lib.rs` pulls in every test in `math` (including the
+//!    integration test that lives in a separate compilation unit), but does
+//!    NOT pull in `strings`'s tests — `strings` has no dependency on `math`.
 //! 3. **Per-target narrowing within a package**: editing
 //!    `math/tests/integration.rs` selects the integration test only — it
 //!    must NOT pull in `test_math_add` (a lib unit test in a different
 //!    compilation unit).
-//! 4. **Within-package structural guarantee**: editing `math/src/lib.rs`
-//!    pulls in every test in `math`, including the integration test that
-//!    lives in a separate compilation unit.
-//! 5. **Cross-package transitive dep**: editing `strings/src/lib.rs`
+//! 4. **Cross-package transitive dep**: editing `strings/src/lib.rs`
 //!    (`math` depends on it via `path = "../strings"`) pulls in math's
 //!    tests too.
 
