@@ -31,9 +31,9 @@ fastest of several serial runs; see the file's module docs for why.
    changes since the last tag.
 3. Once it merges, tag the squash commit `vX.Y.Z` and push the tag.
 
-Pushing the tag is what publishes: `release.yaml` triggers on it and runs
-`cargo publish` under crates.io Trusted Publishing (GitHub OIDC, `release`
-environment), so no API token is stored. Nothing creates a GitHub release.
+Pushing the tag triggers `release.yaml`, which runs `cargo publish` under
+crates.io Trusted Publishing (GitHub OIDC, `release` environment), then creates
+a GitHub Release with generated notes. No crates.io API token is stored.
 
 ## Architecture
 
