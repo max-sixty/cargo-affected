@@ -1,7 +1,12 @@
 name: release
 
-# Publishes cargo-affected to crates.io when a version tag is pushed.
-# Requires the `CARGO_REGISTRY_TOKEN` repo secret to be set.
+# Publishes cargo-affected to crates.io and creates a GitHub Release when a
+# version tag is pushed.
+#
+# Auth is via crates.io Trusted Publishing (GitHub Actions OIDC): the job mints a
+# short-lived, auto-revoked token per run instead of a long-lived API token. This
+# requires a Trusted Publisher to be configured for the crate on crates.io, scoped
+# to this repo, the `release.yaml` workflow, and the `release` environment.
 
 on:
   push:
@@ -12,9 +17,33 @@ jobs:
   publish-cargo:
     runs-on: ubuntu-24.04
     environment: release
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      # `--locked` asserts the committed `Cargo.lock` is already in sync with
+      # `Cargo.toml`. Without it, an out-of-sync lock is silently rewritten
+      # during the verify build and the rewritten lock ships inside the
+      # published crate, so `cargo install --locked cargo-affected` can pin
+      # dependency versions no CI job built — a bumped or added dependency
+      # requirement gets re-resolved to newest-compatible at publish time.
+      # With `--locked` the publish fails instead.
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --package cargo-affected
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --package cargo-affected
+
+  github-release:
+    needs: publish-cargo
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

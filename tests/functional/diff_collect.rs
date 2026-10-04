@@ -16,8 +16,8 @@
 //! The one hard error covered is the "fail loudly" no-prior-collect path.
 
 use crate::{
-    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit, replace_in_file,
-    write_two_module_project,
+    assert_no_staging_dirs, cargo_affected, combined_output, git, git_head,
+    init_git_with_initial_commit, replace_in_file, write_two_module_project,
 };
 
 /// Distinct collect_shas that anchor `test_name`'s rows. Sorted for stable
@@ -70,8 +70,8 @@ fn diff_collect_re_anchors_only_affected_tests() {
     // The re-collect summary should pick exactly one test (test_add).
     let combined = combined_output(&diff);
     assert!(
-        combined.contains("1 tests to recollect"),
-        "expected '1 tests to recollect' in diff output, got:\n{combined}"
+        combined.contains("1 test to recollect"),
+        "expected '1 test to recollect' in diff output, got:\n{combined}"
     );
 
     // DB invariant: rerun test now anchored at edited_sha; the others remain
@@ -118,11 +118,7 @@ fn write_three_one_test_modules(dir: &std::path::Path, crate_name: &str) {
 
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("lib.rs"),
-        "pub mod a;\npub mod b;\npub mod c;\n",
-    )
-    .unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
     for (file, name) in [("a.rs", "a"), ("b.rs", "b"), ("c.rs", "c")] {
         std::fs::write(
             src.join(file),
@@ -192,7 +188,7 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     );
     let combined2 = combined_output(&diff2);
     assert!(
-        combined2.contains("1 tests to recollect"),
+        combined2.contains("1 test to recollect"),
         "round2 should rerun exactly test_fb, got:\n{combined2}"
     );
 
@@ -226,7 +222,10 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
     all_shas.sort();
     let mut expected = vec![sha0, sha1, sha2];
     expected.sort();
-    assert_eq!(all_shas, expected, "three distinct collect_shas should coexist");
+    assert_eq!(
+        all_shas, expected,
+        "three distinct collect_shas should coexist"
+    );
 }
 
 #[test]
@@ -250,15 +249,20 @@ fn diff_collect_errors_with_no_prior_collect() {
     );
 }
 
-/// When one sha out of several diverges, `run` proceeds with the rows still
-/// anchored at reachable shas — only tests stranded at the diverged sha
-/// rerun (as "new"). The diverged rows stay in the DB until the user runs
-/// `cargo affected clean`.
+/// A `collect_sha` that HEAD has moved off of is still *reachable* as long
+/// as its commit sits in the object database — reachability is `git cat-file
+/// -e`, not ancestry. So `run` diffs against the sibling like any other sha:
+/// the test anchored there comes back as plain `affected`, nothing is
+/// stranded, and the run doesn't widen. The sibling's rows stay in the DB
+/// until the user runs `cargo affected clean`.
+///
+/// The genuinely-missing case — where the commit is gone and its tests do
+/// strand — is [`run_unions_affected_and_stranded_when_sha_is_missing`].
 ///
 /// One-test-per-file isolates each test's row set per file so the
 /// structural-edit backstop doesn't pull unrelated tests in.
 #[test]
-fn run_uses_reachable_shas_when_one_sha_diverges() {
+fn run_uses_sibling_sha_without_stranding_or_widening() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_three_one_test_modules(dir, "sample_diff_partial_diverge");
@@ -306,9 +310,11 @@ fn run_uses_reachable_shas_when_one_sha_diverges() {
 
     // Selection chose exactly one test (test_fa — anchored at sha1, which is
     // a sibling but reachable, and the diff against it picks up the edit).
+    // The breakdown pins the *category*: a sibling sha contributes `affected`
+    // hits, never `stranded` ones.
     assert!(
-        combined.contains("1 tests to run"),
-        "expected '1 tests to run' (test_fa affected via sha1), got:\n{combined}"
+        combined.contains("1 test to run (1 affected + 0 config + 0 new + 0 stranded"),
+        "expected test_fa selected as 'affected' with nothing stranded, got:\n{combined}"
     );
     assert!(
         combined.contains("test_fa"),
@@ -342,12 +348,20 @@ fn run_uses_reachable_shas_when_one_sha_diverges() {
     );
 }
 
-/// Middle-case: one sha diverged, one reachable — and there's a real edit
-/// against a file covered by the reachable sha. Verifies the union of
-/// `affected` (over the reachable sha) and `new_tests` (the stranded one)
-/// is what runs, not just one or the other.
+/// Middle-case: one sha genuinely gone, one reachable — and there's a real
+/// edit against a file covered by the reachable sha. Verifies the union of
+/// `affected` (over the reachable sha) and `stranded` (the tests anchored
+/// only at the missing one) is what runs, not just one or the other.
+///
+/// Resetting HEAD is *not* enough to strand anything. Reachability is
+/// `git cat-file -e`, so an orphaned commit still in the object database
+/// stays reachable and its tests come back as ordinary `affected` hits —
+/// that variant is
+/// [`run_uses_sibling_sha_without_stranding_or_widening`]. Expiring the
+/// reflog and running `git gc --prune=now` is what actually removes the
+/// commit and drives the `stranded` path.
 #[test]
-fn run_unions_affected_and_stranded_when_partially_diverged() {
+fn run_unions_affected_and_stranded_when_sha_is_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_three_one_test_modules(dir, "sample_diff_partial_diverge_with_edit");
@@ -366,7 +380,7 @@ fn run_unions_affected_and_stranded_when_partially_diverged() {
     replace_in_file(&dir.join("src/a.rs"), "x + 1", "x + 1 /* edited */");
     git(dir, &["add", "."]);
     git(dir, &["commit", "-q", "-m", "edit fa"]);
-    let _sha1 = git_head(dir);
+    let sha1 = git_head(dir);
     let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
     assert!(
         diff.status.success(),
@@ -374,10 +388,29 @@ fn run_unions_affected_and_stranded_when_partially_diverged() {
         String::from_utf8_lossy(&diff.stderr),
     );
 
-    // Reset HEAD to sha0 (orphans sha1) AND modify b.rs so there's a real
-    // diff against sha0. Selection should pick test_fb (overlap at sha0)
-    // AND test_fa (stranded → "new").
+    // Reset HEAD to sha0, then expire the reflog and gc so sha1's commit
+    // object is really gone — the reset alone orphans it but leaves it
+    // findable, which would make it reachable and this scenario a duplicate
+    // of the sibling test above.
     git(dir, &["reset", "--hard", "-q", &sha0]);
+    git(dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git(dir, &["gc", "--prune=now", "--quiet"]);
+    assert!(
+        // `.output()` rather than `.status()`: the probe is expected to fail,
+        // and this keeps git's "Not a valid object name" off the test log.
+        !std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{sha1}^{{commit}}")])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "sha1 {sha1} should be pruned out of the object database",
+    );
+
+    // Modify b.rs so there's a real diff against sha0. Selection should pick
+    // test_fb (overlap at sha0) AND test_fa (anchored only at the missing
+    // sha1 → stranded).
     replace_in_file(&dir.join("src/b.rs"), "x + 1", "x + 1 /* run-time edit */");
 
     let run = cargo_affected(dir, &["affected", "run", "-v"]);
@@ -389,9 +422,21 @@ fn run_unions_affected_and_stranded_when_partially_diverged() {
     );
     let combined = combined_output(&run);
 
+    // The breakdown is the assertion that matters: one hit from each
+    // category. A bare "2 tests to run" would also pass with both tests
+    // classified `affected`, which is exactly what happens if sha1 survives.
     assert!(
-        combined.contains("2 tests to run"),
-        "expected '2 tests to run' (test_fb affected + test_fa as new), got:\n{combined}"
+        combined.contains("2 tests to run (1 affected + 0 config + 0 new + 1 stranded"),
+        "expected the affected ∪ stranded union, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("test_fa (stranded)"),
+        "test_fa is anchored only at the missing sha → stranded, got:\n{combined}"
+    );
+    // The missing sha is announced, not silently dropped.
+    assert!(
+        combined.contains("not in the repo"),
+        "expected the missing-sha notice for {sha1}, got:\n{combined}"
     );
     for t in ["test_fa", "test_fb"] {
         assert!(
@@ -666,7 +711,8 @@ fn diff_collect_all_phantom_selection_prunes_cleanly() {
 
 /// `--diff` on a clean working tree (HEAD == prior collect_sha, no
 /// uncommitted edits) should short-circuit with exit 0 and announce that
-/// nothing needs to be recollected — no nextest invocation, no DB writes.
+/// nothing needs to be recollected — no nextest invocation, no DB writes,
+/// and no staging dirs left behind.
 #[test]
 fn diff_collect_clean_tree_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -718,5 +764,73 @@ fn diff_collect_clean_tree_exits_zero() {
         row_count(),
         before,
         "clean-tree --diff should leave test_regions row count unchanged"
+    );
+    // ...and the disk invariant. The staging dirs are created before the diff
+    // plan exists — that plan is what tells us there's nothing to rerun — so
+    // this path has to sweep them on the way out like the two rerun paths do.
+    // Without it, each no-op `--diff` strands a fresh PID-suffixed triple
+    // until the next `clean`.
+    assert_no_staging_dirs(dir, "collect --diff");
+}
+
+/// The second error path the module doc names — every stored `collect_sha`
+/// gone from the repo — which nothing pinned;
+/// [`diff_collect_errors_with_no_prior_collect`] covers the other one. It is
+/// also where the missing-sha notice meets the bail: nothing is rerun or
+/// re-anchored here, so the notice must not promise that it will be.
+#[test]
+fn diff_collect_errors_when_every_sha_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_all_shas_missing");
+    init_git_with_initial_commit(dir);
+    let init_sha = git_head(dir);
+
+    // Collect at a *second* commit so the only stored sha is one the prune
+    // below can actually delete — HEAD's own commit can't be pruned.
+    replace_in_file(&dir.join("src/math.rs"), "a + b", "a + b /* v2 */");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "edit add"]);
+    let collect_commit = git_head(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Same prune as `run_unions_affected_and_stranded_when_sha_is_missing`:
+    // the reset alone leaves the commit findable through the reflog, which
+    // is the sibling case, not this one.
+    git(dir, &["reset", "--hard", "-q", &init_sha]);
+    git(dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git(dir, &["gc", "--prune=now", "--quiet"]);
+    assert!(
+        !std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{collect_commit}^{{commit}}")])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "collect_sha {collect_commit} survived the prune, so this scenario \
+         would exercise the sibling path instead of the missing one",
+    );
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    let combined = combined_output(&diff);
+    assert!(
+        !diff.status.success(),
+        "--diff with no reachable collect_sha must bail, got success:\n{combined}"
+    );
+    assert!(
+        combined.contains("no reachable collect_sha"),
+        "expected the unreachable-sha bail, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("will be rerun and re-anchored at the new HEAD"),
+        "the bail cancels the rerun, so the missing-sha notice must not \
+         promise one, got:\n{combined}"
     );
 }

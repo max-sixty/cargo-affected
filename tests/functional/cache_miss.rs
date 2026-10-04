@@ -5,10 +5,11 @@
 //! at all, fingerprint mismatch, every stored `collect_sha` missing from
 //! the repo), it emits a stderr notice and runs every test rather than
 //! bailing or no-opping. This file pins that contract for the empty-cache
-//! case, and the inverse: when the `collect_sha` is a sibling on a
-//! different lineage (CI's PR-vs-main-tip shape, or a local
-//! `git reset --hard`), the cached coverage is still usable — diff vs
-//! collect_sha works in either direction, and selection runs as normal.
+//! case and for the pruned-sha case, and the inverse: when the
+//! `collect_sha` is a sibling on a different lineage (CI's PR-vs-main-tip
+//! shape, or a local `git reset --hard`), the cached coverage is still
+//! usable — diff vs collect_sha works in either direction, and selection
+//! runs as normal.
 
 use crate::{
     cargo_affected, combined_output, git, git_head, init_git_with_initial_commit,
@@ -113,4 +114,86 @@ fn run_uses_selection_when_collect_sha_is_sibling() {
         combined.contains("tests to run") && combined.contains("affected"),
         "expected the selection summary (tests to run / affected), got:\n{combined}"
     );
+}
+
+/// The third miss the module doc names — every stored `collect_sha` gone from
+/// the repo — which neither test above reaches: the empty-cache case never
+/// records a sha, and the sibling case keeps one reachable. Pruning the only
+/// sha is what sends `run` down `CacheMiss::NoReachableSha`, where the
+/// missing-sha notice and the widening notice are printed back to back and
+/// have to agree with each other.
+#[test]
+fn run_executes_full_suite_when_collect_sha_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_cache_miss_pruned");
+    init_git_with_initial_commit(dir);
+    let init_sha = git_head(dir);
+
+    std::fs::write(dir.join("src/extra.rs"), "pub fn extra() -> i32 { 1 }\n").unwrap();
+    let lib_path = dir.join("src/lib.rs");
+    let lib = std::fs::read_to_string(&lib_path).unwrap();
+    std::fs::write(&lib_path, format!("{lib}pub mod extra;\n")).unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "add extra module"]);
+    let collect_commit = git_head(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr)
+    );
+
+    // Resetting alone only orphans the commit — the reflog still holds the
+    // object, which is the sibling case above. Expiring the reflog and
+    // pruning is what actually deletes it.
+    git(dir, &["reset", "--hard", "-q", &init_sha]);
+    git(dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git(dir, &["gc", "--prune=now", "--quiet"]);
+    let gone = std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("{collect_commit}^{{commit}}")])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        !gone.status.success(),
+        "collect_sha {collect_commit} survived the prune, so this scenario \
+         would exercise the sibling path instead of the missing one"
+    );
+
+    let run = cargo_affected(dir, &["affected", "run"]);
+    assert!(
+        run.status.success(),
+        "run with a pruned collect_sha should succeed by running all: stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout),
+    );
+
+    let combined = combined_output(&run);
+    assert!(
+        combined.contains("not in the repo") && combined.contains("running all tests"),
+        "expected the missing-sha and widening notices, got:\n{combined}"
+    );
+    // No sha anchors a diff, so no selection runs and no test is classified
+    // `stranded`. Promising that category here contradicts the widening
+    // notice on the very next line.
+    assert!(
+        !combined.contains("stranded"),
+        "with no reachable sha nothing is selected, so the missing-sha \
+         notice must not promise the 'stranded' category, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("will rerun as part of the full suite"),
+        "the missing-sha notice should say the full suite covers those \
+         tests, got:\n{combined}"
+    );
+    // Same three-PASS check as the empty-cache case: one PASS would be
+    // ambiguous between widening and a narrow selection.
+    for t in ["test_add", "test_multiply", "test_greet"] {
+        assert!(
+            combined.contains("PASS") && combined.contains(t),
+            "expected nextest to PASS {t}, got:\n{combined}"
+        );
+    }
 }

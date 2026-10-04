@@ -16,11 +16,18 @@
 //! Because the shim *waits* for the test (rather than `exec`ing into it), it
 //! regains control the moment the test process exits — at which point the
 //! LLVM runtime has flushed the profile. So extraction happens right here, in
-//! the process that ran the test: merge the profraw with `llvm-profdata`,
-//! export with `llvm-cov`, parse the hit ranges, write a small per-test
-//! [`TestResult`] JSON file under `CARGO_AFFECTED_RESULTS_DIR`, and delete the
-//! per-test profraw dir before exiting. `collect` reads those result files
-//! once nextest finishes.
+//! the process that ran the test: merge the profraw into its text form with
+//! `llvm-profdata`, join the functions it names against the binary's
+//! function map, write a small per-test [`TestResult`] JSON file under
+//! `CARGO_AFFECTED_RESULTS_DIR`, and delete the per-test profraw dir before
+//! exiting. `collect` reads those result files once nextest finishes.
+//!
+//! The function map is the half of the answer that doesn't vary per test —
+//! where each instrumented function lives in the source — so `collect` derives
+//! it once per binary and leaves it under `CARGO_AFFECTED_FUNCTION_MAPS_DIR` for
+//! every shim to read. What the shim contributes is the other half: which
+//! functions this test reached. See [`crate::coverage`] for what the join
+//! costs in precision and what skipping it would cost in time.
 //!
 //! Doing the work here is what bounds peak disk: each profraw is consumed and
 //! deleted by its own shim, so at most nextest's concurrency (`test-threads`)
@@ -29,11 +36,16 @@
 //! completion signal is `wait()` returning.
 //!
 //! Reading the binary_id straight from the env sidesteps the path-drift
-//! problem entirely: cargo's hash suffix can shift between collect's listing
-//! and the shim invocation (CI rust-cache restore races, build-script env
-//! sensitivity), but nextest knows the stable id of the test it just
+//! problem for *attribution*: cargo's hash suffix can shift between collect's
+//! listing and the shim invocation (CI rust-cache restore races, build-script
+//! env sensitivity), but nextest knows the stable id of the test it just
 //! launched and tells us directly. Same answer for `[lib]`/`[[bin]]` pairs
 //! that normalize to the same compiled basename — no marker probe needed.
+//!
+//! The *map* needs more than the id, because cargo's hash suffix tracks build
+//! metadata rather than contents — a rebuilt binary keeps its name. Each map
+//! therefore carries a stamp of the binary it was exported from, and the shim
+//! checks it. See [`load_function_map`].
 //!
 //! Storage layout under `CARGO_AFFECTED_PROFRAW_BASE` (and, mirrored, under
 //! `CARGO_AFFECTED_RESULTS_DIR`) is two levels:
@@ -47,9 +59,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::coverage::{self, HitRange};
+use crate::coverage::{self, BinaryFunctionMap, BinaryStamp, HitRange};
 
 /// Environment-variable contract between `collect` (which sets all of these on
 /// the `cargo nextest run` command) and the shim (which reads them). Shared
@@ -59,8 +72,7 @@ use crate::coverage::{self, HitRange};
 pub(crate) const ENV_PROFRAW_BASE: &str = "CARGO_AFFECTED_PROFRAW_BASE";
 pub(crate) const ENV_RESULTS_DIR: &str = "CARGO_AFFECTED_RESULTS_DIR";
 pub(crate) const ENV_LLVM_PROFDATA: &str = "CARGO_AFFECTED_LLVM_PROFDATA";
-pub(crate) const ENV_LLVM_COV: &str = "CARGO_AFFECTED_LLVM_COV";
-pub(crate) const ENV_CANONICAL_ROOT: &str = "CARGO_AFFECTED_CANONICAL_ROOT";
+pub(crate) const ENV_FUNCTION_MAPS_DIR: &str = "CARGO_AFFECTED_FUNCTION_MAPS_DIR";
 
 /// Per-test coverage result the shim writes and `collect` reads back. Carries
 /// the verbatim `(binary_id, test_name)` so `collect` doesn't have to invert
@@ -73,12 +85,13 @@ pub(crate) struct TestResult {
 }
 
 /// Outcome of extracting one test's coverage. `Skipped` covers every soft
-/// failure (no profraw, a failed llvm-tool invocation, a parse error): the
-/// test simply gains no coverage this round and gets re-selected on the next
-/// `--diff`. A *systematic* failure (e.g. a present-but-unrunnable llvm tool)
-/// turns every test into `Skipped`; `collect` catches that case — zero tests
-/// collected — and bails rather than storing (and, for a full collect,
-/// wiping) coverage. See the empty-`mappings` guard in `collect`.
+/// failure (no profraw, no function map, a failed llvm-tool invocation, a
+/// parse error): the test simply gains no coverage this round and gets
+/// re-selected on the next `--diff`. A *systematic* failure (e.g. a
+/// present-but-unrunnable llvm tool) turns every test into `Skipped`;
+/// `collect` catches that case — zero tests collected — and bails rather than
+/// storing (and, for a full collect, wiping) coverage. See the
+/// empty-`mappings` guard in `collect`.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum TestOutcome {
     Collected { ranges: BTreeSet<HitRange> },
@@ -90,7 +103,7 @@ pub(crate) enum TestOutcome {
 ///
 /// Never returns — runs the test binary, extracts its coverage, and exits with
 /// the test's exit code.
-pub fn run(args: &[String]) -> ! {
+pub(crate) fn run(args: &[String]) -> ! {
     let Some((binary, rest)) = args.split_first() else {
         eprintln!("cargo-affected runner-shim: missing test binary argument");
         std::process::exit(2);
@@ -156,15 +169,15 @@ fn run_test(binary: &str, rest: &[String]) -> i32 {
     }
 }
 
-/// Coverage tool paths and output locations `collect` hands the shim via the
-/// environment (see the `ENV_*` constants). Present together or not at all:
-/// `collect` sets every one whenever it sets [`ENV_PROFRAW_BASE`].
+/// The llvm-profdata path, the function maps to join against, and where to
+/// stage output — everything `collect` hands the shim via the environment (see
+/// the `ENV_*` constants). Present together or not at all: `collect` sets every
+/// one whenever it sets [`ENV_PROFRAW_BASE`].
 struct CoverageEnv {
     profraw_base: PathBuf,
     results_dir: PathBuf,
     llvm_profdata: PathBuf,
-    llvm_cov: PathBuf,
-    canonical_root: PathBuf,
+    function_maps_dir: PathBuf,
 }
 
 impl CoverageEnv {
@@ -184,16 +197,18 @@ impl CoverageEnv {
             profraw_base: var(ENV_PROFRAW_BASE),
             results_dir: var(ENV_RESULTS_DIR),
             llvm_profdata: var(ENV_LLVM_PROFDATA),
-            llvm_cov: var(ENV_LLVM_COV),
-            canonical_root: var(ENV_CANONICAL_ROOT),
+            function_maps_dir: var(ENV_FUNCTION_MAPS_DIR),
         }
     }
 }
 
-/// Merge the profraws in `dir` and export coverage for `binary`, returning the
-/// hit ranges or a `Skipped` reason. Mirrors the llvm-tool plumbing that used
-/// to live in `collect`, now run per-test in the shim that produced the
-/// bundle.
+/// Merge the profraws in `dir` and join the functions they name against
+/// `binary`'s function map, returning the hit ranges or a `Skipped` reason.
+///
+/// `--sparse` drops all-zero records, so the merged profile is already close
+/// to the set of functions the test reached; the counter values decide the
+/// rest. `--text` is what makes the merge the *only* llvm-tool invocation
+/// here: the binary side of the join was resolved once, by `collect`.
 fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
     let profraw_files = match list_profraw_files(dir) {
         Ok(files) => files,
@@ -209,13 +224,18 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
-    let profdata_path = dir.join("coverage.profdata");
+    let map = match load_function_map(&env.function_maps_dir, binary) {
+        Ok(map) => map,
+        Err(e) => return TestOutcome::Skipped { reason: e },
+    };
+
+    let proftext_path = dir.join("coverage.proftext");
     let mut merge_cmd = Command::new(&env.llvm_profdata);
-    merge_cmd.arg("merge").arg("--sparse");
+    merge_cmd.arg("merge").arg("--sparse").arg("--text");
     for f in &profraw_files {
         merge_cmd.arg(f);
     }
-    merge_cmd.arg("-o").arg(&profdata_path);
+    merge_cmd.arg("-o").arg(&proftext_path);
     let merge_output = match merge_cmd.output() {
         Ok(output) => output,
         Err(e) => {
@@ -233,41 +253,68 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
-    // POSIX ERE — no negative lookahead, so the regex enumerates prefixes to
-    // drop. It shrinks `files[]` but leaves `functions[]` (the bulk of the
-    // JSON) intact; `coverage::extract_hit_ranges` re-filters authoritatively
-    // via `strip_prefix(canonical_root)`.
-    let export_output = match Command::new(&env.llvm_cov)
-        .arg("export")
-        .arg("--format=text")
-        .arg(format!("--instr-profile={}", profdata_path.display()))
-        .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
-        .arg(binary)
-        .output()
-    {
-        Ok(output) => output,
+    let proftext = match std::fs::read_to_string(&proftext_path) {
+        Ok(text) => text,
         Err(e) => {
             return TestOutcome::Skipped {
-                reason: format!("llvm-cov export failed to run: {e}"),
+                reason: format!("reading merged profile: {e}"),
             }
         }
     };
-    if !export_output.status.success() {
-        return TestOutcome::Skipped {
-            reason: format!(
-                "llvm-cov export failed: {}",
-                String::from_utf8_lossy(&export_output.stderr).trim()
-            ),
-        };
-    }
+    let executed = match coverage::executed_functions(&proftext) {
+        Ok(executed) => executed,
+        Err(e) => {
+            return TestOutcome::Skipped {
+                reason: format!("parse error: {e:#}"),
+            }
+        }
+    };
 
-    let json = String::from_utf8_lossy(&export_output.stdout);
-    match coverage::extract_hit_ranges(&json, &env.canonical_root) {
+    match coverage::hit_ranges(&executed, &map.functions)
+        .with_context(|| format!("joining against {}", binary.display()))
+    {
         Ok(ranges) => TestOutcome::Collected { ranges },
         Err(e) => TestOutcome::Skipped {
-            reason: format!("parse error: {e}"),
+            reason: format!("{e:#}"),
         },
     }
+}
+
+/// Read the function map `collect` wrote for `binary`, and check it describes
+/// the binary we were actually handed.
+///
+/// The filename can't carry that check on its own: cargo's hash suffix is
+/// derived from build metadata, not from the binary's contents, so a rebuild
+/// between `collect`'s listing pass and the run produces the *same* name over
+/// different line numbers. The stamp inside the file is what distinguishes
+/// them ([`coverage::BinaryStamp`]). A mismatch skips the test rather than
+/// filing it under stale lines; if it happens to every test, `collect` bails
+/// instead of overwriting stored coverage.
+fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<BinaryFunctionMap, String> {
+    let path = map_path(function_maps_dir, binary)
+        .ok_or_else(|| format!("{} has no file name to look a map up by", binary.display()))?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("reading function map {}: {e}", path.display()))?;
+    let map: BinaryFunctionMap = serde_json::from_str(&raw)
+        .map_err(|e| format!("parsing function map {}: {e}", path.display()))?;
+    let stamp = BinaryStamp::of(binary).map_err(|e| format!("{e:#}"))?;
+    if stamp != map.binary {
+        return Err(format!(
+            "{} was rebuilt after its function map was exported; the map \
+             describes a different build and its line numbers no longer apply",
+            binary.display(),
+        ));
+    }
+    Ok(map)
+}
+
+/// Where a binary's function map lives under the function-maps directory.
+/// Shared with `collect`, which writes it, so the two can't drift. `None` for
+/// a path with no file name — impossible for a binary nextest ran, and
+/// refused rather than quietly turned into a shared default name.
+pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBuf> {
+    let name = sanitize(&binary.file_name()?.to_string_lossy());
+    Some(function_maps_dir.join(format!("{name}.json")))
 }
 
 /// Write the per-test result to `<results_dir>/<binary_id>/<test_name>.json`.
@@ -326,7 +373,7 @@ fn list_profraw_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// per-test [`TestResult`] carries the verbatim values, so name collisions
 /// inside one binary_id are the only risk, and they don't occur with real Rust
 /// test names (no two tests in the same binary share a sanitized form).
-pub fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
@@ -361,7 +408,8 @@ mod tests {
 
     /// A dir with no `.profraw` (test produced no profile — `#[ignore]`d at
     /// runtime, exited before the runtime flushed, etc.) yields a `Skipped`
-    /// with a stable reason, never an error. This path needs no llvm tools.
+    /// with a stable reason, never an error. This path needs no llvm tools
+    /// and no function map.
     #[test]
     fn extract_without_profraw_skips() {
         let tmp = tempfile::tempdir().unwrap();
@@ -370,14 +418,92 @@ mod tests {
             results_dir: tmp.path().to_path_buf(),
             // Never invoked — there's no profraw to merge.
             llvm_profdata: PathBuf::from("llvm-profdata"),
-            llvm_cov: PathBuf::from("llvm-cov"),
-            canonical_root: tmp.path().to_path_buf(),
+            function_maps_dir: tmp.path().to_path_buf(),
         };
         let outcome = extract(tmp.path(), Path::new("test-bin"), &env);
         match outcome {
             TestOutcome::Skipped { reason } => assert_eq!(reason, "no profraw generated"),
             TestOutcome::Collected { .. } => panic!("expected Skipped, got Collected"),
         }
+    }
+
+    /// Build a scratch binary file, a profraw beside it, and the shim env
+    /// pointing at both. Returns `(env, profraw_dir, binary)`.
+    fn extract_fixture(tmp: &Path) -> (CoverageEnv, PathBuf, PathBuf) {
+        let profraw_dir = tmp.join("profraw");
+        std::fs::create_dir_all(&profraw_dir).unwrap();
+        std::fs::write(profraw_dir.join("a.profraw"), b"").unwrap();
+        let binary = tmp.join("integration-abc123");
+        std::fs::write(&binary, b"not really a binary").unwrap();
+        let env = CoverageEnv {
+            profraw_base: tmp.to_path_buf(),
+            results_dir: tmp.to_path_buf(),
+            // Never invoked — every case here fails at the map lookup first.
+            llvm_profdata: PathBuf::from("llvm-profdata"),
+            function_maps_dir: tmp.to_path_buf(),
+        };
+        (env, profraw_dir, binary)
+    }
+
+    fn skip_reason(outcome: TestOutcome) -> String {
+        match outcome {
+            TestOutcome::Skipped { reason } => reason,
+            TestOutcome::Collected { .. } => panic!("expected Skipped, got Collected"),
+        }
+    }
+
+    /// A profraw with no function map to join it against skips with a reason
+    /// naming the file it looked for.
+    #[test]
+    fn extract_without_function_map_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (env, profraw_dir, binary) = extract_fixture(tmp.path());
+        let reason = skip_reason(extract(&profraw_dir, &binary, &env));
+        assert!(
+            reason.contains("integration-abc123.json"),
+            "reason should name the missing map: {reason}",
+        );
+    }
+
+    /// The map that matters: a binary rebuilt after its map was exported keeps
+    /// its cargo-hashed name — the hash tracks build metadata, not contents —
+    /// so the *stamp* is what catches it. Without this the shim would file the
+    /// test's coverage against the previous build's line numbers, which no
+    /// later step could detect.
+    #[test]
+    fn extract_with_a_map_for_another_build_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (env, profraw_dir, binary) = extract_fixture(tmp.path());
+
+        let map = coverage::BinaryFunctionMap {
+            binary: coverage::BinaryStamp::of(&binary).unwrap(),
+            functions: [("f".to_string(), Vec::new())].into_iter().collect(),
+        };
+        let path = map_path(&env.function_maps_dir, &binary).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&map).unwrap()).unwrap();
+
+        // Same name, different build.
+        std::fs::write(&binary, b"a longer pretend binary than before").unwrap();
+
+        let reason = skip_reason(extract(&profraw_dir, &binary, &env));
+        assert!(
+            reason.contains("rebuilt after its function map was exported"),
+            "reason should name the stale map: {reason}",
+        );
+    }
+
+    /// A binary path with no file name has no map to look up, and gets an
+    /// error rather than a default name every such binary would share.
+    #[test]
+    fn map_path_is_named_for_the_binary() {
+        assert_eq!(
+            map_path(
+                Path::new("/tmp/maps"),
+                Path::new("/t/debug/deps/integration-9f2a")
+            ),
+            Some(PathBuf::from("/tmp/maps/integration-9f2a.json")),
+        );
+        assert_eq!(map_path(Path::new("/tmp/maps"), Path::new("..")), None);
     }
 
     /// `write_result` round-trips through the same JSON `collect` reads back,

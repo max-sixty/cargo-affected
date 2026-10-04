@@ -1,0 +1,6 @@
+[default.extend-words]
+# Hyphenated "mis-" prefixes in the docs (mis-target, mis-select, mis-tokenised)
+# tokenize to a bare `mis`, which typos maps to "miss"/"mist".
+mis = "mis"
+# "raison d'être" — tokenizes to `raison`, which typos maps to "reason"/"raisin".
+raison = "raison"
