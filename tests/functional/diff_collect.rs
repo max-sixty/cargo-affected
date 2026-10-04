@@ -13,7 +13,8 @@
 //! creates: a sibling sha is reachable rather than fatal (#9), and a
 //! selection spanning several shas stays narrow instead of widening to the
 //! whole suite.
-//! The one hard error covered is the "fail loudly" no-prior-collect path.
+//! The hard errors covered are no prior collect and every stored sha missing
+//! from the repository.
 
 use crate::{
     assert_no_staging_dirs, cargo_affected, combined_output, git, git_head,
