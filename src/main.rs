@@ -46,7 +46,7 @@ enum Action {
         /// Re-collect coverage only for tests affected by changes since the
         /// last collect, leaving rows for unaffected tests in place. Errors
         /// out if there's no prior collect for the current environment, or
-        /// if any stored collect_sha is no longer reachable from HEAD.
+        /// if every stored collect_sha is missing from the repository.
         #[arg(long)]
         diff: bool,
         /// Collect against a dirty working tree. Stored line numbers reflect
