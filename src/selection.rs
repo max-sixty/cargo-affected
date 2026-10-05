@@ -550,13 +550,14 @@ pub(crate) fn compute(
             // / `-E` / default-filter), so it never gains coverage — must
             // not be treated as a new/stranded test to rerun. Stays in
             // `listed` (above) so `collect --diff`'s prune keeps its rows.
-            // Deliberately *not* recorded in `filter_excluded`: a test
-            // excluded here is excluded on every run regardless of what
-            // changed (an `#[ignore]`d test never enters the DB, so it is
-            // permanently listed-but-excluded), and counting it would blame
-            // the filter for every genuinely uncovered change in a project
-            // that has one. Only the two change-driven sources below can
-            // lose a selection *to this change's* filter.
+            // Deliberately *not* recorded in `filter_excluded`: this arm
+            // cannot tell a test the caller's own filter excluded from one
+            // that is excluded on every run whatever the diff says (an
+            // `#[ignore]`d test never enters the DB, so it is permanently
+            // listed-but-excluded), and counting both would blame the
+            // filter for every genuinely uncovered change in a project that
+            // owns one. So the caller-filter case is given up here: only
+            // the two change-driven sources below record a lost selection.
             continue;
         }
         if reachable_known.contains(t) {
