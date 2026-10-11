@@ -40,6 +40,7 @@ jobs:
           ref: main
           fetch-depth: 0
           token: ${{ secrets.TEND_BOT_TOKEN }}
+          persist-credentials: false
 
       - run: |-
           rustup component add llvm-tools
@@ -51,7 +52,7 @@ jobs:
       - uses: max-sixty/tend/codex@0.3.10
         with:
           github_token: ${{ secrets.TEND_BOT_TOKEN }}
-          merge: restricted
+          merge: yolo
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           codex_auth_json: ${{ secrets.CODEX_AUTH_JSON }}
           bot_name: cargo-affected-bot
