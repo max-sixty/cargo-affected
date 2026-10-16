@@ -17,6 +17,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Checkout is the only step here that touches the API, so `contents: read` is
+# the whole requirement. Without this key the token inherits the repo-wide
+# default, which on a `push` to main can be read/write across every scope —
+# every other workflow in this repo pins its own, so this one was the outlier.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # CI does clean builds, so incremental compilation tracking adds I/O overhead
