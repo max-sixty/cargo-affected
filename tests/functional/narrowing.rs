@@ -91,3 +91,39 @@ fn function_body_edit_selects_only_that_test() {
     // this is belt-and-braces — but cheap and clarifying.
     git(dir, &["checkout", "--", "src/math.rs"]);
 }
+
+#[test]
+fn collect_keeps_tests_whose_names_sanitize_identically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_name_collisions");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "mod math;\nmod strings;\n#[cfg(test)] mod a { #[test] fn b() {} }\n#[test] fn a__b() {}\n#[test] fn café() {}\n#[test] fn cafè() {}\n",
+    )
+    .unwrap();
+    init_git_with_initial_commit(dir);
+
+    // Serial execution makes result overwrites deterministic, independently
+    // of the additional profraw-directory race under parallel execution.
+    let collect = cargo_affected(dir, &["affected", "collect", "--", "--test-threads=1"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        crate::combined_output(&collect)
+    );
+    let conn = rusqlite::Connection::open(dir.join("target/affected/coverage.db")).unwrap();
+    let names: Vec<String> = conn
+        .prepare("SELECT DISTINCT test_name FROM test_regions ORDER BY test_name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for name in ["a::b", "a__b", "café", "cafè"] {
+        assert!(
+            names.iter().any(|stored| stored == name),
+            "missing {name}: {names:?}"
+        );
+    }
+}
