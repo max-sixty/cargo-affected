@@ -49,11 +49,11 @@
 //!
 //! Storage layout under `CARGO_AFFECTED_PROFRAW_BASE` (and, mirrored, under
 //! `CARGO_AFFECTED_RESULTS_DIR`) is two levels:
-//! `<sanitized_binary_id>/<sanitized_test_name>/`. Two levels (rather than a
-//! single concatenated component) keep names unique even after sanitization
-//! collapses `::` to `_`: `(foo, a::b)` and `(foo::a, b)` would otherwise both
-//! produce `foo__a__b` and clobber each other on Windows where `:` is
-//! filesystem-illegal.
+//! `<binary_key>/<test_key>/`. Each key is the SHA-256 digest of the full
+//! UTF-8 name. Hashing preserves distinctions that replacing punctuation
+//! loses (`a::b` versus `a__b`, or different Unicode identifiers), and bounds
+//! path-component length even for long test names. Two levels keep the
+//! binary and test identities separate.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,7 @@ use std::process::Command;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::coverage::{self, BinaryFunctionMap, BinaryStamp, HitRange};
 
@@ -76,7 +77,7 @@ pub(crate) const ENV_FUNCTION_MAPS_DIR: &str = "CARGO_AFFECTED_FUNCTION_MAPS_DIR
 
 /// Per-test coverage result the shim writes and `collect` reads back. Carries
 /// the verbatim `(binary_id, test_name)` so `collect` doesn't have to invert
-/// [`sanitize`] from the filesystem path.
+/// [`storage_key`] from the filesystem path.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct TestResult {
     pub(crate) binary_id: String,
@@ -122,8 +123,8 @@ pub(crate) fn run(args: &[String]) -> ! {
     let env = CoverageEnv::from_env();
     let dir = env
         .profraw_base
-        .join(sanitize(&binary_id))
-        .join(sanitize(&test_name));
+        .join(storage_key(&binary_id))
+        .join(storage_key(&test_name));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!(
             "cargo-affected runner-shim: failed to create {}: {e}",
@@ -313,7 +314,7 @@ fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<BinaryFu
 /// a path with no file name — impossible for a binary nextest ran, and
 /// refused rather than quietly turned into a shared default name.
 pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBuf> {
-    let name = sanitize(&binary.file_name()?.to_string_lossy());
+    let name = storage_key(&binary.file_name()?.to_string_lossy());
     Some(function_maps_dir.join(format!("{name}.json")))
 }
 
@@ -333,8 +334,8 @@ pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBu
 /// Best-effort: a failure here costs this test one collect (it's re-selected
 /// next `--diff`), so we warn rather than abort the test.
 fn write_result(results_dir: &Path, binary_id: &str, test_name: &str, outcome: TestOutcome) {
-    let dir = results_dir.join(sanitize(binary_id));
-    let path = dir.join(format!("{}.json", sanitize(test_name)));
+    let dir = results_dir.join(storage_key(binary_id));
+    let path = dir.join(format!("{}.json", storage_key(test_name)));
     let tmp = path.with_extension("json.tmp");
     let result = TestResult {
         binary_id: binary_id.to_string(),
@@ -366,27 +367,13 @@ fn list_profraw_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Make a test name or binary id safe for use as a single filesystem directory
-/// component.
+/// Derive a deterministic, fixed-length filesystem key from the full name.
 ///
-/// Keeps alphanumerics, `_`, `-`, `.`. Replaces everything else (including
-/// `:` and path separators) with `_`. `:` is forbidden in Windows path
-/// components — drive letters and alternate data streams reserve it — so
-/// the `::`-joined nextest ids and Rust test names that occur in practice
-/// have to collapse to underscores. Sanitize output is never reversed; the
-/// per-test [`TestResult`] carries the verbatim values, so name collisions
-/// inside one binary_id are the only risk, and they don't occur with real Rust
-/// test names (no two tests in the same binary share a sanitized form).
-pub(crate) fn sanitize(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-            out.push(c);
-        } else {
-            out.push('_');
-        }
-    }
-    out
+/// Hex digests are safe on Windows (including case-insensitive filesystems).
+/// These paths are collect-local staging data; result JSON retains the
+/// original identity, and no persistent coverage schema depends on the key.
+fn storage_key(name: &str) -> String {
+    format!("{:x}", Sha256::digest(name.as_bytes()))
 }
 
 #[cfg(test)]
@@ -394,20 +381,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_passthrough() {
-        assert_eq!(sanitize("plain_name"), "plain_name");
-        assert_eq!(sanitize("dotted.name-1"), "dotted.name-1");
-    }
-
-    #[test]
-    fn sanitize_replaces_hostile_chars() {
-        // `:` and path separators are filesystem-illegal on Windows; spaces
-        // and other punctuation are merely ugly. All collapse to `_`.
-        assert_eq!(sanitize("math::tests::test_add"), "math__tests__test_add");
-        assert_eq!(sanitize("mock-stub::builds"), "mock-stub__builds");
-        assert_eq!(sanitize("a/b"), "a_b");
-        assert_eq!(sanitize("a\\b"), "a_b");
-        assert_eq!(sanitize("a b"), "a_b");
+    fn storage_keys_are_safe_bounded_components() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "CON",
+            "a/b",
+            "a\\b",
+            "a b",
+            "é",
+            &"a".repeat(1000),
+        ] {
+            let key = storage_key(name);
+            assert_eq!(key.len(), 64);
+            assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert_ne!(storage_key("A"), storage_key("a"));
     }
 
     /// A dir with no `.profraw` (test produced no profile — `#[ignore]`d at
@@ -429,6 +419,36 @@ mod tests {
             TestOutcome::Skipped { reason } => assert_eq!(reason, "no profraw generated"),
             TestOutcome::Collected { .. } => panic!("expected Skipped, got Collected"),
         }
+    }
+
+    #[test]
+    fn write_result_preserves_distinct_rust_test_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = ["a::b", "a__b", "café", "cafè"];
+        for name in names {
+            write_result(
+                tmp.path(),
+                "sample",
+                name,
+                TestOutcome::Skipped {
+                    reason: name.into(),
+                },
+            );
+        }
+        let dir = tmp.path().join(storage_key("sample"));
+        let mut stored: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let raw = std::fs::read(entry.unwrap().path()).unwrap();
+                serde_json::from_slice::<TestResult>(&raw)
+                    .unwrap()
+                    .test_name
+            })
+            .collect();
+        stored.sort();
+        let mut expected = names.to_vec();
+        expected.sort();
+        assert_eq!(stored, expected, "every test needs its own result file");
     }
 
     /// Build a scratch binary file, a profraw beside it, and the shim env
@@ -464,7 +484,7 @@ mod tests {
         let (env, profraw_dir, binary) = extract_fixture(tmp.path());
         let reason = skip_reason(extract(&profraw_dir, &binary, &env));
         assert!(
-            reason.contains("integration-abc123.json"),
+            reason.contains(&format!("{}.json", storage_key("integration-abc123"))),
             "reason should name the missing map: {reason}",
         );
     }
@@ -505,14 +525,17 @@ mod tests {
                 Path::new("/tmp/maps"),
                 Path::new("/t/debug/deps/integration-9f2a")
             ),
-            Some(PathBuf::from("/tmp/maps/integration-9f2a.json")),
+            Some(
+                PathBuf::from("/tmp/maps")
+                    .join(format!("{}.json", storage_key("integration-9f2a")))
+            ),
         );
         assert_eq!(map_path(Path::new("/tmp/maps"), Path::new("..")), None);
     }
 
     /// `write_result` round-trips through the same JSON `collect` reads back,
     /// laid out two levels deep so distinct `(binary_id, test_name)` pairs
-    /// never collide after sanitization.
+    /// remain distinct in the staging directory.
     #[test]
     fn write_result_round_trips() {
         use camino::Utf8PathBuf;
@@ -533,7 +556,9 @@ mod tests {
             TestOutcome::Collected { ranges },
         );
 
-        let path = results.join("my-crate__tests").join("math__adds.json");
+        let path = results
+            .join(storage_key("my-crate::tests"))
+            .join(format!("{}.json", storage_key("math::adds")));
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: TestResult = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.binary_id, "my-crate::tests");
