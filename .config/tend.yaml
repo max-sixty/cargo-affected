@@ -1,9 +1,5 @@
 bot_name: cargo-affected-bot
 merge: yolo
-harness: codex
-model: gpt-6.1-sol
-codex:
-  auth_refresh: false
 workflows:
   ci-failures:
     watched_workflows:
