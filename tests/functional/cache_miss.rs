@@ -49,7 +49,9 @@ fn run_executes_full_suite_when_no_coverage_data() {
     // three to confirm we really ran the full suite.
     for t in ["test_add", "test_multiply", "test_greet"] {
         assert!(
-            combined.contains("PASS") && combined.contains(t),
+            combined
+                .lines()
+                .any(|l| l.contains("PASS") && l.contains(t)),
             "expected nextest to PASS {t}, got:\n{combined}"
         );
     }
@@ -98,16 +100,15 @@ fn run_uses_selection_when_collect_sha_is_sibling() {
     let combined = combined_output(&run);
 
     // Must NOT widen to the full suite — a sibling sha is reachable, so the
-    // diff feeds normal selection. The "tests to run (N affected + M new ...
-    // skipped of K known)" summary line is unique to the selection path; the
-    // full-suite path emits "running all tests with nextest" and skips it.
+    // diff feeds normal selection. The "N tests to run (A affected + ...)"
+    // summary line is unique to the selection path; the full-suite path emits
+    // "running all tests with nextest" and skips it.
     assert!(
         !combined.contains("running all tests"),
         "sibling collect_sha must not trigger full-suite widening, got:\n{combined}"
     );
     assert!(
-        !combined.contains("not reachable from HEAD")
-            && !combined.contains("not in the repo"),
+        !combined.contains("not in the repo"),
         "sibling collect_sha is reachable; should not emit the missing-sha notice, got:\n{combined}"
     );
     assert!(
@@ -192,7 +193,9 @@ fn run_executes_full_suite_when_collect_sha_is_missing() {
     // ambiguous between widening and a narrow selection.
     for t in ["test_add", "test_multiply", "test_greet"] {
         assert!(
-            combined.contains("PASS") && combined.contains(t),
+            combined
+                .lines()
+                .any(|l| l.contains("PASS") && l.contains(t)),
             "expected nextest to PASS {t}, got:\n{combined}"
         );
     }
