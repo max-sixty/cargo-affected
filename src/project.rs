@@ -19,9 +19,10 @@
 //! of HEAD. Only a sha genuinely absent from the repo is `Missing`; a sibling
 //! or post-`reset` orphan stays `Reachable`, because `git diff <sha> HEAD`
 //! resolves either way and the ranges still live in `<sha>`'s coordinates.
-//! `Reachable { commits_ahead: 0 }` is such a sibling — it resolves, but its
-//! tree differs from HEAD's, which is why callers treat it as divergence
-//! rather than an exact hit.
+//! `Reachable { commits_ahead: 0 }` is a descendant of HEAD, such as the
+//! orphan a `reset` to its parent leaves — it resolves, but its tree differs
+//! from HEAD's, which is why callers treat it as divergence rather than an
+//! exact hit.
 //!
 //! ## Git failure is never "nothing changed"
 //!
@@ -1139,8 +1140,8 @@ mod tests {
         let init_sha = git_head_sha(dir.path())?;
 
         // Create a commit, capture its sha, then reset HEAD back. The captured
-        // sha is now a sibling of HEAD's history — present in the repo but
-        // not an ancestor. `git diff <sha> HEAD` still resolves both trees,
+        // sha is now a descendant of HEAD — present in the repo but not an
+        // ancestor. `git diff <sha> HEAD` still resolves both trees,
         // so the cache is usable; classify as Reachable.
         std::fs::write(dir.path().join("a.txt"), b"x")?;
         git(dir.path(), &["add", "a.txt"]);
