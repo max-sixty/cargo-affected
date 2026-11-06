@@ -243,10 +243,10 @@ pub(crate) fn plan(
 
 /// `hit-exact` only when every reachable sha *is* HEAD.
 ///
-/// `Reachable { commits_ahead: 0 }` — a sibling of HEAD, as after
-/// `git reset --hard` to its parent — counts as divergence: the sha resolves,
-/// but its tree differs from HEAD's, so stored line numbers are in a
-/// different coordinate system.
+/// Every `Reachable` sha counts as divergence, including
+/// `Reachable { commits_ahead: 0 }` — a descendant of HEAD, as after
+/// `git reset --hard` to its parent: the sha resolves, but its tree differs
+/// from HEAD's, so stored line numbers are in a different coordinate system.
 fn classify_hit_status(reach: &Reachability) -> CacheStatus {
     if reach
         .per_sha
@@ -260,8 +260,8 @@ fn classify_hit_status(reach: &Reachability) -> CacheStatus {
 }
 
 /// Everything [`write_selection_report`] needs, bundled so the call site
-/// doesn't thread nine arguments — the same shape [`SelectionInputs`] uses
-/// one layer down.
+/// doesn't thread each field as its own argument — the same shape
+/// [`SelectionInputs`] uses one layer down.
 pub(crate) struct SelectionReport<'a> {
     pub(crate) command: &'static str,
     pub(crate) db: &'a Db,
