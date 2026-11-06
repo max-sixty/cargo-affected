@@ -444,10 +444,10 @@ pub(crate) fn changed_paths_since(
 ///
 /// `Equal` outranks every `Reachable` rather than sharing rank 0 with
 /// `commits_ahead: 0`. `git rev-list --count sha..HEAD` is also zero for a sha
-/// that is a *descendant* of HEAD or a sibling with no commits HEAD lacks, and
-/// those trees differ from HEAD's; a sha that IS HEAD is the one anchor that
-/// can't be behind. Remaining ties (two distinct shas at the same distance,
-/// which needs one of them to be a sibling) break by sha for determinism.
+/// that is a *descendant* of HEAD, and that tree differs from HEAD's; a sha
+/// that IS HEAD is the one anchor that can't be behind. Remaining ties (two
+/// distinct shas at the same distance, such as two descendants of HEAD) break
+/// by sha for determinism.
 fn newest_reachable_sha(reach: &Reachability) -> Option<&String> {
     reach
         .reachable
@@ -807,12 +807,11 @@ mod tests {
     }
 
     /// `Equal` wins outright over a `Reachable` sha that is also zero commits
-    /// behind HEAD — a descendant of HEAD, or a sibling with no commits HEAD
-    /// lacks, both of which `git rev-list --count sha..HEAD` reports as 0. The
-    /// `zzz`/`aaa` naming makes the lexicographic tie-break pick the wrong one
-    /// if the two ever share a rank.
+    /// behind HEAD — a descendant of HEAD, which `git rev-list --count
+    /// sha..HEAD` reports as 0. The `zzz`/`aaa` naming makes the lexicographic
+    /// tie-break pick the wrong one if the two ever share a rank.
     #[test]
-    fn newest_reachable_prefers_head_over_a_zero_distance_sibling() {
+    fn newest_reachable_prefers_head_over_a_zero_distance_descendant() {
         let reach = Reachability {
             per_sha: [
                 (
