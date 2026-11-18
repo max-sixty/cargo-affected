@@ -19,27 +19,27 @@
 //! `/Users/joe/Library/Application Support/…` (macOS) would be
 //! mis-tokenised. The TOML array preserves the path as one argv slot.
 //!
-//! Approach:
-//! 1. Read crate roots from `cargo metadata`, scoped per nextest target
+//! Approach, in the order `collect` runs it:
+//! 1. Capture HEAD sha (anchor for future diffs) up front, so a missing HEAD
+//!    (e.g. an empty repo) errors before we spend time on builds.
+//! 2. Read crate roots from `cargo metadata`, scoped per nextest target
 //!    (`binary_id`): each test's sentinel set covers its own crate root,
 //!    its package's lib (for non-lib targets), and lib roots of workspace
 //!    packages this target transitively depends on. Stored as sentinel-range
 //!    rows via [`HitRange::sentinel`] (line 1 through
 //!    `CRATE_ROOT_SENTINEL_END`) so any hunk in one of those files
 //!    overlaps and re-selects the test.
-//! 2. `cargo nextest list --message-format json` to enumerate every binary
-//!    and every testcase.
-//! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
-//!    runner wired in via `--config`. The preceding `list` step built the
-//!    binaries, so `run` is a cache hit. nextest handles parallelism and
-//!    progress. Each test invocation gets its `binary_id` straight from
-//!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
-//! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
-//!    git error surfaces before we spend time on coverage parsing.
-//! 5. Export each participating binary's coverage map **once**, with
+//! 3. `cargo nextest list --message-format json`, with `-C instrument-coverage`
+//!    in RUSTFLAGS, to enumerate every binary and every testcase. This builds
+//!    the instrumented binaries, so the `run` below is a cache hit.
+//! 4. Export each participating binary's coverage map **once**, with
 //!    `llvm-cov export` against an empty profile, and leave it under
 //!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
 //!    and it doesn't vary per test — see [`write_function_maps`].
+//! 5. `cargo nextest run` with the same RUSTFLAGS and the runner wired in via
+//!    `--config`. nextest handles parallelism and progress. Each test
+//!    invocation gets its `binary_id` straight from `NEXTEST_BINARY_ID` — the
+//!    runner shim doesn't need to map paths.
 //! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
 //!    profraw to text with `llvm-profdata`, joins the functions it names
