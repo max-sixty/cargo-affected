@@ -16,15 +16,18 @@ use crate::{cargo_affected, combined_output, git, init_git_with_initial_commit, 
 
 /// Crate whose only test reads `golden.txt` at runtime and compares it to what
 /// `greeting()` returns — a hermetic stand-in for an insta snapshot or doc-sync
-/// test.
-fn write_golden_project(dir: &Path) {
+/// test. `package` is the Cargo package name; give each scenario its own (see
+/// `tests/CLAUDE.md`).
+fn write_golden_project(dir: &Path, package: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
-        r#"[package]
-name = "config-rule-sample"
+        format!(
+            r#"[package]
+name = "{package}"
 version = "0.1.0"
 edition = "2021"
-"#,
+"#
+        ),
     )
     .unwrap();
     std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
@@ -60,17 +63,20 @@ edition = "2021"
 
     let tests = dir.join("tests");
     std::fs::create_dir_all(&tests).unwrap();
+    let krate = package.replace('-', "_");
     std::fs::write(
         tests.join("golden.rs"),
-        r#"#[test]
-fn golden_matches() {
+        format!(
+            r#"#[test]
+fn golden_matches() {{
     let expected = std::fs::read_to_string(
         concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
     )
     .unwrap();
-    assert_eq!(config_rule_sample::greeting::greeting(), expected.trim());
-}
-"#,
+    assert_eq!({krate}::greeting::greeting(), expected.trim());
+}}
+"#
+        ),
     )
     .unwrap();
 }
@@ -90,7 +96,7 @@ fn add_affected_rule(dir: &Path, globs: &str, filterset: &str) {
 fn config_rule_selects_test_for_non_rust_input_change() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-sample");
     init_git_with_initial_commit(dir);
 
     // Seed coverage: `golden_matches` runs, covering `greeting()` and the test
@@ -147,7 +153,7 @@ fn config_rule_selects_test_for_non_rust_input_change() {
 fn config_rule_rescues_committed_added_input() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-sample");
     add_affected_rule(dir, "\"data/*.snap\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);
 
@@ -185,7 +191,7 @@ fn config_rule_rescues_committed_added_input() {
 fn config_rule_bogus_filterset_fails_loudly() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-bogus-sample");
     // `&&` is a binary operator with no operands — nextest's filterset parser
     // rejects it.
     add_affected_rule(dir, "\"golden.txt\"", "&&");
@@ -221,7 +227,7 @@ fn config_rule_bogus_filterset_fails_loudly() {
 fn config_rule_inert_when_no_glob_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-sample");
     // A rule keyed on a file the edit below never touches.
     add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);
