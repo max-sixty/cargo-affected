@@ -16,15 +16,18 @@ use crate::{cargo_affected, combined_output, git, init_git_with_initial_commit, 
 
 /// Crate whose only test reads `golden.txt` at runtime and compares it to what
 /// `greeting()` returns — a hermetic stand-in for an insta snapshot or doc-sync
-/// test.
-fn write_golden_project(dir: &Path) {
+/// test. `package` is the Cargo package name; give each scenario its own (see
+/// `tests/CLAUDE.md`).
+fn write_golden_project(dir: &Path, package: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
-        r#"[package]
-name = "config-rule-sample"
+        format!(
+            r#"[package]
+name = "{package}"
 version = "0.1.0"
 edition = "2021"
-"#,
+"#
+        ),
     )
     .unwrap();
     std::fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
@@ -60,17 +63,20 @@ edition = "2021"
 
     let tests = dir.join("tests");
     std::fs::create_dir_all(&tests).unwrap();
+    let krate = package.replace('-', "_");
     std::fs::write(
         tests.join("golden.rs"),
-        r#"#[test]
-fn golden_matches() {
+        format!(
+            r#"#[test]
+fn golden_matches() {{
     let expected = std::fs::read_to_string(
         concat!(env!("CARGO_MANIFEST_DIR"), "/golden.txt"),
     )
     .unwrap();
-    assert_eq!(config_rule_sample::greeting::greeting(), expected.trim());
-}
-"#,
+    assert_eq!({krate}::greeting::greeting(), expected.trim());
+}}
+"#
+        ),
     )
     .unwrap();
 }
@@ -90,7 +96,7 @@ fn add_affected_rule(dir: &Path, globs: &str, filterset: &str) {
 fn config_rule_selects_test_for_non_rust_input_change() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-non-rust-input-sample");
     init_git_with_initial_commit(dir);
 
     // Seed coverage: `golden_matches` runs, covering `greeting()` and the test
@@ -147,7 +153,7 @@ fn config_rule_selects_test_for_non_rust_input_change() {
 fn config_rule_rescues_committed_added_input() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-added-input-sample");
     add_affected_rule(dir, "\"data/*.snap\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);
 
@@ -176,13 +182,52 @@ fn config_rule_rescues_committed_added_input() {
     );
 }
 
+/// A bogus filterset in `[*.metadata.affected]` that nextest's parser rejects
+/// must error end-to-end, not get swallowed into a silent skip. The "fail
+/// loudly" principle (CLAUDE.md) is load-bearing here: a typo'd filterset that
+/// silently selected zero tests would re-open the very gap the rule exists to
+/// close.
+#[test]
+fn config_rule_bogus_filterset_fails_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_golden_project(dir, "config-rule-bogus-sample");
+    // `&&` is a binary operator with no operands — nextest's filterset parser
+    // rejects it.
+    add_affected_rule(dir, "\"golden.txt\"", "&&");
+    init_git_with_initial_commit(dir);
+
+    // Seed coverage. `collect` doesn't resolve filtersets (no diff yet) so the
+    // bogus rule doesn't block the cache.
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    // Touch the rule's input. Resolution now happens — and must fail.
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+
+    let out = cargo_affected(dir, &["affected", "status", "-v"]);
+    let combined = combined_output(&out);
+    assert!(
+        !out.status.success(),
+        "expected failure for bogus filterset, got success: {combined}"
+    );
+    assert!(
+        combined.contains("filterset"),
+        "error must name the offending filterset: {combined}"
+    );
+}
+
 /// A rule that matches no changed path must be inert: a Rust-only edit takes
 /// the exact pre-rule path, with no config category and no extra selection.
 #[test]
 fn config_rule_inert_when_no_glob_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir);
+    write_golden_project(dir, "config-rule-inert-sample");
     // A rule keyed on a file the edit below never touches.
     add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);

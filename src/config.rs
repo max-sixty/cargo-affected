@@ -10,10 +10,11 @@
 //! with `cargo nextest list -E`, so it speaks the full nextest filter language.
 //!
 //! The rules ride in the manifest cargo-affected already loads via `cargo
-//! metadata`, so there's no extra file to read. The trade-off is that the
-//! manifest is fingerprinted: editing a rule changes the coverage-cache key, so
-//! the next run re-collects. No rules → the tool behaves exactly as before, with
-//! no extra `nextest list` invocation.
+//! metadata`, so there's no extra file to read. Manifests are fingerprinted,
+//! but [`crate::fingerprint`] strips `[*.metadata]` before hashing — cargo
+//! ignores it for builds — so editing a rule is cache-neutral and you can
+//! iterate on rules without re-collecting. No rules → the tool behaves exactly
+//! as before, with no extra `nextest list` invocation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
