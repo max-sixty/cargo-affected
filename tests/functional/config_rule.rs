@@ -96,7 +96,7 @@ fn add_affected_rule(dir: &Path, globs: &str, filterset: &str) {
 fn config_rule_selects_test_for_non_rust_input_change() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir, "config-rule-sample");
+    write_golden_project(dir, "config-rule-non-rust-input-sample");
     init_git_with_initial_commit(dir);
 
     // Seed coverage: `golden_matches` runs, covering `greeting()` and the test
@@ -153,7 +153,7 @@ fn config_rule_selects_test_for_non_rust_input_change() {
 fn config_rule_rescues_committed_added_input() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir, "config-rule-sample");
+    write_golden_project(dir, "config-rule-added-input-sample");
     add_affected_rule(dir, "\"data/*.snap\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);
 
@@ -227,7 +227,7 @@ fn config_rule_bogus_filterset_fails_loudly() {
 fn config_rule_inert_when_no_glob_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_golden_project(dir, "config-rule-sample");
+    write_golden_project(dir, "config-rule-inert-sample");
     // A rule keyed on a file the edit below never touches.
     add_affected_rule(dir, "\"golden.txt\"", "test(=golden_matches)");
     init_git_with_initial_commit(dir);
