@@ -92,10 +92,12 @@ pub(crate) fn run(
     // goes here rather than inside the two arms that could emit it.
     if let Some(reach) = state.reachability() {
         if !reach.missing.is_empty() {
-            eprintln!(
-                "{}",
-                selection::missing_shas_notice(&reach.missing, "will rerun as 'stranded'")
-            );
+            let fate = if state.strands_missing_sha_tests() {
+                "will rerun as 'stranded'"
+            } else {
+                "will rerun as part of the full suite"
+            };
+            eprintln!("{}", selection::missing_shas_notice(&reach.missing, fate));
         }
     }
 

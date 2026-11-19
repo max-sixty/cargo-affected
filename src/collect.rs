@@ -3,11 +3,14 @@
 //! Delegates build and test execution to `cargo nextest run`. We insert a
 //! small runner shim (`cargo-affected runner-shim`) via
 //! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at a
-//! per-test subdirectory, runs the real test binary, and turns its profile
-//! into line ranges on the spot. Each binary's function map — the expensive,
+//! per-test subdirectory, then spawns and waits for the real test binary and
+//! turns its profile into line ranges on the spot — merging profraws, joining
+//! them against the binary's function map, and writing a small per-test result
+//! file — before exiting. Each binary's function map — the expensive,
 //! test-invariant half of that translation — is exported once, before the run.
-//! After nextest finishes we read the per-test results back and write
-//! per-(test, file) line ranges to SQLite.
+//! After nextest finishes we read those per-test result files back and write
+//! per-(test, file) line ranges to SQLite. See the Approach section below and
+//! [`crate::shim`] for the in-shim extraction details.
 //!
 //! We use the `--config` array form rather than the
 //! `CARGO_TARGET_<TRIPLE>_RUNNER` env var because cargo only
@@ -16,27 +19,27 @@
 //! `/Users/joe/Library/Application Support/…` (macOS) would be
 //! mis-tokenised. The TOML array preserves the path as one argv slot.
 //!
-//! Approach:
-//! 1. Read crate roots from `cargo metadata`, scoped per nextest target
+//! Approach, in the order `collect` runs it:
+//! 1. Capture HEAD sha (anchor for future diffs) up front, so a missing HEAD
+//!    (e.g. an empty repo) errors before we spend time on builds.
+//! 2. Read crate roots from `cargo metadata`, scoped per nextest target
 //!    (`binary_id`): each test's sentinel set covers its own crate root,
 //!    its package's lib (for non-lib targets), and lib roots of workspace
 //!    packages this target transitively depends on. Stored as sentinel-range
 //!    rows via [`HitRange::sentinel`] (line 1 through
 //!    `CRATE_ROOT_SENTINEL_END`) so any hunk in one of those files
 //!    overlaps and re-selects the test.
-//! 2. `cargo nextest list --message-format json` to enumerate every binary
-//!    and every testcase.
-//! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
-//!    runner wired in via `--config`. The preceding `list` step built the
-//!    binaries, so `run` is a cache hit. nextest handles parallelism and
-//!    progress. Each test invocation gets its `binary_id` straight from
-//!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
-//! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
-//!    git error surfaces before we spend time on coverage parsing.
-//! 5. Export each participating binary's coverage map **once**, with
+//! 3. `cargo nextest list --message-format json`, with `-C instrument-coverage`
+//!    in RUSTFLAGS, to enumerate every binary and every testcase. This builds
+//!    the instrumented binaries, so the `run` below is a cache hit.
+//! 4. Export each participating binary's coverage map **once**, with
 //!    `llvm-cov export` against an empty profile, and leave it under
 //!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
 //!    and it doesn't vary per test — see [`write_function_maps`].
+//! 5. `cargo nextest run` with the same RUSTFLAGS and the runner wired in via
+//!    `--config`. nextest handles parallelism and progress. Each test
+//!    invocation gets its `binary_id` straight from `NEXTEST_BINARY_ID` — the
+//!    runner shim doesn't need to map paths.
 //! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
 //!    profraw to text with `llvm-profdata`, joins the functions it names
@@ -249,6 +252,12 @@ pub(crate) fn collect(
                      ({:.1}s total)",
                     total_start.elapsed().as_secs_f64(),
                 );
+                // This is a success path like the two below, so it owes the
+                // same sweep: the staging dirs were created before we knew
+                // there was nothing to rerun, and the PID suffix means each
+                // no-op `--diff` would otherwise strand a fresh empty triple
+                // under target/affected/ until the next `clean`.
+                remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
                 return Ok(0);
             }
         }
@@ -771,6 +780,15 @@ fn plan_diff_collect(
         );
     }
     let reach = selection::check_shas_reachable(project_root, &prior_shas)?;
+    if reach.reachable.is_empty() {
+        bail!(
+            "no reachable collect_sha for the current environment (every \
+             stored sha is rebased away or otherwise unreachable from HEAD); \
+             run `cargo affected collect` to re-anchor"
+        );
+    }
+    // Below the bail, not above it: the notice promises a rerun and a
+    // re-anchor, and on that path neither happens.
     if !reach.missing.is_empty() {
         eprintln!(
             "{}",
@@ -778,13 +796,6 @@ fn plan_diff_collect(
                 &reach.missing,
                 "will be rerun and re-anchored at the new HEAD",
             ),
-        );
-    }
-    if reach.reachable.is_empty() {
-        bail!(
-            "no reachable collect_sha for the current environment (every \
-             stored sha is rebased away or otherwise unreachable from HEAD); \
-             run `cargo affected collect` to re-anchor"
         );
     }
     if reach.max_commits_ahead > 0 {

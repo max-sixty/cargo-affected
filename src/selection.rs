@@ -15,9 +15,9 @@
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
 //! from several distinct collect points at once for a single fingerprint.
-//! Reachability is per-sha — diverged shas are skipped and tests stranded
-//! only there surface as `new_tests` so they're rerun rather than silently
-//! dropped.
+//! Reachability is per-sha — diverged shas are skipped and tests anchored
+//! only there surface as `stranded_tests` so they're rerun rather than
+//! silently dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -207,9 +207,10 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// than treating any divergence as all-or-nothing — important under `collect
 /// --diff`, where rows from several shas coexist for one fingerprint and a
 /// single rebase shouldn't invalidate unrelated tests' rows. Tests anchored
-/// at missing shas remain in the DB; queries skip them, and selection
-/// surfaces them as "new tests" so they get rerun (and re-anchored, in
-/// `collect --diff`'s case). Old rows accumulate as bloat — clear with
+/// at missing shas remain in the DB; queries skip them, so selection finds
+/// them absent from the reachable set but present in the DB and surfaces
+/// them as [`Selection::stranded_tests`] — rerun, and re-anchored in
+/// `collect --diff`'s case. Old rows accumulate as bloat — clear with
 /// `cargo affected clean`.
 pub(crate) struct Reachability {
     /// Per-sha relation to HEAD for every checked sha. Lets the report
@@ -229,11 +230,19 @@ pub(crate) struct Reachability {
     pub(crate) max_commits_ahead: u32,
 }
 
-/// Format the partial-divergence notice shared by `run`, `status`, and
+/// Format the missing-sha notice shared by `run`, `status`, and
 /// `collect --diff`. `verb_phrase` slots into "tests anchored only there
-/// VERB_PHRASE" — "will rerun as 'new'" for `run`/`collect --diff`, "would
-/// rerun as 'new'" for `status`. Returns the body without a trailing
-/// newline so callers can `eprintln!`/`println!` it directly.
+/// VERB_PHRASE", and the caller picks it: those tests' fate turns on both
+/// the command and whether any other sha survived, so it is not derivable
+/// here. `run` and `status` say "rerun as 'stranded'" when one did and
+/// "rerun as part of the full suite" when none did (see
+/// [`CacheState::strands_missing_sha_tests`](crate::plan::CacheState::strands_missing_sha_tests)),
+/// each in its own tense; `collect --diff` bails when no sha survives and
+/// otherwise says "will be rerun and re-anchored at the new HEAD" — it emits
+/// the notice below that bail, so the promise is only ever made where it
+/// holds.
+/// Returns the body without a trailing newline so callers can
+/// `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {
     let plural = plural_s(missing.len());
     let list = missing.iter().cloned().collect::<Vec<_>>().join(", ");
@@ -476,10 +485,10 @@ pub(crate) fn changed_paths_since(
 ///
 /// `Equal` outranks every `Reachable` rather than sharing rank 0 with
 /// `commits_ahead: 0`. `git rev-list --count sha..HEAD` is also zero for a sha
-/// that is a *descendant* of HEAD or a sibling with no commits HEAD lacks, and
-/// those trees differ from HEAD's; a sha that IS HEAD is the one anchor that
-/// can't be behind. Remaining ties (two distinct shas at the same distance,
-/// which needs one of them to be a sibling) break by sha for determinism.
+/// that is a *descendant* of HEAD, and that tree differs from HEAD's; a sha
+/// that IS HEAD is the one anchor that can't be behind. Remaining ties (two
+/// distinct shas at the same distance, such as two descendants of HEAD) break
+/// by sha for determinism.
 fn newest_reachable_sha(reach: &Reachability) -> Option<&String> {
     reach
         .reachable
@@ -876,12 +885,11 @@ mod tests {
     }
 
     /// `Equal` wins outright over a `Reachable` sha that is also zero commits
-    /// behind HEAD — a descendant of HEAD, or a sibling with no commits HEAD
-    /// lacks, both of which `git rev-list --count sha..HEAD` reports as 0. The
-    /// `zzz`/`aaa` naming makes the lexicographic tie-break pick the wrong one
-    /// if the two ever share a rank.
+    /// behind HEAD — a descendant of HEAD, which `git rev-list --count
+    /// sha..HEAD` reports as 0. The `zzz`/`aaa` naming makes the lexicographic
+    /// tie-break pick the wrong one if the two ever share a rank.
     #[test]
-    fn newest_reachable_prefers_head_over_a_zero_distance_sibling() {
+    fn newest_reachable_prefers_head_over_a_zero_distance_descendant() {
         let reach = Reachability {
             per_sha: [
                 (

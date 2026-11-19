@@ -83,6 +83,19 @@ impl CacheState {
             Self::Miss(CacheMiss::NoCoverage | CacheMiss::Fingerprint { .. }) => None,
         }
     }
+
+    /// Whether tests anchored only at a missing `collect_sha` come back as
+    /// the `stranded` selection category.
+    ///
+    /// The missing-sha notice is emitted from one place for both states
+    /// [`reachability`](Self::reachability) answers for, but their outcomes
+    /// differ: with a surviving sha there is a selection to join, so those
+    /// tests are `stranded`; with none there is no selection at all and the
+    /// whole suite runs. The callers own the wording (and its tense), so
+    /// this owns the distinction they both branch on.
+    pub(crate) fn strands_missing_sha_tests(&self) -> bool {
+        matches!(self, Self::Usable(_))
+    }
 }
 
 impl CacheMiss {
@@ -232,10 +245,10 @@ pub(crate) fn plan(
 
 /// `hit-exact` only when every reachable sha *is* HEAD.
 ///
-/// `Reachable { commits_ahead: 0 }` — a sibling of HEAD, as after
-/// `git reset --hard` to its parent — counts as divergence: the sha resolves,
-/// but its tree differs from HEAD's, so stored line numbers are in a
-/// different coordinate system.
+/// Every `Reachable` sha counts as divergence, including
+/// `Reachable { commits_ahead: 0 }` — a descendant of HEAD, as after
+/// `git reset --hard` to its parent: the sha resolves, but its tree differs
+/// from HEAD's, so stored line numbers are in a different coordinate system.
 fn classify_hit_status(reach: &Reachability) -> CacheStatus {
     if reach
         .per_sha
@@ -249,8 +262,8 @@ fn classify_hit_status(reach: &Reachability) -> CacheStatus {
 }
 
 /// Everything [`write_selection_report`] needs, bundled so the call site
-/// doesn't thread nine arguments — the same shape [`SelectionInputs`] uses
-/// one layer down.
+/// doesn't thread each field as its own argument — the same shape
+/// [`SelectionInputs`] uses one layer down.
 pub(crate) struct SelectionReport<'a> {
     pub(crate) command: &'static str,
     pub(crate) db: &'a Db,
@@ -290,7 +303,6 @@ pub(crate) fn write_selection_report(inputs: SelectionReport, path: &Path) -> Re
             &plan.changed_ranges,
             &plan.changed_paths.all,
         )?,
-        include_changed_files: true,
     };
     Report::build_selection(report_inputs).write_json(path)
 }

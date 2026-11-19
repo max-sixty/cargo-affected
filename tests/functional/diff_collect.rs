@@ -4,13 +4,21 @@
 //! at their original sha.
 //!
 //! This file exercises the headline guarantee — multiple shas can coexist
-//! in `test_regions` for the same fingerprint after `--diff` — plus the
-//! two error paths the project's "fail loudly" stance demands: no prior
-//! collect, and a stored sha no longer reachable from HEAD.
+//! in `test_regions` for the same fingerprint after `--diff` — along with
+//! the row-maintenance and selection behaviors built on it: re-anchoring
+//! only affected tests, accumulating distinct shas across rounds, pruning
+//! deleted/renamed tests while keeping merely-ignored ones, recovering from
+//! an all-phantom selection, and short-circuiting a clean tree. A few `run`
+//! cases live here too, since they exercise the multi-sha state `--diff`
+//! creates: a sibling sha is reachable rather than fatal (#9), and a
+//! selection spanning several shas stays narrow instead of widening to the
+//! whole suite.
+//! The hard errors covered are no prior collect and every stored sha missing
+//! from the repository.
 
 use crate::{
-    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit, replace_in_file,
-    write_two_module_project,
+    assert_no_staging_dirs, cargo_affected, combined_output, git, git_head,
+    init_git_with_initial_commit, replace_in_file, write_two_module_project,
 };
 
 /// Distinct collect_shas that anchor `test_name`'s rows. Sorted for stable
@@ -219,6 +227,75 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
         all_shas, expected,
         "three distinct collect_shas should coexist"
     );
+}
+
+/// Regression for #94. After a `--diff`, a clean working tree must select
+/// nothing — that steady state is the whole point of `--diff`.
+///
+/// `write_two_module_project` keeps `add` and `multiply` in the same
+/// `src/math.rs`, so after `--diff` re-anchors `test_add` at the new HEAD the
+/// rows left at the initial sha no longer cover `add`'s lines. The initial
+/// sha's diff still shows the committed edit to `add`, that hunk now overlaps
+/// no stored range there, and the structural-edit backstop broadens to every
+/// test with rows for `src/math.rs` at that sha — `test_multiply`. It reruns
+/// on every `run` until the next `collect`, even though nothing changed and
+/// `test_multiply` never touches `add`.
+///
+/// **This test fails today** — #94 is unfixed, so it is `#[ignore]`d to keep
+/// the suite green rather than turning `main` red for a defect no PR here
+/// introduced. It still runs on demand (`cargo test -- --ignored`), and the
+/// fix for #94 should remove the attribute in the same commit; the reason
+/// lives here rather than only in the attribute string so it survives an
+/// edit to either.
+#[test]
+#[ignore = "reproduction for #94 — fails today; un-ignore with the fix"]
+fn run_after_diff_collect_selects_nothing_on_a_clean_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_steady_state_backstop");
+    init_git_with_initial_commit(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "initial collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    replace_in_file(&dir.join("src/math.rs"), "a + b", "a + b /* edited */");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "edit add"]);
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    assert!(
+        diff.status.success(),
+        "collect --diff failed: stderr=\n{}\nstdout=\n{}",
+        String::from_utf8_lossy(&diff.stderr),
+        String::from_utf8_lossy(&diff.stdout),
+    );
+
+    // Working tree is clean and HEAD is the sha `--diff` just anchored at.
+    // Nothing should run — and nothing should run on the invocation after
+    // it either, since `run` never writes coverage rows.
+    for attempt in 1..=2 {
+        let run = cargo_affected(dir, &["affected", "run", "-v"]);
+        assert!(
+            run.status.success(),
+            "run #{attempt} failed: stderr=\n{}\nstdout=\n{}",
+            String::from_utf8_lossy(&run.stderr),
+            String::from_utf8_lossy(&run.stdout),
+        );
+        let combined = combined_output(&run);
+        assert!(
+            !combined.contains("test_multiply"),
+            "run #{attempt}: test_multiply doesn't touch `add` and the tree is \
+             clean — it must not be selected, got:\n{combined}"
+        );
+        assert!(
+            combined.contains("nothing to run"),
+            "run #{attempt}: expected an empty selection on a clean tree, got:\n{combined}"
+        );
+    }
 }
 
 #[test]
@@ -704,7 +781,8 @@ fn diff_collect_all_phantom_selection_prunes_cleanly() {
 
 /// `--diff` on a clean working tree (HEAD == prior collect_sha, no
 /// uncommitted edits) should short-circuit with exit 0 and announce that
-/// nothing needs to be recollected — no nextest invocation, no DB writes.
+/// nothing needs to be recollected — no nextest invocation, no DB writes,
+/// and no staging dirs left behind.
 #[test]
 fn diff_collect_clean_tree_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -756,5 +834,73 @@ fn diff_collect_clean_tree_exits_zero() {
         row_count(),
         before,
         "clean-tree --diff should leave test_regions row count unchanged"
+    );
+    // ...and the disk invariant. The staging dirs are created before the diff
+    // plan exists — that plan is what tells us there's nothing to rerun — so
+    // this path has to sweep them on the way out like the two rerun paths do.
+    // Without it, each no-op `--diff` strands a fresh PID-suffixed triple
+    // until the next `clean`.
+    assert_no_staging_dirs(dir, "collect --diff");
+}
+
+/// The second error path the module doc names — every stored `collect_sha`
+/// gone from the repo — which nothing pinned;
+/// [`diff_collect_errors_with_no_prior_collect`] covers the other one. It is
+/// also where the missing-sha notice meets the bail: nothing is rerun or
+/// re-anchored here, so the notice must not promise that it will be.
+#[test]
+fn diff_collect_errors_when_every_sha_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_diff_all_shas_missing");
+    init_git_with_initial_commit(dir);
+    let init_sha = git_head(dir);
+
+    // Collect at a *second* commit so the only stored sha is one the prune
+    // below can actually delete — HEAD's own commit can't be pruned.
+    replace_in_file(&dir.join("src/math.rs"), "a + b", "a + b /* v2 */");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "edit add"]);
+    let collect_commit = git_head(dir);
+
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        String::from_utf8_lossy(&collect.stderr),
+    );
+
+    // Same prune as `run_unions_affected_and_stranded_when_sha_is_missing`:
+    // the reset alone leaves the commit findable through the reflog, which
+    // is the sibling case, not this one.
+    git(dir, &["reset", "--hard", "-q", &init_sha]);
+    git(dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git(dir, &["gc", "--prune=now", "--quiet"]);
+    assert!(
+        !std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{collect_commit}^{{commit}}")])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "collect_sha {collect_commit} survived the prune, so this scenario \
+         would exercise the sibling path instead of the missing one",
+    );
+
+    let diff = cargo_affected(dir, &["affected", "collect", "--diff"]);
+    let combined = combined_output(&diff);
+    assert!(
+        !diff.status.success(),
+        "--diff with no reachable collect_sha must bail, got success:\n{combined}"
+    );
+    assert!(
+        combined.contains("no reachable collect_sha"),
+        "expected the unreachable-sha bail, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("will be rerun and re-anchored at the new HEAD"),
+        "the bail cancels the rerun, so the missing-sha notice must not \
+         promise one, got:\n{combined}"
     );
 }
