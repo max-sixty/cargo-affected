@@ -176,6 +176,45 @@ fn config_rule_rescues_committed_added_input() {
     );
 }
 
+/// A bogus filterset in `[*.metadata.affected]` that nextest's parser rejects
+/// must error end-to-end, not get swallowed into a silent skip. The "fail
+/// loudly" principle (CLAUDE.md) is load-bearing here: a typo'd filterset that
+/// silently selected zero tests would re-open the very gap the rule exists to
+/// close.
+#[test]
+fn config_rule_bogus_filterset_fails_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_golden_project(dir);
+    // `&&` is a binary operator with no operands — nextest's filterset parser
+    // rejects it.
+    add_affected_rule(dir, "\"golden.txt\"", "&&");
+    init_git_with_initial_commit(dir);
+
+    // Seed coverage. `collect` doesn't resolve filtersets (no diff yet) so the
+    // bogus rule doesn't block the cache.
+    let collect = cargo_affected(dir, &["affected", "collect"]);
+    assert!(
+        collect.status.success(),
+        "collect failed: {}",
+        combined_output(&collect)
+    );
+
+    // Touch the rule's input. Resolution now happens — and must fail.
+    replace_in_file(&dir.join("golden.txt"), "hello", "hi");
+
+    let out = cargo_affected(dir, &["affected", "status", "-v"]);
+    let combined = combined_output(&out);
+    assert!(
+        !out.status.success(),
+        "expected failure for bogus filterset, got success: {combined}"
+    );
+    assert!(
+        combined.contains("filterset"),
+        "error must name the offending filterset: {combined}"
+    );
+}
+
 /// A rule that matches no changed path must be inert: a Rust-only edit takes
 /// the exact pre-rule path, with no config category and no extra selection.
 #[test]
