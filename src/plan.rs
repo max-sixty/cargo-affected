@@ -243,7 +243,8 @@ pub(crate) fn plan(
     })
 }
 
-/// `hit-exact` only when every reachable sha *is* HEAD.
+/// `hit-exact` only when every stored sha *is* HEAD — a missing sha alongside
+/// an `Equal` one still counts as divergence.
 ///
 /// Every `Reachable` sha counts as divergence, including
 /// `Reachable { commits_ahead: 0 }` — a descendant of HEAD, as after

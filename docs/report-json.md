@@ -71,8 +71,8 @@ Closed enum. Consumers should treat unknown values as forward-compatible.
 
 | Value | Meaning |
 |---|---|
-| `hit-exact` | Fingerprint matched and every reachable collect_sha equals HEAD. Highest-precision selection. |
-| `hit-with-divergence` | Fingerprint matched; at least one reachable sha is ahead of HEAD or at least one stored sha is missing alongside reachable ones. Selection still runs but is noisier. |
+| `hit-exact` | Fingerprint matched and every stored collect_sha equals HEAD (none differs, none is missing). Highest-precision selection. |
+| `hit-with-divergence` | Fingerprint matched; at least one reachable sha differs from HEAD (an ancestor, a sibling, or a descendant) or at least one stored sha is missing alongside reachable ones. Selection still runs but is noisier. |
 | `miss-fingerprint` | DB has rows under other fingerprints but the current fingerprint isn't among them. A build input changed. Run skips selection. |
 | `miss-no-coverage` | DB has no rows at all. First-ever run, or after `cargo affected clean`. Run skips selection. |
 | `miss-no-reachable-sha` | Fingerprint matched but every stored collect_sha is missing from the repo (rebased away). No usable diff anchor. Run skips selection. |

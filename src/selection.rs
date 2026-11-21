@@ -214,7 +214,7 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// `cargo affected clean`.
 pub(crate) struct Reachability {
     /// Per-sha relation to HEAD for every checked sha. Lets the report
-    /// builder render which shas equal HEAD vs are ahead vs are missing
+    /// builder render which shas equal HEAD vs differ from it vs are missing
     /// instead of just summarizing.
     pub(crate) per_sha: BTreeMap<String, ShaRelation>,
     /// Stored shas the repo can still resolve to a commit. Includes strict
