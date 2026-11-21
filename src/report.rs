@@ -71,10 +71,12 @@ pub(crate) struct CacheReport {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CacheStatus {
-    /// Every reachable collect_sha equals HEAD; full-precision selection.
+    /// Every stored collect_sha equals HEAD — none differs, none is
+    /// missing; full-precision selection.
     HitExact,
-    /// Fingerprint matched but at least one reachable sha is ahead of
-    /// HEAD or at least one missing sha exists alongside reachable ones.
+    /// Fingerprint matched but at least one reachable sha differs from
+    /// HEAD (an ancestor, a sibling, or a descendant) or at least one
+    /// missing sha exists alongside reachable ones.
     /// Selection still runs; results are noisier than exact-match.
     HitWithDivergence,
     /// Composite fingerprint absent from DB (DB has rows under other
