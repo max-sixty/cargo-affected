@@ -675,8 +675,10 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
 }
 
 /// Read every per-test [`TestResult`] the shim wrote under `results_dir`. The
-/// layout mirrors the profraw tree — `<binary_id>/<test_name>.json` — so two
-/// levels of walking find them all. Sorted by `(binary_id, test_name)` so the
+/// layout mirrors the profraw tree — one directory per binary, one `.json` per
+/// test, both named by the shim's SHA-256 `storage_key` of the ID rather than
+/// the ID itself — so two levels of walking find them all. The real IDs come
+/// from each file's contents. Sorted by `(binary_id, test_name)` so the
 /// skip log and stored rows come out in a stable order.
 ///
 /// An unreadable or unparsable result file is skipped with a warning, not a

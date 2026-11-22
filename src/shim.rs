@@ -318,7 +318,8 @@ pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBu
     Some(function_maps_dir.join(format!("{name}.json")))
 }
 
-/// Write the per-test result to `<results_dir>/<binary_id>/<test_name>.json`.
+/// Write the per-test result to
+/// `<results_dir>/<storage_key(binary_id)>/<storage_key(test_name)>.json`.
 ///
 /// Written atomically — to a `.tmp` sibling, then renamed — so the reader
 /// (`collect::read_results`) only ever sees a complete file. Extraction runs
