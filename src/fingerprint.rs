@@ -1,8 +1,10 @@
 //! Environment fingerprinting.
 //!
 //! Produces a stable hash of every input that would globally invalidate cached
-//! coverage data: `Cargo.lock`, all workspace `Cargo.toml` files, the rustc
-//! version, and build-flag env vars. Stored alongside each `(test, file)`
+//! coverage data: the Git-relative coverage path basis (including the workspace
+//! prefix and path-schema version), `Cargo.lock`, all workspace `Cargo.toml`
+//! files, the rustc version, and build-flag env vars. Stored alongside each
+//! `(test, file)`
 //! mapping so queries scoped to the current fingerprint naturally miss when
 //! any tracked input has changed — no explicit invalidation path needed.
 //!

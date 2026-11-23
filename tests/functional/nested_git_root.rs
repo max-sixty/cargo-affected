@@ -9,17 +9,9 @@ fn write_nested_member(repo: &Path) {
     let member = repo.join("member");
     fs::create_dir_all(member.join("src")).unwrap();
     fs::create_dir_all(member.join("fixtures")).unwrap();
-    fs::create_dir_all(member.join(".cargo")).unwrap();
     fs::write(
         repo.join(".gitignore"),
         "/member/target/\n/member/Cargo.lock\n",
-    )
-    .unwrap();
-    // Required for compatibility with Cargo builds that aggressively remove
-    // intermediate test binaries as soon as compilation completes.
-    fs::write(
-        member.join(".cargo/config.toml"),
-        "[build]\nephemeral-intermediates = false\n",
     )
     .unwrap();
     fs::write(
