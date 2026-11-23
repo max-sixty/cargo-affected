@@ -92,6 +92,7 @@ pub(crate) fn collect(
     // Git reports paths relative to the repository root. LLVM function
     // locations and crate-root sentinels must use that exact same basis.
     let canonical_root = canonicalize_no_verbatim(&project.git_root)?;
+    let canonical_workspace_root = canonicalize_no_verbatim(project_root)?;
 
     // Refuse to collect on a dirty tree by default: ranges would be filed
     // under HEAD but reflect working-tree line numbers, knocking the DB out
@@ -281,6 +282,8 @@ pub(crate) fn collect(
         &llvm_profdata,
         &llvm_cov,
         &canonical_root,
+        &canonical_workspace_root,
+        &project.git_prefix,
     )?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
@@ -554,6 +557,8 @@ fn write_function_maps(
     llvm_profdata: &Path,
     llvm_cov: &Path,
     canonical_root: &Path,
+    canonical_workspace_root: &Path,
+    git_prefix: &Path,
 ) -> Result<()> {
     // An empty text profile merges into a valid profile containing no records,
     // which is exactly what "report every function as unexecuted" needs.
@@ -595,8 +600,13 @@ fn write_function_maps(
             );
         }
         let json = String::from_utf8_lossy(&export.stdout);
-        let functions = coverage::build_function_map(&json, canonical_root)
-            .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
+        let functions = coverage::build_function_map(
+            &json,
+            canonical_root,
+            canonical_workspace_root,
+            git_prefix,
+        )
+        .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
         if functions.is_empty() {
             bail!(
                 "{} has no instrumented functions under {} — every test in it \

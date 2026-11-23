@@ -86,11 +86,8 @@ fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
     // Coverage source paths used to be workspace-relative; old SQLite maps
     // cannot be interpreted using Git-root paths. Also differentiate a
     // workspace moved under a different subdirectory of the same Git repo.
-    let relative_workspace = project
-        .workspace_root
-        .strip_prefix(&project.git_root)
-        .context("Cargo workspace root is outside its Git repository")?;
-    let mut path_basis = b"git-root-v1/".to_vec();
+    let relative_workspace = &project.git_prefix;
+    let mut path_basis = b"git-root-v2/".to_vec();
     path_basis.extend(relative_workspace.to_string_lossy().as_bytes());
     inputs.push(("coverage_path_basis".to_string(), path_basis));
 
@@ -238,6 +235,7 @@ mod tests {
     fn project_with(workspace_root: PathBuf, manifests: Vec<PathBuf>) -> ProjectRoot {
         ProjectRoot {
             git_root: workspace_root.clone(),
+            git_prefix: PathBuf::new(),
             workspace_root,
             manifest_paths: manifests,
             metadata: serde_json::Value::Null,

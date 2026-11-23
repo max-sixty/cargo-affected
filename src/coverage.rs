@@ -236,6 +236,21 @@ pub(crate) fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
     }
 }
 
+/// Map absolute Cargo or LLVM source paths into Git-diff coordinates.
+/// The workspace prefix comes from Git; the roots keep the compiler's path
+/// spelling, which may include Windows 8.3 short names.
+pub(crate) fn to_git_relative(
+    source: &Path,
+    workspace_root: &Path,
+    git_root: &Path,
+    git_prefix: &Path,
+) -> Option<Utf8PathBuf> {
+    if let Ok(relative) = source.strip_prefix(workspace_root) {
+        return to_db_relative(&git_prefix.join(relative));
+    }
+    to_db_relative(source.strip_prefix(git_root).ok()?)
+}
+
 /// Build one binary's [`FunctionMap`] from its `llvm-cov export` JSON.
 ///
 /// `canonical_root` must already be canonicalized. Functions outside it
@@ -243,7 +258,12 @@ pub(crate) fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
 /// `files[]` but leaves `functions[]` intact, so the filter is applied here.
 /// Multiple monomorphizations of a generic that land on the same source extent
 /// collapse to one range.
-pub(crate) fn build_function_map(json: &str, canonical_root: &Path) -> Result<FunctionMap> {
+pub(crate) fn build_function_map(
+    json: &str,
+    canonical_root: &Path,
+    canonical_workspace_root: &Path,
+    git_prefix: &Path,
+) -> Result<FunctionMap> {
     let export: CoverageExport =
         serde_json::from_str(json).context("failed to parse llvm-cov export JSON")?;
 
@@ -270,10 +290,9 @@ pub(crate) fn build_function_map(json: &str, canonical_root: &Path) -> Result<Fu
                     continue;
                 };
                 let path = Path::new(filename);
-                let Ok(rel) = path.strip_prefix(canonical_root) else {
-                    continue;
-                };
-                let Some(utf8) = to_db_relative(rel) else {
+                let Some(utf8) =
+                    to_git_relative(path, canonical_workspace_root, canonical_root, git_prefix)
+                else {
                     continue;
                 };
                 let range = HitRange {
@@ -442,7 +461,7 @@ mod tests {
             ),
         ]);
 
-        let map = build_function_map(&json, &canon).unwrap();
+        let map = build_function_map(&json, &canon, &canon, Path::new("")).unwrap();
         assert_eq!(map.len(), 2, "the stdlib function is filtered out: {map:?}");
         assert_eq!(
             map["adds"],
@@ -479,7 +498,7 @@ mod tests {
             &[&lib],
             "[20, 0, 25, 0, 0, 0, 0, 0], [22, 0, 30, 0, 0, 0, 0, 0]",
         )]);
-        let map = build_function_map(&json, &canon).unwrap();
+        let map = build_function_map(&json, &canon, &canon, Path::new("")).unwrap();
         assert_eq!(map["early_return"][0].line_start, 20);
         assert_eq!(map["early_return"][0].line_end, 30);
     }
@@ -501,7 +520,7 @@ mod tests {
             function_json("id$u8", &[&lib], "[1, 0, 5, 0, 0, 0, 0, 0]"),
             function_json("id$i32", &[&lib], "[1, 0, 5, 0, 0, 0, 0, 0]"),
         ]);
-        let map = build_function_map(&json, &canon).unwrap();
+        let map = build_function_map(&json, &canon, &canon, Path::new("")).unwrap();
         let ranges = hit_ranges(&["id$u8", "id$i32"], &map).unwrap();
         assert_eq!(ranges.len(), 1);
     }
@@ -653,5 +672,48 @@ _RNvC5probe12never_called
         assert_eq!(r.line_start, 1);
         assert_eq!(r.line_end, CRATE_ROOT_SENTINEL_END);
         assert_eq!(r.line_end, i64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod git_root_path_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_paths_use_gits_spelling_instead_of_windows_short_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_root = tmp.path();
+        let cargo_workspace = git_root.join("SHORT~1");
+        let git_prefix = Path::new("workspace-long-name");
+        let result = to_git_relative(
+            &cargo_workspace.join("src/lib.rs"),
+            &cargo_workspace,
+            git_root,
+            git_prefix,
+        );
+        assert_eq!(
+            result.as_ref().map(|p| p.as_str()),
+            Some("workspace-long-name/src/lib.rs")
+        );
+
+        // Modules outside the Cargo workspace but in the repository still
+        // need Git-root-relative coordinates, not a workspace prefix.
+        let shared = to_git_relative(
+            &git_root.join("shared/generated.rs"),
+            &cargo_workspace,
+            git_root,
+            git_prefix,
+        );
+        assert_eq!(
+            shared.as_ref().map(|p| p.as_str()),
+            Some("shared/generated.rs")
+        );
+        assert!(to_git_relative(
+            &git_root.parent().unwrap().join("out-of-repo.rs"),
+            &cargo_workspace,
+            git_root,
+            git_prefix,
+        )
+        .is_none());
     }
 }

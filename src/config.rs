@@ -147,10 +147,7 @@ pub(crate) fn config_rule_hits(
     if rules.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let workspace_prefix = project
-        .workspace_root
-        .strip_prefix(&project.git_root)
-        .context("Cargo workspace root is outside its Git repository")?;
+    let workspace_prefix = &project.git_prefix;
     resolve_config_hits(
         &project.workspace_root,
         workspace_prefix,
