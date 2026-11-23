@@ -752,9 +752,9 @@ impl Db {
 
     /// Distinct (binary_id, test_name) pairs under `fingerprint` whose rows
     /// are anchored at one of `shas`. Used by selection to compute "tests
-    /// known to the cache *and reachable*" — tests anchored only at diverged
-    /// shas appear missing here, so selection surfaces them as stranded and
-    /// reruns them.
+    /// known to the cache *and reachable*" — tests anchored only at shas
+    /// missing from the repo are absent here, so selection surfaces them as
+    /// stranded and reruns them.
     pub(crate) fn all_tests_at_shas(
         &self,
         fingerprint: &str,
@@ -781,8 +781,9 @@ impl Db {
     }
 
     /// Count of `test_regions` rows under `fingerprint` whose `collect_sha`
-    /// is one of `shas`. Used by `status` to quantify diverged-row bloat so
-    /// the user knows when `cargo affected clean` is worth running.
+    /// is one of `shas`. Used by `status` to quantify the rows stranded at
+    /// missing shas so the user knows when `cargo affected clean` is worth
+    /// running.
     pub(crate) fn region_count_at_shas(
         &self,
         fingerprint: &str,
@@ -1589,7 +1590,7 @@ mod tests {
     }
 
     /// `region_count_at_shas` scopes by both fingerprint and sha, used for
-    /// the stale-row count `status` shows on partial divergence.
+    /// the stale-row count `status` shows when some shas are missing.
     #[test]
     fn region_count_scoped_by_shas() -> Result<()> {
         let dir = tempfile::tempdir()?;

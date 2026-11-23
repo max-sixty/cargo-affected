@@ -15,9 +15,10 @@
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
 //! from several distinct collect points at once for a single fingerprint.
-//! Reachability is per-sha — diverged shas are skipped and tests anchored
-//! only there surface as `stranded_tests` so they're rerun rather than
-//! silently dropped.
+//! Reachability is per-sha — shas missing from the repo are skipped and
+//! tests anchored only there surface as `stranded_tests` so they're rerun
+//! rather than silently dropped. A sha that has merely diverged from HEAD (a
+//! sibling) stays reachable and is diffed like any other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -204,7 +205,7 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// Per-sha reachability for the stored `collect_sha`s under one fingerprint.
 ///
 /// Splits cleanly so callers can proceed with the reachable subset rather
-/// than treating any divergence as all-or-nothing — important under `collect
+/// than treating any missing sha as all-or-nothing — important under `collect
 /// --diff`, where rows from several shas coexist for one fingerprint and a
 /// single rebase shouldn't invalidate unrelated tests' rows. Tests anchored
 /// at missing shas remain in the DB; queries skip them, so selection finds
