@@ -15,9 +15,10 @@
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
 //! from several distinct collect points at once for a single fingerprint.
-//! Reachability is per-sha — diverged shas are skipped and tests anchored
-//! only there surface as `stranded_tests` so they're rerun rather than
-//! silently dropped.
+//! Reachability is per-sha — shas missing from the repo are skipped and
+//! tests anchored only there surface as `stranded_tests` so they're rerun
+//! rather than silently dropped. A sha that has merely diverged from HEAD (a
+//! sibling) stays reachable and is diffed like any other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
