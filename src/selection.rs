@@ -205,7 +205,7 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// Per-sha reachability for the stored `collect_sha`s under one fingerprint.
 ///
 /// Splits cleanly so callers can proceed with the reachable subset rather
-/// than treating any divergence as all-or-nothing — important under `collect
+/// than treating any missing sha as all-or-nothing — important under `collect
 /// --diff`, where rows from several shas coexist for one fingerprint and a
 /// single rebase shouldn't invalidate unrelated tests' rows. Tests anchored
 /// at missing shas remain in the DB; queries skip them, so selection finds

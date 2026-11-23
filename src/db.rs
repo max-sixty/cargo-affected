@@ -1590,7 +1590,7 @@ mod tests {
     }
 
     /// `region_count_at_shas` scopes by both fingerprint and sha, used for
-    /// the stale-row count `status` shows on partial divergence.
+    /// the stale-row count `status` shows when some shas are missing.
     #[test]
     fn region_count_scoped_by_shas() -> Result<()> {
         let dir = tempfile::tempdir()?;

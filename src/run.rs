@@ -41,9 +41,9 @@ use crate::selection::{self, DiagnosticDetail};
 ///
 /// Runs every test (with an explanatory stderr notice) when the coverage
 /// cache offers nothing usable — no coverage yet, fingerprint mismatch, or
-/// every stored `collect_sha` unreachable from HEAD. Partial divergence
-/// (some shas reachable, some not) proceeds with the reachable subset and
-/// surfaces stranded tests as "stranded".
+/// every stored `collect_sha` missing from the repo. When only some are
+/// missing, `run` proceeds with the reachable subset and surfaces tests
+/// anchored only at missing shas as "stranded".
 pub(crate) fn run(
     all: bool,
     verbose: bool,

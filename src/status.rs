@@ -25,8 +25,8 @@ use crate::selection::{self, DiagnosticDetail};
 ///
 /// Reports "would run all tests" (with an explanation) when the cache
 /// offers nothing usable — no coverage, fingerprint mismatch, or every
-/// stored `collect_sha` unreachable. Partial divergence proceeds with the
-/// reachable subset and surfaces stranded tests.
+/// stored `collect_sha` missing from the repo. When only some are missing,
+/// it proceeds with the reachable subset and surfaces stranded tests.
 ///
 /// The prediction comes from [`crate::plan::plan`], the same call `run`
 /// makes, so "what would run" can't drift from what runs. `nextest_args`
