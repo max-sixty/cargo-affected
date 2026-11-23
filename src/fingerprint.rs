@@ -39,8 +39,8 @@ pub(crate) struct Fingerprint {
 /// A single named input contributing to the composite fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FingerprintComponent {
-    /// Stable label (`cargo_lock`, `manifest:Cargo.toml`, `rustc`,
-    /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
+    /// Stable label (`coverage_path_basis`, `cargo_lock`,
+    /// `manifest:Cargo.toml`, `rustc`, `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
     pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
     pub(crate) hash: String,
@@ -390,6 +390,7 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "coverage_path_basis",
                 "cargo_lock",
                 "manifest:Cargo.toml",
                 "manifest:crates/foo/Cargo.toml",
