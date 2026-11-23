@@ -89,7 +89,9 @@ pub(crate) fn collect(
     if verbose {
         eprintln!("project root: {}", project_root.display());
     }
-    let canonical_root = canonicalize_no_verbatim(project_root)?;
+    // Git reports paths relative to the repository root. LLVM function
+    // locations and crate-root sentinels must use that exact same basis.
+    let canonical_root = canonicalize_no_verbatim(&project.git_root)?;
 
     // Refuse to collect on a dirty tree by default: ranges would be filed
     // under HEAD but reflect working-tree line numbers, knocking the DB out

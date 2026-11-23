@@ -147,7 +147,17 @@ pub(crate) fn config_rule_hits(
     if rules.is_empty() {
         return Ok(BTreeMap::new());
     }
-    resolve_config_hits(&project.workspace_root, build_args, &rules, changed_paths)
+    let workspace_prefix = project
+        .workspace_root
+        .strip_prefix(&project.git_root)
+        .context("Cargo workspace root is outside its Git repository")?;
+    resolve_config_hits(
+        &project.workspace_root,
+        workspace_prefix,
+        build_args,
+        &rules,
+        changed_paths,
+    )
 }
 
 /// Resolve compiled rules against the changed paths, returning a map from each
@@ -198,6 +208,7 @@ pub(crate) fn config_rule_hits(
 /// keep the set non-empty and the warning would never fire at all.
 pub(crate) fn resolve_config_hits(
     project_root: &Path,
+    workspace_prefix: &Path,
     build_args: &[String],
     rules: &[CompiledRule],
     changed_paths: &BTreeSet<String>,
@@ -207,7 +218,15 @@ pub(crate) fn resolve_config_hits(
     for rule in rules {
         let matched: Vec<&String> = changed_paths
             .iter()
-            .filter(|p| rule.matcher.is_match(p.as_str()))
+            .filter(|p| {
+                // The rule's globs are relative to Cargo's workspace, while
+                // the selector stores Git-root-relative paths. Keep the
+                // original Git path as the reason key for the JSON report.
+                Path::new(p)
+                    .strip_prefix(workspace_prefix)
+                    .ok()
+                    .is_some_and(|relative| rule.matcher.is_match(relative))
+            })
             .collect();
         if matched.is_empty() {
             continue;

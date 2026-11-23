@@ -84,7 +84,10 @@ pub(crate) enum ShaRelation {
 
 /// Project root information.
 pub(crate) struct ProjectRoot {
-    /// Workspace root directory. Git operations and the DB live here.
+    /// Git repository root. Git diffs are relative to this directory even
+    /// when Cargo's workspace is nested further down.
+    pub(crate) git_root: PathBuf,
+    /// Workspace root directory. The coverage DB and Cargo builds live here.
     /// For single-crate projects this equals the crate root.
     pub(crate) workspace_root: PathBuf,
     /// All Cargo.toml files belonging to the workspace — the root manifest
@@ -142,6 +145,22 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
         .as_str()
         .context("cargo metadata missing workspace_root")?;
     let workspace_root = PathBuf::from(workspace_root);
+    let git_root_output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&workspace_root)
+        .output()
+        .context("failed to find Git repository root")?;
+    if !git_root_output.status.success() {
+        bail!(
+            "git rev-parse --show-toplevel failed: {}",
+            String::from_utf8_lossy(&git_root_output.stderr).trim()
+        );
+    }
+    let git_root = PathBuf::from(
+        std::str::from_utf8(&git_root_output.stdout)
+            .context("git repository root was not UTF-8")?
+            .trim(),
+    );
 
     let mut manifest_paths: Vec<PathBuf> = meta["packages"]
         .as_array()
@@ -164,6 +183,7 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
     manifest_paths.sort();
 
     Ok(ProjectRoot {
+        git_root,
         workspace_root,
         manifest_paths,
         metadata: meta,
@@ -205,7 +225,10 @@ impl ProjectRoot {
         // would diverge on Windows (verbatim `\\?\` prefix, 8.3 → long-name
         // expansion of `RUNNER~1` → `runneradmin`) and the strip_prefix
         // below would silently drop every target.
-        let root = &self.workspace_root;
+        // Coverage regions and Git diffs must use the same coordinate
+        // system. Git emits repository-relative paths, not workspace-relative
+        // ones, when a Cargo workspace sits below the Git root.
+        let root = &self.git_root;
 
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
@@ -441,7 +464,13 @@ pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
             "--cached",
             "-z",
         ],
-        vec!["ls-files", "-z", "--others", "--exclude-standard"],
+        vec![
+            "ls-files",
+            "--full-name",
+            "-z",
+            "--others",
+            "--exclude-standard",
+        ],
     ] {
         for path in run_git(project_root, &args)? {
             if !files.contains(&path) {
@@ -844,6 +873,19 @@ mod tests {
             files.iter().any(|f| f == "new.txt"),
             "expected new.txt in {files:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_repository_untracked_files_keep_git_root_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(member.join("src"))?;
+        std::fs::write(member.join("src/new.rs"), b"pub fn new() {}\n")?;
+
+        let paths = git_changed_files(&member)?;
+        assert_eq!(paths, vec!["member/src/new.rs"]);
         Ok(())
     }
 
@@ -1319,6 +1361,7 @@ mod tests {
         });
 
         let project = ProjectRoot {
+            git_root: root.clone(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
             metadata,
@@ -1426,6 +1469,7 @@ mod tests {
         });
 
         let project = ProjectRoot {
+            git_root: root.clone(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
             metadata,
@@ -1515,6 +1559,7 @@ mod tests {
         });
 
         let project = ProjectRoot {
+            git_root: root.clone(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
             metadata,
