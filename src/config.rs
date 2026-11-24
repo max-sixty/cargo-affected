@@ -17,7 +17,7 @@
 //! as before, with no extra `nextest list` invocation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::collect::{args_without_filtersets, nextest_list, Listing};
 use crate::db::TestId;
-use crate::project::ProjectRoot;
+use crate::project::{git_prefix, ProjectRoot};
 
 /// Where rules live, for user-facing error messages. The `*` shorthand covers
 /// both locations — `[workspace.metadata.affected]` and the single-crate
@@ -148,14 +148,10 @@ pub(crate) fn config_rule_hits(
         return Ok(BTreeMap::new());
     }
     // Rule globs are relative to the workspace; changed paths are relative to
-    // the Git root, which is the workspace or one of its ancestors.
-    let prefix = project
-        .workspace_root
-        .strip_prefix(&project.git_root)
-        .expect("git_root is derived as an ancestor of workspace_root");
+    // the Git root.
     resolve_config_hits(
         &project.workspace_root,
-        prefix,
+        &git_prefix(&project.workspace_root)?,
         build_args,
         &rules,
         changed_paths,
@@ -210,7 +206,7 @@ pub(crate) fn config_rule_hits(
 /// keep the set non-empty and the warning would never fire at all.
 pub(crate) fn resolve_config_hits(
     project_root: &Path,
-    workspace_prefix: &Path,
+    git_prefix: &Path,
     build_args: &[String],
     rules: &[CompiledRule],
     changed_paths: &BTreeSet<String>,
@@ -221,9 +217,8 @@ pub(crate) fn resolve_config_hits(
         let matched: Vec<&String> = changed_paths
             .iter()
             .filter(|p| {
-                Path::new(p)
-                    .strip_prefix(workspace_prefix)
-                    .is_ok_and(|rel| rule.matcher.is_match(rel))
+                rule.matcher
+                    .is_match(workspace_relative(Path::new(p), git_prefix))
             })
             .collect();
         if matched.is_empty() {
@@ -274,9 +269,42 @@ pub(crate) fn resolve_config_hits(
     Ok(out)
 }
 
+/// A path relative to the Git root, made relative to the workspace for rule
+/// globs to match: with `git_prefix` `member`, `member/src/x.rs` becomes
+/// `src/x.rs` and `docs/x.md` becomes `../docs/x.md`.
+fn workspace_relative(path: &Path, git_prefix: &Path) -> PathBuf {
+    let mut prefix = git_prefix.components().peekable();
+    let mut rest = path.components().peekable();
+    while prefix.peek().is_some() && prefix.peek() == rest.peek() {
+        prefix.next();
+        rest.next();
+    }
+    prefix.map(|_| Component::ParentDir).chain(rest).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_paths_become_workspace_relative() {
+        let member = Path::new("member");
+        let rel = |p: &str| workspace_relative(Path::new(p), member);
+        assert_eq!(rel("member/src/x.rs"), Path::new("src/x.rs"));
+        assert_eq!(rel("docs/x.md"), Path::new("../docs/x.md"));
+        assert_eq!(rel("member2/x.md"), Path::new("../member2/x.md"));
+        assert_eq!(
+            workspace_relative(Path::new("a/c/x.md"), Path::new("a/b")),
+            Path::new("../c/x.md")
+        );
+        assert_eq!(
+            workspace_relative(Path::new("src/x.rs"), Path::new("")),
+            Path::new("src/x.rs")
+        );
+        // A recursive glob still reaches inputs beside the workspace.
+        let glob = Glob::new("**/*.snap").unwrap().compile_matcher();
+        assert!(glob.is_match(rel("fixtures/a.snap")));
+    }
 
     /// `[workspace.metadata.affected]` shape, as `cargo metadata` surfaces it.
     fn workspace_meta(rules: Value) -> Value {

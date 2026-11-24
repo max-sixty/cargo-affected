@@ -124,6 +124,17 @@ fn nested_git_root_selects_covered_functions_and_workspace_rules() {
         .unwrap()
         .contains("forty"),);
 
+    // `diff.relative` would make git print `src/logic.rs` from inside the
+    // member; cargo-affected must still see the Git-root path.
+    git(repo, &["config", "diff.relative", "true"]);
+    let relative = cargo_affected(&member, &["affected", "status"]);
+    assert!(
+        combined_output(&relative).contains("selection=1/2"),
+        "diff.relative changed the selection: {}",
+        combined_output(&relative),
+    );
+    git(repo, &["config", "--unset", "diff.relative"]);
+
     // Verify it really fails when executed, rather than merely assuming
     // the coverage-selected test can detect this particular mutation.
     let full = std::process::Command::new("cargo")

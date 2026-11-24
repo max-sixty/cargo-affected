@@ -157,7 +157,9 @@ globs = ["README.md", "docs/**/*.md"]
 filterset = "test(/readme_sync/)"
 ```
 
-Each rule pairs `globs` (matched against changed paths) with a nextest
+Each rule pairs `globs` (matched against changed paths relative to the
+workspace root, so a file beside a nested workspace is `../docs/x.md`) with a
+nextest
 `filterset` (the full [filter-expression
 language](https://nexte.st/docs/filtersets/)). When a changed path matches, the
 filterset is resolved with `cargo nextest list -E` and its tests are

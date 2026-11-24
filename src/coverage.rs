@@ -62,7 +62,7 @@
 //! project-root filter itself using `strip_prefix`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
@@ -127,8 +127,8 @@ impl<'de> Deserialize<'de> for CoverageRegion {
 /// One hit function range for some test, in source coordinates.
 ///
 /// `line_start..=line_end` is the inclusive line span covered by the function's
-/// hit regions in `file`. Sources are stored relative to the project root so
-/// they line up with `git diff` output.
+/// hit regions in `file`, which is the source's [`DbKeys`] key, so it
+/// compares directly with the paths `git diff` reports.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct HitRange {
     pub(crate) file: Utf8PathBuf,
@@ -218,32 +218,69 @@ pub(crate) struct BinaryFunctionMap {
     pub(crate) functions: FunctionMap,
 }
 
-/// Convert a relative source path into a `Utf8PathBuf` whose string form uses
-/// forward slashes on every platform.
+/// Turns the absolute path of a source file, as cargo or llvm-cov spell it,
+/// into the path the database stores for it: the file's path relative to the
+/// Git root, which is how every git query in [`crate::project`] reports it.
 ///
-/// llvm-cov and cargo on Windows emit paths with `\` separators, while git
-/// diff always uses `/`. The DB stores file paths as opaque strings and
-/// looks them up by exact-match — so anything destined for `test_regions`
-/// must be normalised to git's separator or selection silently misses on
-/// Windows. Returns `None` if the path isn't valid UTF-8 (paths originating
-/// from cargo/llvm-cov already are, but the call shape is still fallible).
-pub(crate) fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
-    let utf8 = Utf8PathBuf::try_from(path.to_path_buf()).ok()?;
-    if cfg!(windows) && utf8.as_str().contains('\\') {
-        Some(Utf8PathBuf::from(utf8.as_str().replace('\\', "/")))
-    } else {
-        Some(utf8)
+/// The key is the file's path relative to `root`, with `git_prefix` (the
+/// workspace's directory as git spells it) in front. Taking that prefix from
+/// git rather than from `root` matters wherever the two spell a directory
+/// differently: a Windows 8.3 short name, or a name in another Unicode
+/// normalization on macOS. `..` components resolve lexically, so a path
+/// dependency beside the workspace and a `#[path = "../x.rs"]` module both
+/// get the path git reports. A file outside the repository has no key.
+///
+/// Separators become `/` on every platform: llvm-cov and cargo on Windows
+/// emit `\`, git always `/`, and the database matches paths as exact strings.
+pub(crate) struct DbKeys<'a> {
+    /// The workspace root, spelled the way the paths being keyed spell it.
+    pub(crate) root: &'a Path,
+    /// [`crate::project::git_prefix`].
+    pub(crate) git_prefix: &'a Path,
+}
+
+impl DbKeys<'_> {
+    pub(crate) fn key(&self, path: &Path) -> Option<Utf8PathBuf> {
+        let mut key = self.git_prefix.to_path_buf();
+        let mut base = self.root;
+        let rel = loop {
+            if let Ok(rel) = path.strip_prefix(base) {
+                break rel;
+            }
+            base = base.parent()?;
+            if !key.pop() {
+                return None;
+            }
+        };
+        for component in rel.components() {
+            match component {
+                Component::Normal(part) => key.push(part),
+                Component::ParentDir => {
+                    if !key.pop() {
+                        return None;
+                    }
+                }
+                Component::CurDir => {}
+                Component::Prefix(_) | Component::RootDir => return None,
+            }
+        }
+        let utf8 = Utf8PathBuf::try_from(key).ok()?;
+        if cfg!(windows) && utf8.as_str().contains('\\') {
+            Some(Utf8PathBuf::from(utf8.as_str().replace('\\', "/")))
+        } else {
+            Some(utf8)
+        }
     }
 }
 
 /// Build one binary's [`FunctionMap`] from its `llvm-cov export` JSON.
 ///
-/// `canonical_root` must already be canonicalized. Functions outside it
-/// (stdlib, dependencies) are dropped: `--ignore-filename-regex` shrinks
-/// `files[]` but leaves `functions[]` intact, so the filter is applied here.
-/// Multiple monomorphizations of a generic that land on the same source extent
-/// collapse to one range.
-pub(crate) fn build_function_map(json: &str, canonical_root: &Path) -> Result<FunctionMap> {
+/// `keys.root` must already be canonicalized. Functions with no key (stdlib,
+/// dependencies) are dropped: `--ignore-filename-regex` shrinks `files[]` but
+/// leaves `functions[]` intact, so the filter is applied here. Multiple
+/// monomorphizations of a generic that land on the same source extent collapse
+/// to one range.
+pub(crate) fn build_function_map(json: &str, keys: &DbKeys) -> Result<FunctionMap> {
     let export: CoverageExport =
         serde_json::from_str(json).context("failed to parse llvm-cov export JSON")?;
 
@@ -269,15 +306,11 @@ pub(crate) fn build_function_map(json: &str, canonical_root: &Path) -> Result<Fu
                 let Some(filename) = func.filenames.get(file_id) else {
                     continue;
                 };
-                let path = Path::new(filename);
-                let Ok(rel) = path.strip_prefix(canonical_root) else {
-                    continue;
-                };
-                let Some(utf8) = to_db_relative(rel) else {
+                let Some(file) = keys.key(Path::new(filename)) else {
                     continue;
                 };
                 let range = HitRange {
-                    file: utf8,
+                    file,
                     line_start: start,
                     line_end: end,
                 };
@@ -413,6 +446,48 @@ mod tests {
         )
     }
 
+    /// Keys for a workspace at the root of its repository.
+    fn top_level_keys(root: &Path) -> DbKeys<'_> {
+        DbKeys {
+            root,
+            git_prefix: Path::new(""),
+        }
+    }
+
+    fn key(keys: &DbKeys, path: &str) -> Option<String> {
+        keys.key(Path::new(path)).map(|k| k.to_string())
+    }
+
+    /// A key is the path relative to the Git root: the workspace's prefix,
+    /// then the path below the workspace, with `..` resolved.
+    #[test]
+    fn keys_are_relative_to_the_git_root() {
+        let nested = DbKeys {
+            root: Path::new("/repo/member"),
+            git_prefix: Path::new("member"),
+        };
+        assert_eq!(
+            key(&nested, "/repo/member/src/lib.rs").as_deref(),
+            Some("member/src/lib.rs")
+        );
+        // A path dependency beside the workspace.
+        assert_eq!(
+            key(&nested, "/repo/shared/src/lib.rs").as_deref(),
+            Some("shared/src/lib.rs")
+        );
+        // A `#[path = "../../shared.rs"]` module.
+        assert_eq!(
+            key(&nested, "/repo/member/src/../../shared.rs").as_deref(),
+            Some("shared.rs")
+        );
+        assert_eq!(key(&nested, "/elsewhere/x.rs"), None);
+        assert_eq!(key(&nested, "/repo/member/../../x.rs"), None);
+
+        let top = top_level_keys(Path::new("/repo"));
+        assert_eq!(key(&top, "/repo/src/lib.rs").as_deref(), Some("src/lib.rs"));
+        assert_eq!(key(&top, "/elsewhere/x.rs"), None);
+    }
+
     /// A project with two source files: the map records each function's full
     /// extent per file, and functions outside the project root are dropped.
     #[test]
@@ -442,7 +517,7 @@ mod tests {
             ),
         ]);
 
-        let map = build_function_map(&json, &canon).unwrap();
+        let map = build_function_map(&json, &top_level_keys(&canon)).unwrap();
         assert_eq!(map.len(), 2, "the stdlib function is filtered out: {map:?}");
         assert_eq!(
             map["adds"],
@@ -479,7 +554,7 @@ mod tests {
             &[&lib],
             "[20, 0, 25, 0, 0, 0, 0, 0], [22, 0, 30, 0, 0, 0, 0, 0]",
         )]);
-        let map = build_function_map(&json, &canon).unwrap();
+        let map = build_function_map(&json, &top_level_keys(&canon)).unwrap();
         assert_eq!(map["early_return"][0].line_start, 20);
         assert_eq!(map["early_return"][0].line_end, 30);
     }
@@ -501,7 +576,7 @@ mod tests {
             function_json("id$u8", &[&lib], "[1, 0, 5, 0, 0, 0, 0, 0]"),
             function_json("id$i32", &[&lib], "[1, 0, 5, 0, 0, 0, 0, 0]"),
         ]);
-        let map = build_function_map(&json, &canon).unwrap();
+        let map = build_function_map(&json, &top_level_keys(&canon)).unwrap();
         let ranges = hit_ranges(&["id$u8", "id$i32"], &map).unwrap();
         assert_eq!(ranges.len(), 1);
     }
