@@ -898,6 +898,13 @@ fn diff_collect_errors_when_every_sha_is_missing() {
         combined.contains("no reachable collect_sha"),
         "expected the unreachable-sha bail, got:\n{combined}"
     );
+    // The bail names the actual condition: a sha that merely diverged from
+    // HEAD is still diffed, so only one absent from the object store lands here.
+    assert!(
+        combined.contains("missing from the repo"),
+        "the bail must say the stored shas are missing, not merely \
+         unreachable from HEAD, got:\n{combined}"
+    );
     assert!(
         !combined.contains("will be rerun and re-anchored at the new HEAD"),
         "the bail cancels the rerun, so the missing-sha notice must not \
