@@ -58,8 +58,9 @@
 //! silently skips the test that would have caught the regression.
 //!
 //! Note that `--ignore-filename-regex` shrinks `data[].files[]` but leaves
-//! `data[].functions[]` untouched, so [`build_function_map`] applies the
-//! project-root filter itself using `strip_prefix`.
+//! `data[].functions[]` untouched, so [`build_function_map`] drops every
+//! function whose file has no [`DbKeys`] key, meaning it lies outside the
+//! repository.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
