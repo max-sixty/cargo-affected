@@ -785,8 +785,8 @@ fn plan_diff_collect(
     if reach.reachable.is_empty() {
         bail!(
             "no reachable collect_sha for the current environment (every \
-             stored sha is rebased away or otherwise unreachable from HEAD); \
-             run `cargo affected collect` to re-anchor"
+             stored sha is missing from the repo, e.g. rebased away and \
+             garbage-collected); run `cargo affected collect` to re-anchor"
         );
     }
     // Below the bail, not above it: the notice promises a rerun and a
