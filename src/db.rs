@@ -11,7 +11,14 @@
 //!   `(1, i64::MAX)` so any hunk in a crate root overlaps and selects the
 //!   test — same effect as the old per-test implicit dep, no special-case
 //!   branch.
-//! - `fingerprints` — `(fingerprint, last_seen)`. Last-seen drives LRU
+//! - `retired_ranges` — `(source_file, env_fingerprint, collect_sha,
+//!   line_start, line_end)`: the ranges `test_regions` rows held at a sha
+//!   before `collect --diff` re-anchored or pruned their test. The
+//!   structural-edit backstop counts them as covered lines and never selects
+//!   a test from them. Every path that deletes `test_regions` rows either
+//!   carries their ranges here (`batch_delete_tests`) or clears this table
+//!   for the same fingerprint.
+//! - `fingerprints` —`(fingerprint, last_seen)`. Last-seen drives LRU
 //!   eviction up to `FINGERPRINT_KEEP`.
 //! - `fingerprint_components` — `(env_fingerprint, label, content_hash)`. The
 //!   per-input decomposition of `env_fingerprint`, so a cache miss can be
