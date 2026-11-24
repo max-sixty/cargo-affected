@@ -3,11 +3,14 @@
 //! Delegates build and test execution to `cargo nextest run`. We insert a
 //! small runner shim (`cargo-affected runner-shim`) via
 //! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at a
-//! per-test subdirectory, runs the real test binary, and turns its profile
-//! into line ranges on the spot. Each binary's function map — the expensive,
+//! per-test subdirectory, then spawns and waits for the real test binary and
+//! turns its profile into line ranges on the spot — merging profraws, joining
+//! them against the binary's function map, and writing a small per-test result
+//! file — before exiting. Each binary's function map — the expensive,
 //! test-invariant half of that translation — is exported once, before the run.
-//! After nextest finishes we read the per-test results back and write
-//! per-(test, file) line ranges to SQLite.
+//! After nextest finishes we read those per-test result files back and write
+//! per-(test, file) line ranges to SQLite. See the Approach section below and
+//! [`crate::shim`] for the in-shim extraction details.
 //!
 //! We use the `--config` array form rather than the
 //! `CARGO_TARGET_<TRIPLE>_RUNNER` env var because cargo only
@@ -16,27 +19,27 @@
 //! `/Users/joe/Library/Application Support/…` (macOS) would be
 //! mis-tokenised. The TOML array preserves the path as one argv slot.
 //!
-//! Approach:
-//! 1. Read crate roots from `cargo metadata`, scoped per nextest target
+//! Approach, in the order `collect` runs it:
+//! 1. Capture HEAD sha (anchor for future diffs) up front, so a missing HEAD
+//!    (e.g. an empty repo) errors before we spend time on builds.
+//! 2. Read crate roots from `cargo metadata`, scoped per nextest target
 //!    (`binary_id`): each test's sentinel set covers its own crate root,
 //!    its package's lib (for non-lib targets), and lib roots of workspace
 //!    packages this target transitively depends on. Stored as sentinel-range
 //!    rows via [`HitRange::sentinel`] (line 1 through
 //!    `CRATE_ROOT_SENTINEL_END`) so any hunk in one of those files
 //!    overlaps and re-selects the test.
-//! 2. `cargo nextest list --message-format json` to enumerate every binary
-//!    and every testcase.
-//! 3. `cargo nextest run` with `-C instrument-coverage` in RUSTFLAGS and the
-//!    runner wired in via `--config`. The preceding `list` step built the
-//!    binaries, so `run` is a cache hit. nextest handles parallelism and
-//!    progress. Each test invocation gets its `binary_id` straight from
-//!    `NEXTEST_BINARY_ID` — the runner shim doesn't need to map paths.
-//! 4. Capture HEAD sha (anchor for future diffs) before extraction so any
-//!    git error surfaces before we spend time on coverage parsing.
-//! 5. Export each participating binary's coverage map **once**, with
+//! 3. `cargo nextest list --message-format json`, with `-C instrument-coverage`
+//!    in RUSTFLAGS, to enumerate every binary and every testcase. This builds
+//!    the instrumented binaries, so the `run` below is a cache hit.
+//! 4. Export each participating binary's coverage map **once**, with
 //!    `llvm-cov export` against an empty profile, and leave it under
 //!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
 //!    and it doesn't vary per test — see [`write_function_maps`].
+//! 5. `cargo nextest run` with the same RUSTFLAGS and the runner wired in via
+//!    `--config`. nextest handles parallelism and progress. Each test
+//!    invocation gets its `binary_id` straight from `NEXTEST_BINARY_ID` — the
+//!    runner shim doesn't need to map paths.
 //! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
 //!    profraw to text with `llvm-profdata`, joins the functions it names
@@ -214,13 +217,14 @@ pub(crate) fn collect(
         project_root,
         Some(&rustflags),
         Some(&build_dir),
-        &cargo_build_args(nextest_args),
+        &args_for_listing(nextest_args),
         None,
     )?;
     eprintln!(
-        "found {} tests across {} binaries",
+        "found {} test{} across {}",
         listing.tests.len(),
-        listing.binaries.len()
+        plural_s(listing.tests.len()),
+        binaries_phrase(listing.binaries.len())
     );
     let fingerprint = fingerprint::compute(&project)?;
     let env_fingerprint = &fingerprint.hex;
@@ -248,6 +252,12 @@ pub(crate) fn collect(
                      ({:.1}s total)",
                     total_start.elapsed().as_secs_f64(),
                 );
+                // This is a success path like the two below, so it owes the
+                // same sweep: the staging dirs were created before we knew
+                // there was nothing to rerun, and the PID suffix means each
+                // no-op `--diff` would otherwise strand a fresh empty triple
+                // under target/affected/ until the next `clean`.
+                remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
                 return Ok(0);
             }
         }
@@ -259,8 +269,10 @@ pub(crate) fn collect(
     // binaries this run will actually touch need a map — a `--diff` collect
     // rerunning three tests shouldn't pay to export a whole workspace.
     let mapped = binaries_for_run(&listing, diff_plan.as_ref());
-    let s = if mapped.len() == 1 { "y" } else { "ies" };
-    eprintln!("exporting coverage maps for {} binary{s}...", mapped.len());
+    eprintln!(
+        "exporting coverage maps for {}...",
+        binaries_phrase(mapped.len())
+    );
     write_function_maps(
         &function_maps_dir,
         &mapped,
@@ -374,7 +386,7 @@ pub(crate) fn collect(
         );
     }
     if skipped > 0 {
-        let s = if skipped == 1 { "" } else { "s" };
+        let s = plural_s(skipped);
         eprintln!("{skipped} test{s} produced no coverage");
     }
     // Every test that ran produced no usable coverage. A real test always
@@ -389,7 +401,7 @@ pub(crate) fn collect(
             "nextest ran but coverage extraction yielded no ranges for any of \
              the {skipped} completed test{} (see the skip reasons above) — \
              refusing to overwrite stored coverage",
-            if skipped == 1 { "" } else { "s" },
+            plural_s(skipped),
         );
     }
 
@@ -398,8 +410,10 @@ pub(crate) fn collect(
 
     if let Some(plan) = diff_plan {
         eprintln!(
-            "updating coverage for {} tests ({region_count} ranges)...",
-            mappings.len()
+            "updating coverage for {} test{} ({region_count} range{})...",
+            mappings.len(),
+            plural_s(mappings.len()),
+            plural_s(region_count),
         );
         db.update_coverage_for_tests(
             env_fingerprint,
@@ -410,8 +424,10 @@ pub(crate) fn collect(
         prune_and_report(&mut db, env_fingerprint, &plan.listed)?;
     } else {
         eprintln!(
-            "storing coverage for {} tests ({region_count} ranges)...",
-            mappings.len()
+            "storing coverage for {} test{} ({region_count} range{})...",
+            mappings.len(),
+            plural_s(mappings.len()),
+            plural_s(region_count),
         );
         db.store_coverage(
             env_fingerprint,
@@ -424,14 +440,16 @@ pub(crate) fn collect(
     let evicted = db.gc(env_fingerprint, FINGERPRINT_KEEP)?;
     if evicted > 0 {
         let kept = db.fingerprint_count()?;
-        let s = if evicted == 1 { "" } else { "s" };
+        let s = plural_s(evicted);
         eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
     eprintln!(
-        "done. {} tests, {} ranges stored in target/affected/coverage.db ({:.1}s total)",
+        "done. {} test{}, {} range{} stored in target/affected/coverage.db ({:.1}s total)",
         mappings.len(),
+        plural_s(mappings.len()),
         region_count,
+        plural_s(region_count),
         total_elapsed.as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
@@ -452,6 +470,24 @@ const STAGING_DIR_PREFIXES: &[&str] = &[
     RESULTS_DIR_PREFIX,
     FUNCTION_MAPS_DIR_PREFIX,
 ];
+
+/// "1 binary" / "2 binaries". The plural splits mid-word, so the noun is
+/// selected whole rather than suffixed the way [`plural_s`] does — suffixing
+/// it is what produced "1 binaryy" in the map-export line.
+fn binaries_phrase(n: usize) -> String {
+    format!("{n} {}", if n == 1 { "binary" } else { "binaries" })
+}
+
+/// The `s` in `{n} test{s}` — empty at one, `"s"` otherwise. Only correct for
+/// nouns that pluralize by suffix; anything splitting mid-word (binary,
+/// binaries) needs its own phrase function.
+pub(crate) fn plural_s(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
 
 /// The binaries whose tests this run will execute, and so the ones needing a
 /// coverage map.
@@ -639,8 +675,10 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
 }
 
 /// Read every per-test [`TestResult`] the shim wrote under `results_dir`. The
-/// layout mirrors the profraw tree — `<binary_id>/<test_name>.json` — so two
-/// levels of walking find them all. Sorted by `(binary_id, test_name)` so the
+/// layout mirrors the profraw tree — one directory per binary, one `.json` per
+/// test, both named by the shim's SHA-256 `storage_key` of the ID rather than
+/// the ID itself — so two levels of walking find them all. The real IDs come
+/// from each file's contents. Sorted by `(binary_id, test_name)` so the
 /// skip log and stored rows come out in a stable order.
 ///
 /// An unreadable or unparsable result file is skipped with a warning, not a
@@ -744,6 +782,15 @@ fn plan_diff_collect(
         );
     }
     let reach = selection::check_shas_reachable(project_root, &prior_shas)?;
+    if reach.reachable.is_empty() {
+        bail!(
+            "no reachable collect_sha for the current environment (every \
+             stored sha is missing from the repo, e.g. rebased away and \
+             garbage-collected); run `cargo affected collect` to re-anchor"
+        );
+    }
+    // Below the bail, not above it: the notice promises a rerun and a
+    // re-anchor, and on that path neither happens.
     if !reach.missing.is_empty() {
         eprintln!(
             "{}",
@@ -751,13 +798,6 @@ fn plan_diff_collect(
                 &reach.missing,
                 "will be rerun and re-anchored at the new HEAD",
             ),
-        );
-    }
-    if reach.reachable.is_empty() {
-        bail!(
-            "no reachable collect_sha for the current environment (every \
-             stored sha is rebased away or otherwise unreachable from HEAD); \
-             run `cargo affected collect` to re-anchor"
         );
     }
     if reach.max_commits_ahead > 0 {
@@ -946,109 +986,217 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
     Ok(path)
 }
 
-/// Boolean cargo build flags accepted by both `cargo nextest list` and
-/// `cargo nextest run` — no value token follows.
-const BUILD_FLAGS_BARE: &[&str] = &[
-    "--workspace",
-    "--all",
-    "--lib",
-    "--bins",
-    "--examples",
-    "--tests",
-    "--benches",
-    "--all-targets",
-    "--all-features",
-    "--no-default-features",
-    "--release",
-    "-r",
-    "--frozen",
-    "--locked",
-    "--offline",
-    "--ignore-rust-version",
-    "--future-incompat-report",
-    "--unit-graph",
+/// Long `cargo nextest run`-only flags with no value token. Dropped from the
+/// listing args; `list` would reject every one of them.
+const RUN_ONLY_BARE: &[&str] = &[
+    "--fail-fast",
+    "--ff",
+    "--no-fail-fast",
+    "--nff",
+    "--no-run",
+    "--no-capture",
+    "--nocapture",
+    "--no-input-handler",
+    "--no-output-indent",
+    "--hide-progress-bar",
 ];
 
-/// Long cargo build flags that consume a value — `--flag value` or the
-/// joined `--flag=value`.
+/// Long `cargo nextest run`-only flags that consume a value. The value may
+/// follow as a separate token (`--flag value`) or be joined (`--flag=value`).
 ///
-/// `--target-dir` is deliberately absent: it changes only where artifacts
-/// land, not which tests exist, and `collect` already passes its own
-/// `--target-dir` to `nextest_list` — forwarding a second one would make
-/// `cargo nextest list` reject the duplicate.
-const BUILD_FLAGS_VALUED: &[&str] = &[
-    "--package",
-    "--exclude",
-    "--bin",
-    "--example",
-    "--test",
-    "--bench",
-    "--features",
-    "--cargo-profile",
-    "--target",
-    "--manifest-path",
-    "--build-jobs",
-    "--config",
+/// Two entries are not run-only — `list` accepts them too, but forwarding
+/// them would corrupt the listing: `--message-format` appears on both with
+/// disjoint value sets (`nextest_list` always passes its own
+/// `--message-format json`, so the user's would duplicate or break it), and
+/// `--partition` must be applied exactly once, at run time (see its comment
+/// below).
+const RUN_ONLY_VALUED: &[&str] = &[
+    "--retries",
+    "--max-fail",
+    "--no-tests",
+    "--status-level",
+    "--final-status-level",
+    "--failure-output",
+    "--success-output",
+    "--message-format",
+    "--message-format-version",
+    "--max-progress-running",
+    "--show-progress",
+    "--stress-count",
+    "--stress-duration",
+    "--debugger",
+    "--tracer",
+    "--flaky-result",
+    "--test-threads",
+    "--jobs",
+    // The one run-only *filter* option: `-R`/`--rerun <RUN_ID_OR_RECORDING>`
+    // re-runs the tests a previous recorded run failed. Every other filter is
+    // shared with `list`, which is why a filter-forwarding denylist has to
+    // name this one explicitly — `cargo nextest list` rejects it.
+    "--rerun",
+    // `list` shares `--partition`, but it has to be applied *once*, to the
+    // selection, at run time. Forwarded, it applies twice: the listing tags
+    // the tests outside the shard's bucket `filter-match: { status:
+    // "mismatch", reason: "partition" }`, so they land in `Listing::excluded`
+    // and drop out of the selection, and `nextest run --partition` then
+    // splits that already-split set again. With `count:`/`slice:` the buckets
+    // are positional, so the second split lands on different tests than the
+    // first: on a 4-test crate where every test is affected, `count:1/2` and
+    // `count:2/2` together run two of the four and exit 0 on both — affected
+    // tests silently skipped, which is the one failure mode this tool cannot
+    // detect downstream. (`hash:` happens to be idempotent, but the flag is
+    // one value space and is denylisted whole.)
+    "--partition",
 ];
 
-/// Short cargo build flags that consume a value — `-p mycrate` or the
-/// joined `-pmycrate`.
-const BUILD_FLAGS_SHORT_VALUED: &[&str] = &["-p", "-F", "-Z"];
+/// Short `cargo nextest run`-only flags that consume a value: `-j`
+/// (`--test-threads`) and `-R` (`--rerun`).
+const RUN_ONLY_SHORT_VALUED: &[&str] = &["-j", "-R"];
 
-/// Extract the cargo *build* flags from the post-`--` passthrough so the
-/// `cargo nextest list` used for new-test detection builds the same test set
-/// as the eventual `cargo nextest run`.
+/// Drop `cargo nextest run`-only flags from the post-`--` passthrough so the
+/// `cargo nextest list` used for new-test detection enumerates the same test
+/// set as the eventual `cargo nextest run`. Everything else — cargo build
+/// flags, positional substring filters, `-E`/`--filterset` expressions,
+/// `--exact`/`--skip`/`--run-ignored` libtest-compatible options — is shared
+/// between `list` and `run` and passes through unchanged. Two filter options
+/// are exceptions and sit in the denylist with the execution flags:
+/// `-R`/`--rerun`, which `run` alone accepts, and `--partition`, which both
+/// accept but which must be applied only once, to the run's selection.
 ///
-/// `list` and `run` share cargo's build options (`--features`, `-p`,
-/// `--release`, …) but `run` adds runner/reporter options (`--retries`,
-/// `--no-fail-fast`, `--no-tests`, …) that `list` rejects outright.
-/// Forwarding the whole passthrough to `list` would break on any of those;
-/// forwarding nothing lists a feature-less build while `run` builds with the
-/// user's features, so "listed minus DB = new" compares two different test
-/// sets. Hence an allowlist of the build flags — anything else (run-only
-/// flags, test-name filters, positionals) is dropped: it either doesn't
-/// affect which test binaries get built or `list` wouldn't accept it.
-pub(crate) fn cargo_build_args(nextest_args: &[String]) -> Vec<String> {
+/// Run-only flags govern execution: failure handling (`--retries`,
+/// `--no-fail-fast`, `--max-fail`), test parallelism (`-j`/`--test-threads`),
+/// output formatting (`--status-level`, `--message-format`), and progress
+/// (`--show-progress`, `--hide-progress-bar`). `list` rejects every one of
+/// them. Build flags and filters affect *which* test cases exist and which
+/// match — `list` needs them to enumerate the right set with the right
+/// `filter-match` tagging.
+///
+/// The denylist must stay complete against nextest's CLI. A future
+/// `cargo nextest run`-only flag not added here would be forwarded to
+/// `cargo nextest list`, which would reject the unknown argument and exit
+/// non-zero, surfacing the omission as a hard error during the listing
+/// step. That matches this repo's prefer-loud-over-silent stance: the
+/// previous build-flag *allowlist* dropped any unknown flag, so a future
+/// build flag silently produced a listing that did not match the run.
+///
+/// The `--message-format`/`--partition` class is the one that fails quietly,
+/// since `list` accepts both: a shared flag that means something different to
+/// a listing than to a run has to be recognised as such and denylisted by
+/// hand. Adding a shared *filter* flag is the case to watch — ask whether
+/// applying it to the listing and again to the run yields the same test set.
+pub(crate) fn args_for_listing(nextest_args: &[String]) -> Vec<String> {
+    drop_flags(
+        nextest_args,
+        RUN_ONLY_BARE,
+        RUN_ONLY_VALUED,
+        RUN_ONLY_SHORT_VALUED,
+    )
+}
+
+/// Long spellings of nextest's filterset flag: `--filterset` plus the
+/// `--filter-expr` alias 0.9.132 still accepts without listing in `--help`.
+/// The short `-E` is handled alongside.
+const FILTERSET_VALUED: &[&str] = &["--filterset", "--filter-expr"];
+
+/// Drop the caller's `-E`/`--filterset` expressions from listing args so a
+/// filterset the *tool* supplies is the only one in play.
+///
+/// `cargo nextest list` unions repeated `-E` flags, so resolving a
+/// `[*.metadata.affected]` rule against a listing that still carried the
+/// user's expression would report every test the *user's* expression matches
+/// as a hit for that rule. Positional substring filters need no such
+/// treatment: nextest intersects test-name filters with filtersets (verified
+/// against 0.9.132 — `-E test(=a) b` matches nothing), so a retained
+/// positional can only narrow a rule's set to the tests `nextest run` would
+/// actually admit.
+pub(crate) fn args_without_filtersets(list_args: &[String]) -> Vec<String> {
+    drop_flags(list_args, &[], FILTERSET_VALUED, &["-E"])
+}
+
+/// Remove `bare` flags, `valued` long flags (with their value, whether a
+/// separate token or `=`-joined), and `short_valued` short flags (separate,
+/// `=`-joined, or joined as `-jN`) from `args`. Everything else passes
+/// through in order.
+fn drop_flags(
+    args: &[String],
+    bare: &[&str],
+    valued: &[&str],
+    short_valued: &[&str],
+) -> Vec<String> {
     let mut out = Vec::new();
-    let mut iter = nextest_args.iter();
+    let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let name = arg.split('=').next().unwrap_or(arg);
-        if BUILD_FLAGS_BARE.contains(&name) {
-            out.push(arg.clone());
-        } else if BUILD_FLAGS_VALUED.contains(&name) {
-            out.push(arg.clone());
-            // `--flag value` carries the value in the next token;
-            // `--flag=value` carries it inline.
-            if !arg.contains('=') {
-                if let Some(value) = iter.next() {
-                    out.push(value.clone());
-                }
-            }
-        } else if BUILD_FLAGS_SHORT_VALUED.contains(&arg.as_str()) {
-            out.push(arg.clone());
-            if let Some(value) = iter.next() {
-                out.push(value.clone());
-            }
-        } else if BUILD_FLAGS_SHORT_VALUED.iter().any(|s| arg.starts_with(*s)) {
-            // Joined short form: `-pmycrate`, `-Ffeature`.
-            out.push(arg.clone());
+        if bare.contains(&name) {
+            continue;
         }
+        if valued.contains(&name) {
+            // Drop the flag, and (when the value rides as a separate token)
+            // the value too.
+            if !arg.contains('=') {
+                iter.next();
+            }
+            continue;
+        }
+        if short_valued.contains(&arg.as_str()) {
+            iter.next();
+            continue;
+        }
+        // Joined short form `-j4`. `-j=4` is unusual but the prefix check
+        // catches it; the name-then-`=` split above already routed `-j=4`
+        // away from the bare/valued long-flag arms.
+        if short_valued.iter().any(|s| arg.starts_with(*s)) && arg.len() > 2 {
+            continue;
+        }
+        out.push(arg.clone());
     }
     out
 }
 
+/// Splice a tool-supplied `-E <expr>` into the caller's listing args, ahead of
+/// any `--` separator rather than after the whole vector.
+///
+/// Everything past a `--` in the passthrough is a *test binary* argument — the
+/// only position `cargo nextest list` accepts the libtest-compat spellings
+/// [`args_for_listing`] forwards (`--exact`, `--skip`). nextest rejects one of
+/// its own flags there outright — "failed to parse test binary arguments
+/// `-E`: arguments are unsupported" — so appending blindly turned
+/// `cargo affected run -- -- --skip foo` on a project with a matching
+/// `[*.metadata.affected]` rule into a hard listing failure — reported against
+/// a filterset that was never at fault.
+fn splice_filter_expr(list_args: &[String], filter_expr: Option<&str>) -> Vec<String> {
+    let Some(expr) = filter_expr else {
+        return list_args.to_vec();
+    };
+    let split = list_args
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(list_args.len());
+    let mut out = list_args[..split].to_vec();
+    out.push("-E".to_string());
+    out.push(expr.to_string());
+    out.extend_from_slice(&list_args[split..]);
+    out
+}
+
 /// Result of `cargo nextest list`: every testcase as a (binary_id, test_name)
-/// pair, the subset that is ignored, plus per-binary metadata.
+/// pair, the subset nextest's filter excludes, plus per-binary metadata.
 pub(crate) struct Listing {
-    /// Every testcase nextest enumerated, ignored or not. The complete set —
-    /// `collect --diff` prunes DB rows against it, so a merely-ignored test
-    /// must stay in here or its rows would be dropped.
+    /// Every testcase nextest enumerated, filter-matched or not. The
+    /// complete set — `collect --diff` prunes DB rows against it, so a test
+    /// merely excluded by the current filter must stay in here or its rows
+    /// would be dropped.
     pub(crate) tests: Vec<TestId>,
-    /// Subset of `tests` that nextest reports as `#[ignore]`d on this
-    /// platform (covers conditional `#[cfg_attr(.., ignore)]` too). These
-    /// are skipped by `cargo nextest run`, so they never gain coverage;
-    /// new-test detection must exclude them or they read as "new" forever.
-    pub(crate) ignored: BTreeSet<TestId>,
+    /// Subset of `tests` that nextest reports with `filter-match: { status:
+    /// "mismatch" }`. `cargo nextest run` skips every test in here, so
+    /// new-test detection must exclude them or each surfaces as `(new)`
+    /// every run, and the affected loop must exclude them or stale coverage
+    /// rows that overlap a hunk would pull a now-skipped test back in.
+    /// Unifies all four filter sources nextest knows about: `#[ignore]`d
+    /// tests (`reason: "ignored"`), positional substring filters
+    /// (`reason: "string"`), `-E`/`--filterset` expressions
+    /// (`reason: "expression"`), and the project's own `default-filter`.
+    pub(crate) excluded: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
 }
 
@@ -1071,20 +1219,25 @@ pub(crate) struct BinaryEntry {
 /// rather than in the project root. Only collect passes this — run/status
 /// reuse the user's default target/.
 ///
-/// `build_args` are the cargo build flags (`--features`, `-p`, …) extracted
-/// from the post-`--` passthrough by [`cargo_build_args`]. They must match
+/// `list_args` are the cargo build flags and nextest filters (`--features`,
+/// `-p`, positional substrings, `-E` expressions, `--exact`, …) extracted
+/// from the post-`--` passthrough by [`args_for_listing`]. They must match
 /// the build config of the subsequent `cargo nextest run`, or the listing
 /// enumerates a different test set than the run builds and new-test
-/// detection ("listed minus DB") becomes unsound.
+/// detection ("listed minus DB") becomes unsound. The filter args additionally
+/// tag each testcase with `filter-match.status` so the selection layer can
+/// honor positional/`-E` filters the same way nextest run will.
 ///
-/// `filter_expr`, when set, passes `-E <expr>` so the listing is restricted to
-/// tests matching a nextest filterset — used to resolve `[workspace.metadata.affected]`
-/// rules to concrete tests. Leave `None` for a full listing.
+/// `filter_expr`, when set, passes `-E <expr>` so each testcase is tagged
+/// against a nextest filterset — used to resolve `[workspace.metadata.affected]`
+/// rules to concrete tests. It restricts nothing about *which* testcases the
+/// JSON reports (see [`Listing::excluded`]); it is spliced ahead of any `--`
+/// in `list_args` by [`splice_filter_expr`]. Leave `None` for a full listing.
 pub(crate) fn nextest_list(
     project_root: &Path,
     rustflags_override: Option<&str>,
     build_dir: Option<&Path>,
-    build_args: &[String],
+    list_args: &[String],
     filter_expr: Option<&str>,
 ) -> Result<Listing> {
     let mut cmd = Command::new("cargo");
@@ -1102,11 +1255,8 @@ pub(crate) fn nextest_list(
         cmd.arg("--target-dir").arg(dir);
         cmd.env("LLVM_PROFILE_FILE", dir.join("build-%p-%m.profraw"));
     }
-    for a in build_args {
+    for a in splice_filter_expr(list_args, filter_expr) {
         cmd.arg(a);
-    }
-    if let Some(expr) = filter_expr {
-        cmd.arg("-E").arg(expr);
     }
     let output = cmd
         .spawn()
@@ -1126,7 +1276,7 @@ pub(crate) fn nextest_list(
         serde_json::from_str(stdout).context("failed to parse nextest list JSON")?;
 
     let mut tests = BTreeSet::new();
-    let mut ignored = BTreeSet::new();
+    let mut excluded = BTreeSet::new();
     let mut binaries = Vec::new();
     if let Some(suites) = json.get("rust-suites").and_then(|v| v.as_object()) {
         for suite in suites.values() {
@@ -1148,12 +1298,15 @@ pub(crate) fn nextest_list(
             };
             for (name, case) in cases {
                 let test_id = TestId::new(binary_id.clone(), name.clone());
-                let is_ignored = case
-                    .get("ignored")
-                    .and_then(|v| v.as_bool())
-                    .context("nextest list testcase missing `ignored` flag")?;
-                if is_ignored {
-                    ignored.insert(test_id.clone());
+                let filter_match = case
+                    .get("filter-match")
+                    .context("nextest list testcase missing `filter-match`")?;
+                let status = filter_match
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .context("nextest list testcase missing `filter-match.status`")?;
+                if status != "matches" {
+                    excluded.insert(test_id.clone());
                 }
                 tests.insert(test_id);
             }
@@ -1161,7 +1314,7 @@ pub(crate) fn nextest_list(
     }
     Ok(Listing {
         tests: tests.into_iter().collect(),
-        ignored,
+        excluded,
         binaries,
     })
 }
@@ -1231,7 +1384,7 @@ fn nextest_version_at_least(actual: &str, required: &str) -> bool {
 fn prune_and_report(db: &mut Db, env_fingerprint: &str, listed: &BTreeSet<TestId>) -> Result<()> {
     let pruned = db.prune_missing_tests(env_fingerprint, listed)?;
     if pruned > 0 {
-        let s = if pruned == 1 { "" } else { "s" };
+        let s = plural_s(pruned);
         eprintln!("pruned {pruned} test{s} no longer present in nextest list");
     }
     Ok(())
@@ -1324,10 +1477,17 @@ fn current_target() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn binaries_phrase_selects_the_whole_noun() {
+        assert_eq!(binaries_phrase(0), "0 binaries");
+        assert_eq!(binaries_phrase(1), "1 binary");
+        assert_eq!(binaries_phrase(2), "2 binaries");
+    }
+
     fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
         Listing {
             tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
-            ignored: BTreeSet::new(),
+            excluded: BTreeSet::new(),
             binaries: binaries
                 .iter()
                 .map(|(id, path)| BinaryEntry {
@@ -1413,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_build_args_keeps_build_flags_drops_run_only() {
+    fn args_for_listing_drops_run_only_flags() {
         let args: Vec<String> = [
             "--features",
             "shell-integration-tests",
@@ -1426,39 +1586,199 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        // `--features <value>` and `--release` survive; the run-only flags —
-        // and `--retries`'s separate value token — are dropped.
+        // Build flags survive; bare `--no-fail-fast`, valued `--retries 2`
+        // (with its separate value token), and joined `--no-tests=warn` are
+        // dropped because `cargo nextest list` rejects every one of them.
         assert_eq!(
-            cargo_build_args(&args),
+            args_for_listing(&args),
             vec!["--features", "shell-integration-tests", "--release"],
         );
     }
 
     #[test]
-    fn cargo_build_args_handles_joined_and_short_forms() {
+    fn args_for_listing_forwards_positional_and_filterset() {
         let args: Vec<String> = [
             "--features=a,b",
             "-p",
             "mycrate",
             "-r",
             "--max-fail=3",
+            "-E",
+            "test(slow)",
             "some_test_filter",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
-        // `--flag=value`, `-p <value>`, and the `-r` short flag are build
-        // args; `--max-fail=3` is run-only and the bare positional filter is
-        // neither — both dropped.
+        // Build flags, `-E` filtersets, and positional substring filters all
+        // pass through — `cargo nextest list` accepts all of them and tags
+        // each testcase with `filter-match.status` accordingly. Only the
+        // run-only `--max-fail=3` is dropped.
         assert_eq!(
-            cargo_build_args(&args),
-            vec!["--features=a,b", "-p", "mycrate", "-r"],
+            args_for_listing(&args),
+            vec![
+                "--features=a,b",
+                "-p",
+                "mycrate",
+                "-r",
+                "-E",
+                "test(slow)",
+                "some_test_filter",
+            ],
         );
     }
 
     #[test]
-    fn cargo_build_args_empty() {
-        assert!(cargo_build_args(&[]).is_empty());
+    fn args_for_listing_drops_short_and_joined_test_threads() {
+        // `-j N`, `-j4` (joined), `--jobs N`, and `--test-threads=N` are all
+        // the same run-only option.
+        let args: Vec<String> = [
+            "-j",
+            "4",
+            "--keep1",
+            "-j8",
+            "--test-threads=2",
+            "--jobs",
+            "1",
+            "--keep2",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(args_for_listing(&args), vec!["--keep1", "--keep2"],);
+    }
+
+    #[test]
+    fn args_for_listing_drops_run_only_aliases() {
+        // nextest accepts `--nocapture` (alias of `--no-capture`), `--ff`
+        // (`--fail-fast`), and `--nff` (`--no-fail-fast`) for libtest muscle
+        // memory; `cargo nextest list` rejects each the same as its canonical
+        // form, so all three must be dropped.
+        let args: Vec<String> = ["--nocapture", "--ff", "--keep", "--nff"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(args_for_listing(&args), vec!["--keep"]);
+    }
+
+    #[test]
+    fn args_for_listing_drops_rerun() {
+        // `-R`/`--rerun <RUN_ID_OR_RECORDING>` is the one run-only *filter*
+        // option. `cargo nextest list` rejects it ("unexpected argument
+        // '--rerun' found"), so every spelling has to go: separate value,
+        // `=`-joined, short separate, short joined.
+        for args in [
+            vec!["--rerun", "latest", "--keep"],
+            vec!["--rerun=latest", "--keep"],
+            vec!["-R", "latest", "--keep"],
+            vec!["-Rlatest", "--keep"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(args_for_listing(&args), vec!["--keep"], "for {args:?}");
+        }
+    }
+
+    #[test]
+    fn args_for_listing_drops_partition() {
+        // `--partition` is shared with `cargo nextest list`, which is exactly
+        // the problem: forwarded, the listing buckets the tests and the run
+        // buckets what's left, so `count:`/`slice:` shards together skip
+        // affected tests. Both spellings have to go.
+        for args in [
+            vec!["--partition", "count:1/2", "--keep"],
+            vec!["--partition=slice:1/3", "--keep"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(args_for_listing(&args), vec!["--keep"], "for {args:?}");
+        }
+    }
+
+    #[test]
+    fn args_for_listing_empty() {
+        assert!(args_for_listing(&[]).is_empty());
+    }
+
+    #[test]
+    fn args_without_filtersets_drops_every_filterset_spelling() {
+        for args in [
+            vec!["--keep", "-E", "test(slow)"],
+            vec!["--keep", "-E=test(slow)"],
+            vec!["--keep", "-Etest(slow)"],
+            vec!["--keep", "--filterset", "test(slow)"],
+            vec!["--keep", "--filterset=test(slow)"],
+            vec!["--keep", "--filter-expr", "test(slow)"],
+            vec!["--keep", "--filter-expr=test(slow)"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                args_without_filtersets(&args),
+                vec!["--keep"],
+                "for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn args_without_filtersets_keeps_build_flags_and_positionals() {
+        // Only the caller's filtersets go; build flags stay (the rule listing
+        // must build the same test set) and so do positional substring
+        // filters, which nextest intersects with the rule's own filterset.
+        let args: Vec<String> = [
+            "--features=a,b",
+            "-p",
+            "mycrate",
+            "-E",
+            "test(slow)",
+            "some_test_filter",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            args_without_filtersets(&args),
+            vec!["--features=a,b", "-p", "mycrate", "some_test_filter"],
+        );
+    }
+
+    /// A rule's `-E` must land ahead of the caller's libtest separator.
+    ///
+    /// `args_for_listing` forwards a post-`--` passthrough verbatim, including
+    /// a second `--` and the `--exact`/`--skip` spellings that only work
+    /// there. Appending the rule's filterset after that vector put `-E` in
+    /// test-binary-argument position, where nextest fails the listing outright
+    /// — so `cargo affected run -- -- --skip foo` errored on any project whose
+    /// `[*.metadata.affected]` rule matched a changed path.
+    #[test]
+    fn splice_filter_expr_lands_before_a_libtest_separator() {
+        let args: Vec<String> = ["-p", "mycrate", "--", "--skip", "slow"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            splice_filter_expr(&args, Some("test(=a)")),
+            vec!["-p", "mycrate", "-E", "test(=a)", "--", "--skip", "slow"],
+        );
+    }
+
+    #[test]
+    fn splice_filter_expr_appends_without_a_separator() {
+        let args: Vec<String> = ["-p", "mycrate", "positional"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            splice_filter_expr(&args, Some("test(=a)")),
+            vec!["-p", "mycrate", "positional", "-E", "test(=a)"],
+        );
+    }
+
+    #[test]
+    fn splice_filter_expr_passes_through_without_an_expression() {
+        let args: Vec<String> = ["-p", "mycrate", "--", "--skip", "slow"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(splice_filter_expr(&args, None), args);
     }
 
     /// Regression for the Windows command-line overflow: a large affected set

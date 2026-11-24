@@ -19,9 +19,10 @@
 //! of HEAD. Only a sha genuinely absent from the repo is `Missing`; a sibling
 //! or post-`reset` orphan stays `Reachable`, because `git diff <sha> HEAD`
 //! resolves either way and the ranges still live in `<sha>`'s coordinates.
-//! `Reachable { commits_ahead: 0 }` is such a sibling — it resolves, but its
-//! tree differs from HEAD's, which is why callers treat it as divergence
-//! rather than an exact hit.
+//! `Reachable { commits_ahead: 0 }` is a descendant of HEAD, such as the
+//! orphan a `reset` to its parent leaves — it resolves, but its tree differs
+//! from HEAD's, which is why callers treat it as divergence rather than an
+//! exact hit.
 //!
 //! ## Git failure is never "nothing changed"
 //!
@@ -61,9 +62,11 @@ pub(crate) struct LineRange {
 /// `Equal` — same commit, no drift.
 /// `Reachable` — sha exists in the repo. `commits_ahead` is the number of
 /// commits in `HEAD` that aren't in the sha (`git rev-list --count
-/// {sha}..HEAD`); zero when sha is the immediate parent of HEAD or shares its
-/// tip. The OLD-side line numbers in `git diff <sha> HEAD` still belong to
-/// the sha's coordinate system, which matches stored coverage ranges, so
+/// {sha}..HEAD`); one when sha is the immediate parent of HEAD, and zero when
+/// every commit reachable from HEAD is also reachable from sha (for example,
+/// when sha is a descendant of HEAD). The OLD-side line numbers in
+/// `git diff <sha> HEAD` still belong to the sha's coordinate system, which
+/// matches stored coverage ranges, so
 /// selection works whether the sha is a strict ancestor or a sibling on a
 /// different branch (CI's typical PR shape: cached collect ran on the latest
 /// main commit, which is *ahead of* the PR's merge-base rather than behind
@@ -183,10 +186,10 @@ impl ProjectRoot {
     ///    their package's lib by default. Over-including is safe (extra test
     ///    run, not a miss) for the rare bin-without-lib case.
     /// 3. **Lib crate roots of transitively-depended workspace packages**
-    ///    (path/workspace deps, normal + dev) — a structural edit in
-    ///    `strings/src/lib.rs` must pull in `math`'s tests when `math`
-    ///    depends on `strings`. Registry deps are excluded; their files
-    ///    aren't in the working tree and can't appear in a diff anyway.
+    ///    (path/workspace deps, normal + dev; proc-macro libs included) — a
+    ///    structural edit in `strings/src/lib.rs` must pull in `math`'s tests
+    ///    when `math` depends on `strings`. Registry deps are excluded; their
+    ///    files aren't in the working tree and can't appear in a diff anyway.
     ///
     /// `binary_id`s are constructed to match nextest's `RustBinaryId::from_parts`
     /// (part of nextest's stable API), so a direct lookup against
@@ -226,13 +229,21 @@ impl ProjectRoot {
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
                     if let Some(parsed) = parse_target(target, root) {
-                        // Lib src_path is recorded separately so non-lib
-                        // targets can pick it up via the "links to own lib"
-                        // rule even if the lib isn't itself a test target.
-                        if matches!(parsed.kind, TargetKind::Lib) {
+                        // Recorded regardless of `runs_tests`, because the two
+                        // roles are independent: a `[lib] test = false` lib
+                        // builds no test harness of its own, but every other
+                        // target in the package — and every workspace package
+                        // that depends on it — still compiles against it. Its
+                        // crate root has to stay available to the "links to
+                        // own lib" and transitive-dep rules below, or a
+                        // structural edit there selects nothing. A
+                        // proc-macro crate root counts too: its dependents'
+                        // code is what it expands into, and coverage of a
+                        // proc-macro never reaches their test binaries.
+                        if matches!(parsed.kind, TargetKind::Lib | TargetKind::ProcMacro) {
                             lib_src.insert(name, parsed.src_path.clone());
                         }
-                        if parsed.is_test_runnable() {
+                        if parsed.runs_tests {
                             targets_by_pkg.entry(name).or_default().push(parsed);
                         }
                     }
@@ -312,33 +323,40 @@ struct TestTarget {
     kind: TargetKind,
     /// Path relative to the workspace root.
     src_path: Utf8PathBuf,
+    /// Cargo's `test` flag for this target — whether cargo builds a test
+    /// harness for it, so nextest gets a binary with tests in it. False for
+    /// `[lib] test = false` and its `[[bin]]`/`[[test]]` equivalents. Such a
+    /// target contributes no `binary_id` of its own but is still a
+    /// compile-time input to the ones that do.
+    runs_tests: bool,
 }
 
-impl TestTarget {
-    /// Whether this target produces a binary nextest would actually run.
-    /// Lib/proc-macro/bin/test all qualify; bench/example don't.
-    fn is_test_runnable(&self) -> bool {
-        matches!(
-            self.kind,
-            TargetKind::Lib | TargetKind::ProcMacro | TargetKind::Bin | TargetKind::Test
-        )
-    }
-}
+/// Every `crate-type` a `[lib]` target can declare other than `proc-macro`,
+/// which keeps its own [`TargetKind`]. Cargo reports a lib target's `kind` as
+/// the list of these it was declared with.
+const LIB_CRATE_TYPES: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib"];
 
+/// Parse one `cargo metadata` target into a [`TestTarget`], or `None` if its
+/// `kind` matches no arm below. This is the only place a target is dropped by
+/// kind: `custom-build`, `example` and `bench` are the exclusions.
+///
+/// The library arm matches every [`LIB_CRATE_TYPES`] spelling, not just
+/// `lib`, because cargo reports `kind` as the declared `crate-type` verbatim —
+/// `crate-type = ["cdylib", "rlib"]` surfaces as `["cdylib", "rlib"]` — while
+/// nextest still lists that target's unit tests under the bare package-name
+/// `binary_id`, the same as a plain `lib`. Matching only the literal `lib`
+/// dropped such a package's crate-root sentinels entirely.
+///
+/// Cargo's `test` flag is carried through rather than filtered on: a target
+/// with `test = false` still compiles into its package's other targets, so
+/// dropping it here would lose its crate root as a sentinel.
 fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
-    let is_test = target
-        .get("test")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !is_test {
-        return None;
-    }
     let kinds: Vec<&str> = target
         .get("kind")
         .and_then(|v| v.as_array())
         .map(|ks| ks.iter().filter_map(|k| k.as_str()).collect())
         .unwrap_or_default();
-    let kind = if kinds.contains(&"lib") {
+    let kind = if kinds.iter().any(|k| LIB_CRATE_TYPES.contains(k)) {
         TargetKind::Lib
     } else if kinds.contains(&"proc-macro") {
         TargetKind::ProcMacro
@@ -353,10 +371,15 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
     let rel = Path::new(abs).strip_prefix(root).ok()?;
     let src_path = to_db_relative(rel)?;
+    let runs_tests = target
+        .get("test")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Some(TestTarget {
         name,
         kind,
         src_path,
+        runs_tests,
     })
 }
 
@@ -1127,8 +1150,8 @@ mod tests {
         let init_sha = git_head_sha(dir.path())?;
 
         // Create a commit, capture its sha, then reset HEAD back. The captured
-        // sha is now a sibling of HEAD's history — present in the repo but
-        // not an ancestor. `git diff <sha> HEAD` still resolves both trees,
+        // sha is now a descendant of HEAD — present in the repo but not an
+        // ancestor. `git diff <sha> HEAD` still resolves both trees,
         // so the cache is usable; classify as Reachable.
         std::fs::write(dir.path().join("a.txt"), b"x")?;
         git(dir.path(), &["add", "a.txt"]);
@@ -1344,6 +1367,176 @@ mod tests {
         assert_eq!(
             map.get("utils").unwrap(),
             &[p("utils/src/lib.rs")].into_iter().collect::<BTreeSet<_>>(),
+        );
+
+        Ok(())
+    }
+
+    /// `[lib] test = false` makes cargo report `test: false` for the lib
+    /// target. The lib then has no tests of its own — but the package's
+    /// integration tests, and every workspace package that depends on it,
+    /// still compile against it, so its crate root must remain a sentinel for
+    /// those binaries.
+    ///
+    /// `parse_target` used to bail on `test: false`, which dropped the lib
+    /// before `lib_src` ever saw it: `math::integration` lost
+    /// `math/src/lib.rs` and `strings/src/lib.rs`, so a structural edit to
+    /// either (a new `mod`, a changed `use`) selected no test at all — silent
+    /// under-selection, with nothing downstream to catch it.
+    #[test]
+    fn lib_without_test_harness_still_seeds_sentinels() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = canonicalize_no_verbatim(dir.path())?;
+        let math_lib = root.join("math/src/lib.rs");
+        let math_int = root.join("math/tests/integration.rs");
+        let strings_lib = root.join("strings/src/lib.rs");
+        for f in [&math_lib, &math_int, &strings_lib] {
+            std::fs::create_dir_all(f.parent().unwrap())?;
+            std::fs::write(f, b"")?;
+        }
+
+        // Both libs opt out of their own test harness; only the integration
+        // target carries tests.
+        let metadata = serde_json::json!({
+            "workspace_root": root.to_string_lossy(),
+            "packages": [
+                {
+                    "name": "math",
+                    "manifest_path": root.join("math/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "math", "kind": ["lib"], "test": false,
+                         "src_path": math_lib.to_string_lossy()},
+                        {"name": "integration", "kind": ["test"], "test": true,
+                         "src_path": math_int.to_string_lossy()},
+                    ],
+                    "dependencies": [
+                        {"name": "strings", "kind": null, "source": null},
+                    ],
+                },
+                {
+                    "name": "strings",
+                    "manifest_path": root.join("strings/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "strings", "kind": ["lib"], "test": false,
+                         "src_path": strings_lib.to_string_lossy()},
+                    ],
+                    "dependencies": [],
+                },
+            ],
+        });
+
+        let project = ProjectRoot {
+            workspace_root: root.clone(),
+            manifest_paths: vec![],
+            metadata,
+        };
+        let map = project.crate_root_sentinels_by_binary_id()?;
+
+        let p = |s: &str| Utf8PathBuf::from(s);
+
+        // The harness-less libs produce no binary_id of their own...
+        assert!(
+            !map.contains_key("math"),
+            "lib with test = false has no test binary; got {map:?}"
+        );
+        assert!(!map.contains_key("strings"), "same for the dep's lib");
+
+        // ...but both crate roots still seed the integration target.
+        assert_eq!(
+            map.get("math::integration").unwrap(),
+            &[
+                p("math/src/lib.rs"),
+                p("math/tests/integration.rs"),
+                p("strings/src/lib.rs"),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        );
+
+        Ok(())
+    }
+
+    /// A lib declared with `crate-type = ["cdylib", "rlib"]` is reported by
+    /// `cargo metadata` as `kind: ["cdylib", "rlib"]` — no literal `lib` —
+    /// yet nextest lists its unit tests under the bare package name, as for
+    /// any lib. A proc-macro lib is reported as `kind: ["proc-macro"]`.
+    ///
+    /// `parse_target` used to match only the literal `lib`, so the cdylib
+    /// target was dropped: `ffi` had no `binary_id` entry at all and a
+    /// structural edit to `ffi/src/lib.rs` selected none of its own tests,
+    /// nor `app`'s. The proc-macro target survived parsing but never reached
+    /// `lib_src`, so `app` lost `derive/src/lib.rs` as a sentinel.
+    #[test]
+    fn non_literal_lib_crate_types_seed_sentinels() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = canonicalize_no_verbatim(dir.path())?;
+        let app_lib = root.join("app/src/lib.rs");
+        let ffi_lib = root.join("ffi/src/lib.rs");
+        let derive_lib = root.join("derive/src/lib.rs");
+        for f in [&app_lib, &ffi_lib, &derive_lib] {
+            std::fs::create_dir_all(f.parent().unwrap())?;
+            std::fs::write(f, b"")?;
+        }
+
+        let metadata = serde_json::json!({
+            "workspace_root": root.to_string_lossy(),
+            "packages": [
+                {
+                    "name": "app",
+                    "manifest_path": root.join("app/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "app", "kind": ["lib"], "test": true,
+                         "src_path": app_lib.to_string_lossy()},
+                    ],
+                    "dependencies": [
+                        {"name": "ffi", "kind": null, "source": null},
+                        {"name": "derive", "kind": null, "source": null},
+                    ],
+                },
+                {
+                    "name": "ffi",
+                    "manifest_path": root.join("ffi/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "ffi", "kind": ["cdylib", "rlib"], "test": true,
+                         "src_path": ffi_lib.to_string_lossy()},
+                    ],
+                    "dependencies": [],
+                },
+                {
+                    "name": "derive",
+                    "manifest_path": root.join("derive/Cargo.toml").to_string_lossy(),
+                    "targets": [
+                        {"name": "derive", "kind": ["proc-macro"], "test": true,
+                         "src_path": derive_lib.to_string_lossy()},
+                    ],
+                    "dependencies": [],
+                },
+            ],
+        });
+
+        let project = ProjectRoot {
+            workspace_root: root.clone(),
+            manifest_paths: vec![],
+            metadata,
+        };
+        let map = project.crate_root_sentinels_by_binary_id()?;
+
+        let p = |s: &str| Utf8PathBuf::from(s);
+
+        assert_eq!(
+            map.get("ffi"),
+            Some(&[p("ffi/src/lib.rs")].into_iter().collect::<BTreeSet<_>>()),
+            "a cdylib+rlib lib keeps its own binary_id and crate root; got {map:?}",
+        );
+        assert_eq!(
+            map.get("app").unwrap(),
+            &[
+                p("app/src/lib.rs"),
+                p("derive/src/lib.rs"),
+                p("ffi/src/lib.rs"),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         );
 
         Ok(())

@@ -46,7 +46,7 @@ enum Action {
         /// Re-collect coverage only for tests affected by changes since the
         /// last collect, leaving rows for unaffected tests in place. Errors
         /// out if there's no prior collect for the current environment, or
-        /// if any stored collect_sha is no longer reachable from HEAD.
+        /// if every stored collect_sha is missing from the repository.
         #[arg(long)]
         diff: bool,
         /// Collect against a dirty working tree. Stored line numbers reflect
@@ -119,7 +119,7 @@ fn clean() -> Result<()> {
     // even when there's no DB to clear.
     let swept = collect::clean_staging_dirs(&project.workspace_root)?;
     if swept > 0 {
-        let s = if swept == 1 { "" } else { "s" };
+        let s = collect::plural_s(swept);
         eprintln!("removed {swept} leftover staging dir{s}");
     }
 

@@ -10,10 +10,11 @@
 //! with `cargo nextest list -E`, so it speaks the full nextest filter language.
 //!
 //! The rules ride in the manifest cargo-affected already loads via `cargo
-//! metadata`, so there's no extra file to read. The trade-off is that the
-//! manifest is fingerprinted: editing a rule changes the coverage-cache key, so
-//! the next run re-collects. No rules → the tool behaves exactly as before, with
-//! no extra `nextest list` invocation.
+//! metadata`, so there's no extra file to read. Manifests are fingerprinted,
+//! but [`crate::fingerprint`] strips `[*.metadata]` before hashing — cargo
+//! ignores it for builds — so editing a rule is cache-neutral and you can
+//! iterate on rules without re-collecting. No rules → the tool behaves exactly
+//! as before, with no extra `nextest list` invocation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -23,10 +24,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::collect::nextest_list;
+use crate::collect::{args_without_filtersets, nextest_list, Listing};
 use crate::db::TestId;
 use crate::project::ProjectRoot;
-use crate::selection::{changed_paths_since, ChangedRangesBySha, Reachability};
 
 /// Where rules live, for user-facing error messages. The `*` shorthand covers
 /// both locations — `[workspace.metadata.affected]` and the single-crate
@@ -125,32 +125,29 @@ impl InputRule {
     }
 }
 
-/// Load the `affected` rules for `project`, and if any, resolve them against the
-/// paths changed since any reachable `collect_sha` (plus working-tree changes).
-/// Returns the path→tests map [`compute`](crate::selection::compute) folds in.
+/// Load the `affected` rules for `project`, and if any, resolve them against
+/// `changed_paths` — every path that differs from any reachable `collect_sha`
+/// or from HEAD, unioned by [`changed_paths_since`](crate::selection::changed_paths_since)
+/// in [`crate::plan::plan`]. Returns the path→tests map
+/// [`compute`](crate::selection::compute) folds in.
 ///
-/// The no-rules fast path returns an empty map without computing changed paths
-/// or invoking nextest, so a project without the table pays nothing.
+/// The no-rules fast path returns an empty map without invoking nextest, so a
+/// project without the table still pays nothing for the expensive half. It no
+/// longer skips computing the changed paths — those moved up to `plan`, which
+/// needs them anyway to tell "nothing changed" from "nothing covers what
+/// changed" — but that's one `git diff --name-only` per reachable sha against
+/// a `nextest list` that has to build the test binaries.
 pub(crate) fn config_rule_hits(
     project: &ProjectRoot,
     build_args: &[String],
-    reach: &Reachability,
-    changed_ranges_by_sha: &ChangedRangesBySha,
-    working_tree_files: &[String],
+    changed_paths: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let rules =
         AffectedConfig::from_metadata(&project.metadata, &project.workspace_root)?.compile()?;
     if rules.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let project_root = &project.workspace_root;
-    let changed_paths = changed_paths_since(
-        project_root,
-        reach,
-        changed_ranges_by_sha,
-        working_tree_files,
-    )?;
-    resolve_config_hits(project_root, build_args, &rules, &changed_paths)
+    resolve_config_hits(&project.workspace_root, build_args, &rules, changed_paths)
 }
 
 /// Resolve compiled rules against the changed paths, returning a map from each
@@ -164,9 +161,41 @@ pub(crate) fn config_rule_hits(
 /// nextest invocation), so a Rust-only diff is byte-for-byte the prior
 /// behavior plus one cheap glob check per changed path.
 ///
-/// A rule whose filterset resolves to zero tests after matching is surfaced as
-/// a warning rather than swallowed: a typo'd filterset would otherwise silently
-/// reopen the gap it exists to close.
+/// `-E` restricts nothing about *which* testcases the listing reports: nextest
+/// lists every one and tags the non-matches `filter-match: { status:
+/// "mismatch", reason: ... }`, so the rule's tests are `listing.tests` minus
+/// `listing.excluded`. Taking `tests` whole would make every test in the
+/// project a hit for any rule that matched a path. The caller's own `-E` comes
+/// out of the listing args ([`args_without_filtersets`]) because nextest
+/// unions repeated `-E` flags; their positional substring filters stay, since
+/// nextest *intersects* name filters with filtersets and so they can only
+/// narrow a rule toward what `nextest run` will admit.
+///
+/// A rule whose filterset matches zero tests is surfaced as a warning rather
+/// than swallowed: a typo'd filterset would otherwise silently reopen the gap
+/// it exists to close. That diagnosis only follows when the listing is the
+/// whole project — an empty match set indicts the filterset only if every
+/// test was there to be matched. Any caller passthrough that survives into
+/// `listing_args` breaks that premise, in either of two ways nextest does not
+/// distinguish for us:
+///
+/// - a *name* filter (`cargo affected run -- <substring>`, or the libtest
+///   `-- -- --skip <name>` spelling) leaves the test listed but tagged
+///   `filter-match: { status: "mismatch", reason: "string" }`, and nextest
+///   reports one reason per testcase in a fixed order that puts name filters
+///   ahead of filtersets, so the rule's own verdict is hidden behind it;
+/// - a *build* flag (`-p`, `--lib`, `--test <name>`, `--features`) drops the
+///   testcase from the listing outright, leaving no verdict to read at all.
+///
+/// So the warning fires only on an unscoped listing — `listing_args.is_empty()`.
+/// The caller's own `-E` never counts, since [`args_without_filtersets`] has
+/// already taken it out. The cost is a missed warning on a passthrough that
+/// narrows nothing (`-- --release`); the alternative is a wrong one on every
+/// narrowed invocation, which is the failure mode this rule exists to avoid.
+/// Keying the hit set on `reason: "expression"` instead is the mirror-image
+/// mistake: the same ordering hides the expression's verdict behind
+/// `"ignored"` too, so one `#[ignore]`d test anywhere in the project would
+/// keep the set non-empty and the warning would never fire at all.
 pub(crate) fn resolve_config_hits(
     project_root: &Path,
     build_args: &[String],
@@ -174,6 +203,7 @@ pub(crate) fn resolve_config_hits(
     changed_paths: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let mut out: BTreeMap<String, BTreeSet<TestId>> = BTreeMap::new();
+    let listing_args = args_without_filtersets(build_args);
     for rule in rules {
         let matched: Vec<&String> = changed_paths
             .iter()
@@ -182,26 +212,40 @@ pub(crate) fn resolve_config_hits(
         if matched.is_empty() {
             continue;
         }
-        let listing = nextest_list(project_root, None, None, build_args, Some(&rule.filterset))
-            .with_context(|| {
-                format!(
-                    "failed to resolve {TABLE} filterset {:?} \
+        let listing = nextest_list(
+            project_root,
+            None,
+            None,
+            &listing_args,
+            Some(&rule.filterset),
+        )
+        .with_context(|| {
+            format!(
+                "failed to resolve {TABLE} filterset {:?} \
                      (check it is a valid nextest filter expression)",
-                    rule.filterset
-                )
-            })?;
-        let tests: BTreeSet<TestId> = listing.tests.into_iter().collect();
+                rule.filterset
+            )
+        })?;
+        let Listing {
+            tests, excluded, ..
+        } = listing;
+        let tests: BTreeSet<TestId> = tests
+            .into_iter()
+            .filter(|t| !excluded.contains(t))
+            .collect();
         if tests.is_empty() {
-            eprintln!(
-                "warning: {TABLE} rule matched {} but its filterset ({:?}) \
-                 selected no tests — those input changes may go untested",
-                matched
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                rule.filterset,
-            );
+            if listing_args.is_empty() {
+                eprintln!(
+                    "warning: {TABLE} rule matched {} but its filterset ({:?}) \
+                     matched no tests — those input changes may go untested",
+                    matched
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    rule.filterset,
+                );
+            }
             continue;
         }
         for p in matched {

@@ -30,6 +30,7 @@
 //! requested path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -37,7 +38,7 @@ use serde::Serialize;
 
 use crate::db::{Db, HitKind, HitReason, StoredFingerprintRow, TestId};
 use crate::fingerprint::FingerprintComponent;
-use crate::project::{git_added_files_since, LineRange, ShaRelation};
+use crate::project::{LineRange, ShaRelation};
 use crate::selection::{FileReasonCounts, Reachability, Selection};
 
 /// JSON schema version. Bump on any incompatible field-shape change so
@@ -70,10 +71,12 @@ pub(crate) struct CacheReport {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CacheStatus {
-    /// Every reachable collect_sha equals HEAD; full-precision selection.
+    /// Every stored collect_sha equals HEAD — none differs, none is
+    /// missing; full-precision selection.
     HitExact,
-    /// Fingerprint matched but at least one reachable sha is ahead of
-    /// HEAD or at least one missing sha exists alongside reachable ones.
+    /// Fingerprint matched but at least one reachable sha differs from
+    /// HEAD (an ancestor, a sibling, or a descendant) or at least one
+    /// missing sha exists alongside reachable ones.
     /// Selection still runs; results are noisier than exact-match.
     HitWithDivergence,
     /// Composite fingerprint absent from DB (DB has rows under other
@@ -89,9 +92,10 @@ pub(crate) enum CacheStatus {
 }
 
 impl CacheStatus {
-    /// Stable kebab-case string used by the JSON serializer and the
-    /// stderr summary line. One canonical mapping; the serde derive
-    /// uses the same encoding.
+    /// Stable kebab-case string for the stderr summary line (reached via
+    /// the [`std::fmt::Display`] impl). The serde derive independently produces the
+    /// same kebab-case encoding for JSON; these are two mappings that must
+    /// agree, and `cache_status_as_str_matches_serde` guards that they do.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::HitExact => "hit-exact",
@@ -252,7 +256,8 @@ pub(crate) struct ReasonEntry {
     pub(crate) file: String,
     pub(crate) kind: ReasonKind,
     /// `[line_start, line_end]` of the stored row that matched. `None`
-    /// for `structural_backstop` (no row matched by definition).
+    /// for `structural_backstop` and `config_rule` — neither is anchored
+    /// to a coverage row, by definition.
     pub(crate) stored_range: Option<[i64; 2]>,
     /// `[start, end]` of the diff hunk that triggered selection.
     pub(crate) matched_hunk: [i64; 2],
@@ -294,9 +299,6 @@ pub(crate) struct SelectionInputs<'a> {
     pub(crate) status: CacheStatus,
     pub(crate) selection: &'a Selection,
     pub(crate) changed_files: Vec<ChangedFileInput>,
-    /// `false` collapses to `selection.changed_files = None` (no diff
-    /// anchor was usable).
-    pub(crate) include_changed_files: bool,
 }
 
 /// Inputs for [`Report::build_full_suite`] — the partial-report path for
@@ -376,41 +378,28 @@ pub(crate) fn collect_sha_snapshots(
 ///   - `changed_ranges_by_sha`: the per-sha hunk maps already computed
 ///     by selection (avoids re-diffing each reachable sha — selection
 ///     and the report consume the same data).
-///   - `working_tree_files`: working-tree changes (uncommitted /
-///     staged / untracked) so files that selection considered but
-///     produced no hunks are still in the report.
-///   - committed-added files (via `git_added_files_since(sha)` per
-///     reachable sha) — these have no OLD-side and the unified-diff
-///     parser skips them, but the report should surface them.
+///   - `changed_paths`: every path that changed, unioned once by
+///     [`crate::selection::changed_paths_since`]. It is a superset of
+///     the hunk maps' keys: working-tree changes selection considered
+///     but that produced no hunks, and committed-added files (no
+///     OLD-side, so the unified-diff parser skips them) both reach the
+///     report only through here.
 ///
 /// `tracked_by_coverage` is set in one DB query
 /// ([`Db::tracked_files_at_shas`]) instead of one query per file.
 pub(crate) fn build_changed_file_inputs(
-    project_root: &std::path::Path,
     db: &Db,
     fingerprint: &str,
     reach: &Reachability,
     changed_ranges_by_sha: &BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
-    working_tree_files: &[String],
+    changed_paths: &BTreeSet<String>,
 ) -> Result<Vec<ChangedFileInput>> {
-    let mut all_files: BTreeSet<String> = working_tree_files.iter().cloned().collect();
-    for by_file in changed_ranges_by_sha.values() {
-        for path in by_file.keys() {
-            all_files.insert(path.clone());
-        }
-    }
-    for sha in &reach.reachable {
-        for added in git_added_files_since(project_root, sha)? {
-            all_files.insert(added);
-        }
-    }
-
     // One query for "which files does the cache know about?", indexed
     // by path lookup below.
     let tracked = db.tracked_files_at_shas(fingerprint, &reach.reachable)?;
 
     let mut out = Vec::new();
-    for path in all_files {
+    for path in changed_paths.iter().cloned() {
         let mut hunks_by_sha: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
         for (sha, by_file) in changed_ranges_by_sha {
             if let Some(hunks) = by_file.get(&path) {
@@ -486,14 +475,12 @@ impl Report {
             mode: SelectionMode::Selection,
         };
 
-        let changed_files = if inputs.include_changed_files {
-            Some(build_changed_files_entries(
-                &inputs.changed_files,
-                &selection.diagnostics.per_file,
-            ))
-        } else {
-            None
-        };
+        // Selection mode always has a usable diff anchor, so this is always
+        // `Some`; the `null` shape belongs to `build_full_suite`.
+        let changed_files = Some(build_changed_files_entries(
+            &inputs.changed_files,
+            &selection.diagnostics.per_file,
+        ));
 
         let selected_tests = selection.diagnostics.per_test.as_ref().map(|per_test| {
             build_selected_tests(
@@ -558,10 +545,11 @@ impl Report {
         }
     }
 
-    /// Serialize and write to `path` atomically: write to
-    /// `<path>.tmp`, then rename. A partial write (process killed,
-    /// disk full) leaves the previous artifact intact rather than a
-    /// truncated JSON file.
+    /// Serialize and write to `path` atomically: write to a uniquely named
+    /// temporary file in the destination directory, then rename. A partial
+    /// write (process killed, disk full) leaves the previous artifact intact
+    /// rather than a truncated JSON file, without claiming a predictable
+    /// sibling path that might already belong to the user.
     pub(crate) fn write_json(&self, path: &Path) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("failed to serialize report to JSON")?;
@@ -569,10 +557,14 @@ impl Report {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+        tmp.write_all(json.as_bytes())
+            .with_context(|| format!("failed to write temporary report for {}", path.display()))?;
+        tmp.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to persist report to {}", path.display()))?;
         Ok(())
     }
 }
@@ -837,6 +829,31 @@ mod tests {
         assert_eq!(json, "\"hit-with-divergence\"");
     }
 
+    /// `as_str` (stderr summary, via `Display`) and the serde derive (JSON)
+    /// are two independent kebab-case mappings that must produce the same
+    /// string for every variant. Guard the whole set so renaming one
+    /// encoding without the other fails loudly instead of silently drifting.
+    #[test]
+    fn cache_status_as_str_matches_serde() {
+        for status in [
+            CacheStatus::HitExact,
+            CacheStatus::HitWithDivergence,
+            CacheStatus::MissFingerprint,
+            CacheStatus::MissNoCoverage,
+            CacheStatus::MissNoReachableSha,
+            CacheStatus::ForcedAll,
+        ] {
+            let serde = serde_json::to_string(&status).unwrap();
+            assert_eq!(
+                serde,
+                format!("\"{}\"", status.as_str()),
+                "as_str and serde disagree for {status:?}",
+            );
+            // Display routes through as_str — keep it in the same guard.
+            assert_eq!(status.to_string(), status.as_str());
+        }
+    }
+
     /// Stored fingerprint diff against current: differing labels are
     /// the symmetric difference of (label, hash) sets.
     #[test]
@@ -953,6 +970,50 @@ mod tests {
         assert_eq!(entries[2].commits_ahead, None);
     }
 
+    /// A `config_rule` reason names the triggering input rather than a
+    /// coverage hunk: `stored_range` is null, `collect_sha` is empty and
+    /// `matched_hunk` is `[0, 0]`. `selection.rs` fills those three fields by
+    /// hand, so nothing else pins the encoding the v1 schema documents.
+    #[test]
+    fn config_rule_reason_carries_no_coverage_anchor() {
+        let test = TestId::new("sample::tests", "reads_snapshot");
+        let per_test: BTreeMap<TestId, Vec<HitReason>> = [(
+            test.clone(),
+            vec![HitReason {
+                collect_sha: String::new(),
+                file: "tests/snapshots/x.snap".to_string(),
+                kind: HitKind::ConfigRule,
+                matched_hunk: (0, 0),
+                stored_range: None,
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let config_tests: BTreeSet<TestId> = [test].into_iter().collect();
+
+        let entries = build_selected_tests(
+            &BTreeSet::new(),
+            &config_tests,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &per_test,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, SelectedTestKind::ConfigRule);
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["reasons"][0]["kind"], "config_rule");
+        assert!(
+            json["reasons"][0]["stored_range"].is_null(),
+            "config_rule matches no coverage row, so stored_range must be null"
+        );
+        assert_eq!(json["reasons"][0]["collect_sha"], "");
+        assert_eq!(
+            json["reasons"][0]["matched_hunk"],
+            serde_json::json!([0, 0])
+        );
+    }
+
     /// Build a minimal full-suite report and verify the shape callers
     /// expect — null counts, omitted changed_files/selected_tests, mode
     /// = "full-suite-no-listing".
@@ -976,5 +1037,31 @@ mod tests {
         assert!(json["selection"]["changed_files"].is_null());
         assert!(json["selection"]["selected_tests"].is_null());
         assert_eq!(json["cache"]["status"], "forced-all");
+    }
+
+    #[test]
+    fn write_json_preserves_unrelated_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("out.txt");
+        let sibling_path = dir.path().join("out.json.tmp");
+        std::fs::write(&sibling_path, "unrelated data\n").unwrap();
+        let report = Report::build_full_suite(FullSuiteInputs {
+            command: "status",
+            current_fingerprint: None,
+            current_components: None,
+            stored_fingerprints: vec![],
+            collect_shas: vec![],
+            status: CacheStatus::MissNoCoverage,
+        });
+
+        report.write_json(&report_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(sibling_path).unwrap(),
+            "unrelated data\n"
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(written["command"], "status");
     }
 }

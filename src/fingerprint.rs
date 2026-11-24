@@ -128,10 +128,11 @@ fn hash_one(bytes: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
-/// Read a file's bytes; treat NotFound as empty (the appearance/disappearance
-/// of the file still changes the composite digest via the label). Other I/O
-/// errors propagate so we don't silently produce a fingerprint that matches a
-/// different state.
+/// Read a file's bytes; treat NotFound as empty. Every label is folded in
+/// whether or not its file exists, so a missing file hashes the same as an
+/// empty one — the appearance of a non-empty file still changes the digest
+/// through its bytes. Other I/O errors propagate so we don't silently produce
+/// a fingerprint that matches a different state.
 fn read_file_or_empty(path: &std::path::Path) -> Result<Vec<u8>> {
     match std::fs::read(path) {
         Ok(b) => Ok(b),

@@ -18,8 +18,8 @@
 //! the far end.
 //!
 //! Definition of `CRATE_ROOT_SENTINEL_END` lives in `src/coverage.rs`. It's
-//! `pub`, but `cargo-affected` ships only a `[[bin]]` target with no library,
-//! so we hard-code `i64::MAX` here.
+//! `pub(crate)` — and `cargo-affected` ships only a `[[bin]]` target with no
+//! library anyway — so we hard-code `i64::MAX` here.
 
 use crate::{cargo_affected, init_git_with_initial_commit, write_two_module_project};
 

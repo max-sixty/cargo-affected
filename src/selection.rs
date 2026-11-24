@@ -15,9 +15,10 @@
 //! `collect --diff` produces rows anchored at the new HEAD while leaving
 //! unaffected tests' rows at their original sha, so the DB can hold rows
 //! from several distinct collect points at once for a single fingerprint.
-//! Reachability is per-sha — diverged shas are skipped and tests stranded
-//! only there surface as `new_tests` so they're rerun rather than silently
-//! dropped.
+//! Reachability is per-sha — shas missing from the repo are skipped and
+//! tests anchored only there surface as `stranded_tests` so they're rerun
+//! rather than silently dropped. A sha that has merely diverged from HEAD (a
+//! sibling) stays reachable and is diffed like any other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -25,7 +26,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::Listing;
+use crate::collect::{plural_s, Listing};
 use crate::db::{Db, HitKind, HitReason, TestId};
 use crate::project::{
     git_added_files_since, git_changed_line_ranges, relation_to_head, LineRange, ShaRelation,
@@ -34,17 +35,22 @@ use crate::project::{
 /// Result of the selection computation.
 pub(crate) struct Selection {
     /// Known tests selected by line-range overlap with the changed hunks.
-    /// Excludes `#[ignore]`d tests: their coverage rows can persist from
-    /// an earlier (non-ignored) collect, but `nextest run` would skip them
-    /// — same all-ignored-selection rationale as [`new_tests`].
-    ///
-    /// [`new_tests`]: Self::new_tests
+    /// Excludes tests with `filter-match.status == "mismatch"` — `#[ignore]`d
+    /// tests whose coverage rows persisted from an earlier collect, tests
+    /// not matched by a positional/`-E` filter the user passed, and tests
+    /// the project's own `default-filter` excludes. `nextest run` would
+    /// skip every one of them; selecting them anyway can collapse the
+    /// effective set to nothing and trip nextest's "no tests to run" exit.
     pub(crate) affected: BTreeSet<TestId>,
     /// Tests present in the nextest listing but absent from the DB
     /// entirely under the current fingerprint — added since the last
     /// `collect`. Always selected because we have no coverage data.
-    /// Excludes `#[ignore]`d tests: `nextest run` skips them, so they
-    /// never gain coverage and would otherwise read as "new" on every run.
+    /// Excludes filter-mismatched tests for the same reason as
+    /// [`affected`] above: an `#[ignore]`d or filter-excluded test would
+    /// otherwise read as `(new)` forever, since it never runs and never
+    /// gains a coverage row.
+    ///
+    /// [`affected`]: Self::affected
     pub(crate) new_tests: BTreeSet<TestId>,
     /// Tests present in the nextest listing AND in the DB, but only
     /// anchored at currently-missing collect_shas. Functionally identical
@@ -68,20 +74,60 @@ pub(crate) struct Selection {
     /// used by `collect --diff` to prune rows for tests that were renamed
     /// or removed.
     pub(crate) listed: BTreeSet<TestId>,
+    /// Tests *this change* pulled in — by coverage overlap or by a config
+    /// rule — that `listing.excluded` then dropped. Carried only so an
+    /// empty selection can be explained: "nothing covers the change" and
+    /// "the current filter removed what does" are different states, and
+    /// `run`/`status` reported the first for both. Not itself a selection —
+    /// every member is a test `nextest run` would skip.
+    ///
+    /// Excluded `new`/`stranded` tests are *not* counted, even though the
+    /// filter cost a selection there too: an excluded test that has never
+    /// been collected (`#[ignore]`d, or cut by the project's own
+    /// `default-filter`) is listed-but-excluded on every run whatever the
+    /// diff says, so counting it would make this set permanently non-empty
+    /// and blame the filter for every uncovered change in such a project.
+    pub(crate) filter_excluded: BTreeSet<TestId>,
     /// Per-file/per-test diagnostics retained at the level requested by
     /// the caller. See [`SelectionDiagnostics`].
     pub(crate) diagnostics: SelectionDiagnostics,
 }
 
 impl Selection {
-    /// Union of affected, stranded, new, and config-rule tests — what nextest
-    /// will be asked to run.
+    /// Union of affected, stranded, new, and config-rule tests — the full
+    /// selection, including tests nextest can no longer run. Callers building
+    /// a filterset for `nextest run` want [`live_selected`] instead.
+    ///
+    /// [`live_selected`]: Self::live_selected
     pub(crate) fn selected(&self) -> BTreeSet<TestId> {
         let mut out = self.affected.clone();
         out.extend(self.new_tests.iter().cloned());
         out.extend(self.stranded_tests.iter().cloned());
         out.extend(self.config_tests.iter().cloned());
         out
+    }
+
+    /// Selected tests still present in the current nextest listing.
+    ///
+    /// The complement is "phantoms": tests whose coverage rows survive in the
+    /// DB but that were renamed or deleted since the last `collect`. Deleting
+    /// a test produces a hunk over the very lines its stored range covers, so
+    /// a phantom lands in [`affected`] as a matter of course — and a change
+    /// that touches nothing else makes the whole selection phantom. The
+    /// generated filterset matches nothing for those, which is nextest's
+    /// "no tests to run" exit 4: a stale cache reported as a test failure.
+    ///
+    /// `collect --diff` deliberately keeps phantoms in its own filterset (it
+    /// uses the live/phantom split afterwards to tell an empty rerun from a
+    /// runner-shim failure, and prunes their rows). `run` and `status` have
+    /// no such use for them.
+    ///
+    /// [`affected`]: Self::affected
+    pub(crate) fn live_selected(&self) -> BTreeSet<TestId> {
+        self.selected()
+            .into_iter()
+            .filter(|t| self.listed.contains(t))
+            .collect()
     }
 
     /// Known tests not selected this round. Both `affected` and `config_tests`
@@ -159,16 +205,17 @@ pub(crate) type ChangedRangesBySha = BTreeMap<String, BTreeMap<String, Vec<LineR
 /// Per-sha reachability for the stored `collect_sha`s under one fingerprint.
 ///
 /// Splits cleanly so callers can proceed with the reachable subset rather
-/// than treating any divergence as all-or-nothing — important under `collect
+/// than treating any missing sha as all-or-nothing — important under `collect
 /// --diff`, where rows from several shas coexist for one fingerprint and a
 /// single rebase shouldn't invalidate unrelated tests' rows. Tests anchored
-/// at missing shas remain in the DB; queries skip them, and selection
-/// surfaces them as "new tests" so they get rerun (and re-anchored, in
-/// `collect --diff`'s case). Old rows accumulate as bloat — clear with
+/// at missing shas remain in the DB; queries skip them, so selection finds
+/// them absent from the reachable set but present in the DB and surfaces
+/// them as [`Selection::stranded_tests`] — rerun, and re-anchored in
+/// `collect --diff`'s case. Old rows accumulate as bloat — clear with
 /// `cargo affected clean`.
 pub(crate) struct Reachability {
     /// Per-sha relation to HEAD for every checked sha. Lets the report
-    /// builder render which shas equal HEAD vs are ahead vs are missing
+    /// builder render which shas equal HEAD vs differ from it vs are missing
     /// instead of just summarizing.
     pub(crate) per_sha: BTreeMap<String, ShaRelation>,
     /// Stored shas the repo can still resolve to a commit. Includes strict
@@ -184,19 +231,78 @@ pub(crate) struct Reachability {
     pub(crate) max_commits_ahead: u32,
 }
 
-/// Format the partial-divergence notice shared by `run`, `status`, and
+/// Format the missing-sha notice shared by `run`, `status`, and
 /// `collect --diff`. `verb_phrase` slots into "tests anchored only there
-/// VERB_PHRASE" — "will rerun as 'new'" for `run`/`collect --diff`, "would
-/// rerun as 'new'" for `status`. Returns the body without a trailing
-/// newline so callers can `eprintln!`/`println!` it directly.
+/// VERB_PHRASE", and the caller picks it: those tests' fate turns on both
+/// the command and whether any other sha survived, so it is not derivable
+/// here. `run` and `status` say "rerun as 'stranded'" when one did and
+/// "rerun as part of the full suite" when none did (see
+/// [`CacheState::strands_missing_sha_tests`](crate::plan::CacheState::strands_missing_sha_tests)),
+/// each in its own tense; `collect --diff` bails when no sha survives and
+/// otherwise says "will be rerun and re-anchored at the new HEAD" — it emits
+/// the notice below that bail, so the promise is only ever made where it
+/// holds.
+/// Returns the body without a trailing newline so callers can
+/// `eprintln!`/`println!` it directly.
 pub(crate) fn missing_shas_notice(missing: &BTreeSet<String>, verb_phrase: &str) -> String {
-    let plural = if missing.len() == 1 { "" } else { "s" };
+    let plural = plural_s(missing.len());
     let list = missing.iter().cloned().collect::<Vec<_>>().join(", ");
     format!(
         "note: {} collect_sha{plural} not in the repo ({list}) — \
          tests anchored only there {verb_phrase}; \
          run `cargo affected clean` to clear stale rows",
         missing.len(),
+    )
+}
+
+/// Format the phantom-selection notice shared by `run` and `status`.
+/// `verb_phrase` slots into "…since collect and VERB_PHRASE" — "will be
+/// skipped" for `run`, "would be skipped" for `status`. Returns the body
+/// without a trailing newline so callers can `eprintln!`/`println!` it
+/// directly.
+pub(crate) fn phantom_notice(count: usize, verb_phrase: &str) -> String {
+    let (plural, is_are) = if count == 1 { ("", "is") } else { ("s", "are") };
+    format!(
+        "note: {count} selected test{plural} {is_are} no longer in the nextest \
+         listing (renamed or deleted since collect) and {verb_phrase}; \
+         run `cargo affected collect` to drop the stale rows"
+    )
+}
+
+/// Format the filtered-out-selection notice shared by `run` and `status`.
+///
+/// The empty-selection arm in both commands used to have two states to
+/// explain — nothing changed, or nothing covers what changed — and told the
+/// user to run `cargo affected collect` in the second. Forwarding the
+/// caller's filters into the listing added a third: the change *is* covered,
+/// and the filter the caller passed is what removed the tests covering it.
+/// Reporting that as "no tests cover the changed lines" is false, and the
+/// remedy it names does nothing. `verb_phrase` slots into "the current
+/// filter VERB_PHRASE the N tests…" — "excludes" for `run`, "would exclude"
+/// for `status`; both are number-neutral, so the count's own plural is the
+/// only agreement to get right. Returns the body without a trailing newline
+/// so callers can `eprintln!`/`println!` it directly.
+pub(crate) fn filter_excluded_notice(count: usize, verb_phrase: &str) -> String {
+    format!(
+        "the current filter {verb_phrase} the {count} test{} this change \
+         selects (a filter passed after `--`, `#[ignore]`, or the project's \
+         nextest `default-filter`)",
+        plural_s(count),
+    )
+}
+
+/// Format the conclusion `run` and `status` reach when *every* selected test
+/// is a phantom: there is nothing live to hand nextest, so no run happens.
+/// `verb_phrase` is "to run" for `run` and "would run" for `status`.
+///
+/// It lives beside [`phantom_notice`] because the two are halves of one
+/// statement — the note explains why the count drops, this says the drop took
+/// it to zero — and because `status` predicting something other than what
+/// `run` does is the failure [`crate::plan`] exists to prevent.
+pub(crate) fn all_phantom_notice(verb_phrase: &str) -> String {
+    format!(
+        "no tests {verb_phrase}: every selected test is absent from the \
+         current nextest listing"
     )
 }
 
@@ -307,13 +413,47 @@ pub(crate) fn select_with_precomputed_ranges(
     )
 }
 
-/// Union of all paths that changed between the working tree and any reachable
-/// `collect_sha` — for matching against `[workspace.metadata.affected]` rule globs.
+/// The paths that changed, in the two shapes selection's consumers need.
+///
+/// The two differ only once the DB holds more than one `collect_sha`, which
+/// is exactly what `collect --diff` produces: it re-anchors the tests it
+/// reran at the new HEAD and leaves the rest at their original sha. From
+/// then on the older sha stays reachable — its rows "linger until `cargo
+/// affected clean`" — so [`all`] permanently contains every path touched
+/// since that older anchor, including ones a `collect --diff` has already
+/// accounted for.
+///
+/// [`all`]: Self::all
+pub(crate) struct ChangedPaths {
+    /// Union across every reachable `collect_sha`. What selection itself
+    /// reasons about: a test anchored at the older sha has to be matched
+    /// against the diff from *that* sha, so `[workspace.metadata.affected]`
+    /// rule-glob matching uses this too — narrowing it would silently stop
+    /// selecting a config-rule test whose input changed before the newest
+    /// anchor (`collect --diff` never reruns config-rule tests, so those
+    /// rows are precisely the ones left behind). The `--report-json`
+    /// per-file entries use it for the same reason: they are keyed by sha.
+    pub(crate) all: BTreeSet<String>,
+    /// Paths changed relative to the reachable `collect_sha` closest to HEAD
+    /// — the most recent point at which any `collect` ran, so everything
+    /// older than it has already been through one. This is the set that
+    /// answers "did anything change that we have not been told about?",
+    /// which is the question `run`/`status`' empty-selection message asks.
+    /// Empty in the `collect --diff` steady state, where [`all`] is not.
+    ///
+    /// [`all`]: Self::all
+    pub(crate) since_newest: BTreeSet<String>,
+}
+
+/// Collect the paths that changed between the working tree and the reachable
+/// `collect_sha`s. Computed once in [`crate::plan::plan`] and carried on the
+/// `Plan`; see [`ChangedPaths`] for which consumer wants which shape.
 ///
 /// Modified files come from the per-sha diff already computed for selection;
 /// added files (which `git diff -U0` omits — they have no OLD side) come from
 /// [`git_added_files_since`]; working-tree changes (uncommitted, staged,
-/// untracked) come from `working_tree_files`. Without the added-files source,
+/// untracked) come from `working_tree_files` and belong to every sha's set,
+/// since they are changes relative to HEAD. Without the added-files source,
 /// a PR that adds a brand-new `.snap`/doc with no modified sibling would slip
 /// through.
 pub(crate) fn changed_paths_since(
@@ -321,15 +461,45 @@ pub(crate) fn changed_paths_since(
     reach: &Reachability,
     changed_ranges_by_sha: &ChangedRangesBySha,
     working_tree_files: &[String],
-) -> Result<BTreeSet<String>> {
-    let mut paths: BTreeSet<String> = working_tree_files.iter().cloned().collect();
-    for by_file in changed_ranges_by_sha.values() {
-        paths.extend(by_file.keys().cloned());
-    }
+) -> Result<ChangedPaths> {
+    let working: BTreeSet<String> = working_tree_files.iter().cloned().collect();
+    let newest = newest_reachable_sha(reach);
+    let mut all = working.clone();
+    let mut since_newest = working;
     for sha in &reach.reachable {
-        paths.extend(git_added_files_since(project_root, sha)?);
+        let mut per_sha: BTreeSet<String> = changed_ranges_by_sha
+            .get(sha)
+            .map(|by_file| by_file.keys().cloned().collect())
+            .unwrap_or_default();
+        per_sha.extend(git_added_files_since(project_root, sha)?);
+        if newest == Some(sha) {
+            since_newest.extend(per_sha.iter().cloned());
+        }
+        all.extend(per_sha);
     }
-    Ok(paths)
+    Ok(ChangedPaths { all, since_newest })
+}
+
+/// The reachable `collect_sha` fewest commits behind HEAD — the most recent
+/// collect point the DB still knows about. `None` when nothing is reachable
+/// (`run`/`status` widen to the full suite there, so no caller asks).
+///
+/// `Equal` outranks every `Reachable` rather than sharing rank 0 with
+/// `commits_ahead: 0`. `git rev-list --count sha..HEAD` is also zero for a sha
+/// that is a *descendant* of HEAD, and that tree differs from HEAD's; a sha
+/// that IS HEAD is the one anchor that can't be behind. Remaining ties (two
+/// distinct shas at the same distance, such as two descendants of HEAD) break
+/// by sha for determinism.
+fn newest_reachable_sha(reach: &Reachability) -> Option<&String> {
+    reach
+        .reachable
+        .iter()
+        .min_by_key(|sha| match reach.per_sha.get(*sha) {
+            Some(ShaRelation::Equal) => (0, 0),
+            Some(ShaRelation::Reachable { commits_ahead }) => (1, *commits_ahead),
+            // Not in `reachable` by construction; treat as farthest.
+            Some(ShaRelation::Missing) | None => (2, u32::MAX),
+        })
 }
 
 /// Compute the selection from a pre-built nextest listing and per-sha changed
@@ -347,11 +517,15 @@ pub(crate) fn changed_paths_since(
 /// - `stranded_tests = listed ∩ (all_db_tests - reachable_known_tests)`
 ///   (in DB but only at currently-missing shas).
 ///
-/// `#[ignore]`d tests are dropped from all three sets: `nextest run` skips
-/// them, so a selection of nothing but ignored tests makes `nextest run` exit
-/// non-zero. New/stranded would re-select an ignored test on every run only
-/// for it to be skipped again; `affected` would re-select a test whose
-/// coverage rows survived from a previous (non-ignored) collect after a hunk
+/// Filter-mismatched tests (`listing.excluded`) are dropped from all three
+/// sets: `nextest run` skips every one of them, so a selection of nothing
+/// but mismatched tests makes `nextest run` exit non-zero. `excluded` covers
+/// `#[ignore]`d tests, tests not matching the user's positional substring
+/// filter, tests not matching a `-E`/`--filterset` expression, and tests the
+/// project's own `default-filter` excludes — `nextest run`'s exact filter
+/// surface. New/stranded would re-select a mismatched test on every run
+/// only for it to be skipped again; `affected` would re-select a test whose
+/// coverage rows survived from a previous (matching) collect after a hunk
 /// happens to overlap them.
 ///
 /// Both `new` and `stranded` get rerun (and re-anchored, in `collect
@@ -379,11 +553,21 @@ pub(crate) fn compute(
 
     let mut new_tests = BTreeSet::new();
     let mut stranded_tests = BTreeSet::new();
+    let mut filter_excluded = BTreeSet::new();
     for t in &listed {
-        if listing.ignored.contains(t) {
-            // Skipped by `nextest run`, so it never gains coverage — must
+        if listing.excluded.contains(t) {
+            // Skipped by `nextest run` (ignored, or excluded by a positional
+            // / `-E` / default-filter), so it never gains coverage — must
             // not be treated as a new/stranded test to rerun. Stays in
             // `listed` (above) so `collect --diff`'s prune keeps its rows.
+            // Deliberately *not* recorded in `filter_excluded`: this arm
+            // cannot tell a test the caller's own filter excluded from one
+            // that is excluded on every run whatever the diff says (an
+            // `#[ignore]`d test never enters the DB, so it is permanently
+            // listed-but-excluded), and counting both would blame the
+            // filter for every genuinely uncovered change in a project that
+            // owns one. So the caller-filter case is given up here: only
+            // the two change-driven sources below record a lost selection.
             continue;
         }
         if reachable_known.contains(t) {
@@ -412,14 +596,22 @@ pub(crate) fn compute(
             }
             let hits = db.tests_covering_ranges(env_fingerprint, collect_sha, file, hunks)?;
             for hit in hits {
-                if listing.ignored.contains(&hit.test_id) {
-                    // Coverage rows from a previous (non-ignored) collect
-                    // can survive into a state where the test is now
-                    // `#[ignore]`d (the `--diff` prune deliberately keeps
-                    // them — see `diff_collect_keeps_ignored_test_rows`).
-                    // Selecting it anyway produces the same all-ignored
+                if listing.excluded.contains(&hit.test_id) {
+                    // Coverage rows from a previous matching collect can
+                    // survive into a state where the test now fails the
+                    // current filter (newly `#[ignore]`d, dropped by a
+                    // positional / `-E` / default-filter); the `--diff`
+                    // prune deliberately keeps them (see
+                    // `diff_collect_keeps_ignored_test_rows`). Selecting
+                    // such a test anyway produces the same all-excluded
                     // → nextest exit 4 we filter against above for
-                    // new/stranded.
+                    // new/stranded. Phantoms (in the DB but absent from
+                    // the listing entirely — renamed/deleted) are NOT in
+                    // `listing.excluded` and stay in `affected`; the
+                    // `collect --diff` flow uses the live/phantom split
+                    // in `handle_no_profraw_dirs` to discriminate them
+                    // from a runner-shim failure.
+                    filter_excluded.insert(hit.test_id);
                     continue;
                 }
                 affected.insert(hit.test_id.clone());
@@ -445,14 +637,20 @@ pub(crate) fn compute(
     // `[workspace.metadata.affected]` rule. Coverage can't link these inputs to tests, so
     // the rule supplies the edge. A reachable-known test that isn't already
     // `affected` would otherwise be skipped — rescue it as a `config_test`.
-    // New/stranded matches already run; ignored ones stay skipped by nextest.
+    // New/stranded matches already run; filter-excluded ones stay skipped by nextest.
     let mut config_tests = BTreeSet::new();
     for (path, tests) in config_hits {
         for test in tests {
-            if listing.ignored.contains(test)
-                || affected.contains(test)
-                || !reachable_known.contains(test)
-            {
+            if listing.excluded.contains(test) {
+                // The rule would have rescued it — `affected` can't already
+                // hold an excluded test, so reachable-known is the whole
+                // condition left.
+                if reachable_known.contains(test) {
+                    filter_excluded.insert(test.clone());
+                }
+                continue;
+            }
+            if affected.contains(test) || !reachable_known.contains(test) {
                 continue;
             }
             config_tests.insert(test.clone());
@@ -492,6 +690,7 @@ pub(crate) fn compute(
         config_tests,
         reachable_known_count,
         listed,
+        filter_excluded,
         diagnostics,
     })
 }
@@ -526,9 +725,10 @@ fn aggregate_per_file_counts(
 pub(crate) fn format_summary(sel: &Selection, verb: &str, verbose: bool) -> String {
     let selected = sel.selected();
     let mut out = format!(
-        "{} tests {verb} ({} affected + {} config + {} new + {} stranded, \
+        "{} test{} {verb} ({} affected + {} config + {} new + {} stranded, \
          {} skipped of {} reachable-known)",
         selected.len(),
+        plural_s(selected.len()),
         sel.affected.len(),
         sel.config_tests.len(),
         sel.new_tests.len(),
@@ -585,6 +785,7 @@ mod tests {
             config_tests: config_tests.iter().cloned().collect(),
             reachable_known_count,
             listed,
+            filter_excluded: BTreeSet::new(),
             diagnostics: SelectionDiagnostics {
                 per_file: BTreeMap::new(),
                 per_test: None,
@@ -606,6 +807,20 @@ mod tests {
             out,
             "3 tests to run (2 affected + 0 config + 1 new + 0 stranded, \
              3 skipped of 5 reachable-known) — pass -v to list"
+        );
+    }
+
+    /// A one-test selection says "1 test", not "1 tests". This is the single
+    /// most-printed line in the tool, and the `-v` breakdown right next to it
+    /// already pluralizes correctly, so the mismatch was visible on any run
+    /// that selected exactly one test.
+    #[test]
+    fn summary_singular_test_count() {
+        let sel = selection_with(&[tid("crate_a", "test_a")], &[], &[], &[], 5);
+        let out = format_summary(&sel, "to run", false);
+        assert!(
+            out.starts_with("1 test to run ("),
+            "expected a singular noun for a one-test selection, got:\n{out}"
         );
     }
 
@@ -631,6 +846,32 @@ mod tests {
     }
 
     #[test]
+    fn live_selected_drops_tests_missing_from_the_listing() {
+        let live = tid("crate_a", "still_here");
+        let phantom = tid("crate_a", "deleted");
+        let mut sel = selection_with(&[live.clone(), phantom.clone()], &[], &[], &[], 2);
+        // `selection_with` lists everything it selects; a phantom is exactly
+        // the case where the DB holds a test the listing no longer does.
+        sel.listed.remove(&phantom);
+
+        assert_eq!(sel.selected().len(), 2);
+        assert_eq!(sel.live_selected(), BTreeSet::from([live]));
+    }
+
+    #[test]
+    fn filter_excluded_notice_agrees_in_number() {
+        assert!(filter_excluded_notice(1, "excludes").contains("excludes the 1 test this change"));
+        assert!(filter_excluded_notice(2, "would exclude")
+            .contains("would exclude the 2 tests this change"));
+    }
+
+    #[test]
+    fn phantom_notice_agrees_in_number() {
+        assert!(phantom_notice(1, "will be skipped").contains("1 selected test is no longer"));
+        assert!(phantom_notice(3, "would be skipped").contains("3 selected tests are no longer"));
+    }
+
+    #[test]
     fn skipped_subtracts_affected_and_config() {
         // 2 affected + 1 config, all reachable-known → all 3 selected, none
         // skipped.
@@ -642,6 +883,29 @@ mod tests {
             3,
         );
         assert_eq!(sel.skipped(), 0);
+    }
+
+    /// `Equal` wins outright over a `Reachable` sha that is also zero commits
+    /// behind HEAD — a descendant of HEAD, which `git rev-list --count
+    /// sha..HEAD` reports as 0. The `zzz`/`aaa` naming makes the lexicographic
+    /// tie-break pick the wrong one if the two ever share a rank.
+    #[test]
+    fn newest_reachable_prefers_head_over_a_zero_distance_descendant() {
+        let reach = Reachability {
+            per_sha: [
+                (
+                    "aaa".to_string(),
+                    ShaRelation::Reachable { commits_ahead: 0 },
+                ),
+                ("zzz".to_string(), ShaRelation::Equal),
+            ]
+            .into_iter()
+            .collect(),
+            reachable: ["aaa".to_string(), "zzz".to_string()].into_iter().collect(),
+            missing: BTreeSet::new(),
+            max_commits_ahead: 0,
+        };
+        assert_eq!(newest_reachable_sha(&reach), Some(&"zzz".to_string()));
     }
 
     #[test]
