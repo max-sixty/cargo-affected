@@ -115,6 +115,19 @@ CREATE TABLE IF NOT EXISTS test_regions (
 -- Benchmark on real workspaces if status/run latency matters.
 CREATE INDEX IF NOT EXISTS idx_test_regions_lookup
     ON test_regions(source_file, env_fingerprint, collect_sha, line_start, line_end);
+-- Ranges that rows at a `collect_sha` held before `collect --diff` re-anchored
+-- or pruned their test. `tests_covering_ranges` counts them, in that sha's own
+-- line numbers, when deciding whether a hunk is structural, so a test moving
+-- off a sha doesn't make the lines it covered there read as uncovered. They
+-- never select a test themselves.
+CREATE TABLE IF NOT EXISTS retired_ranges (
+    source_file TEXT NOT NULL,
+    env_fingerprint TEXT NOT NULL,
+    collect_sha TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    PRIMARY KEY (source_file, env_fingerprint, collect_sha, line_start, line_end)
+);
 CREATE TABLE IF NOT EXISTS fingerprints (
     fingerprint TEXT PRIMARY KEY,
     last_seen TEXT NOT NULL
@@ -284,17 +297,42 @@ fn batch_delete_tests<'a>(
             })
             .collect::<Vec<_>>()
             .join(" OR ");
-        let sql = format!(
-            "DELETE FROM test_regions \
-             WHERE env_fingerprint = ?1 AND ({predicate})"
-        );
-        let params = std::iter::once(fingerprint).chain(
-            chunk
-                .iter()
-                .flat_map(|t| [t.binary_id.as_str(), t.test_name.as_str()]),
-        );
-        tx.execute(&sql, rusqlite::params_from_iter(params))?;
+        let params = || {
+            std::iter::once(fingerprint).chain(
+                chunk
+                    .iter()
+                    .flat_map(|t| [t.binary_id.as_str(), t.test_name.as_str()]),
+            )
+        };
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO retired_ranges \
+                 (source_file, env_fingerprint, collect_sha, line_start, line_end) \
+                 SELECT source_file, env_fingerprint, collect_sha, line_start, line_end \
+                 FROM test_regions WHERE env_fingerprint = ?1 AND ({predicate})"
+            ),
+            rusqlite::params_from_iter(params()),
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM test_regions \
+                 WHERE env_fingerprint = ?1 AND ({predicate})"
+            ),
+            rusqlite::params_from_iter(params()),
+        )?;
     }
+    Ok(())
+}
+
+/// Drop `retired_ranges` at shas no `test_regions` row is anchored at any
+/// more. Selection never queries such a sha, so the ranges there can't
+/// suppress anything.
+fn purge_unanchored_retired(tx: &rusqlite::Transaction<'_>, fingerprint: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM retired_ranges WHERE env_fingerprint = ?1 AND collect_sha NOT IN \
+         (SELECT DISTINCT collect_sha FROM test_regions WHERE env_fingerprint = ?1)",
+        [fingerprint],
+    )?;
     Ok(())
 }
 
@@ -413,6 +451,10 @@ impl Db {
             "DELETE FROM test_regions WHERE env_fingerprint = ?1",
             [fingerprint],
         )?;
+        tx.execute(
+            "DELETE FROM retired_ranges WHERE env_fingerprint = ?1",
+            [fingerprint],
+        )?;
         insert_mappings(&tx, fingerprint, collect_sha, mappings)?;
         upsert_components(&tx, fingerprint, components)?;
         touch_fingerprint(&tx, fingerprint)?;
@@ -437,6 +479,7 @@ impl Db {
         let tx = self.conn.transaction()?;
         batch_delete_tests(&tx, fingerprint, mappings.iter().map(|(t, _)| t))?;
         insert_mappings(&tx, fingerprint, new_collect_sha, mappings)?;
+        purge_unanchored_retired(&tx, fingerprint)?;
         upsert_components(&tx, fingerprint, components)?;
         touch_fingerprint(&tx, fingerprint)?;
         write_last_collected(&tx)?;
@@ -479,6 +522,7 @@ impl Db {
         }
         let tx = self.conn.transaction()?;
         batch_delete_tests(&tx, fingerprint, to_drop.iter())?;
+        purge_unanchored_retired(&tx, fingerprint)?;
         tx.commit()
             .map_err(|e| translate_busy(e, "failed to commit prune"))?;
         Ok(to_drop.len())
@@ -488,7 +532,9 @@ impl Db {
     /// given line ranges in `file`. Per hunk: range-overlap; if a hunk
     /// overlaps no stored range, broaden to "any test with rows for this
     /// file at this sha" (the structural-edit backstop for struct-field,
-    /// derive, const, use, mod edits).
+    /// derive, const, use, mod edits). "Stored" includes `retired_ranges`,
+    /// so the backstop decides from every range ever recorded at this sha,
+    /// exactly as it would had `--diff` moved no test off it.
     ///
     /// Each returned [`TestHit`] carries the [`HitReason`] explaining
     /// selection — which file, which hunk, and which kind of match
@@ -540,6 +586,15 @@ impl Db {
         if rows.is_empty() {
             return Ok(hits);
         }
+        let mut stmt = self.conn.prepare(
+            "SELECT line_start, line_end FROM retired_ranges \
+             WHERE source_file = ?1 AND env_fingerprint = ?2 AND collect_sha = ?3",
+        )?;
+        let retired: Vec<(i64, i64)> = stmt
+            .query_map(rusqlite::params![file, fingerprint, collect_sha], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
         for hunk in hunks {
             // Range-overlap: a stored row [ls, le] overlaps a hunk [hs, he]
@@ -565,6 +620,13 @@ impl Db {
                     overlapped = true;
                 }
             }
+            // A range a re-anchored test held here still says these lines
+            // were inside a function body at this sha, so the hunk isn't
+            // structural — whichever test covered it is now judged at its
+            // own anchor.
+            overlapped |= retired
+                .iter()
+                .any(|(ls, le)| *ls <= hunk.end && *le >= hunk.start);
             if !overlapped {
                 // Backstop: emit one hit per unique test for this file
                 // (rows can have many ranges per test; we don't want to
@@ -828,6 +890,7 @@ impl Db {
             .transaction()
             .map_err(|e| translate_busy(e, "failed to start clear transaction"))?;
         tx.execute("DELETE FROM test_regions", [])?;
+        tx.execute("DELETE FROM retired_ranges", [])?;
         tx.execute("DELETE FROM fingerprints", [])?;
         tx.execute("DELETE FROM fingerprint_components", [])?;
         tx.execute("DELETE FROM meta", [])?;
@@ -860,6 +923,10 @@ impl Db {
 
         for fp in &to_evict {
             tx.execute("DELETE FROM test_regions WHERE env_fingerprint = ?1", [fp])?;
+            tx.execute(
+                "DELETE FROM retired_ranges WHERE env_fingerprint = ?1",
+                [fp],
+            )?;
             tx.execute("DELETE FROM fingerprints WHERE fingerprint = ?1", [fp])?;
             tx.execute(
                 "DELETE FROM fingerprint_components WHERE env_fingerprint = ?1",
@@ -1003,6 +1070,7 @@ fn migrate_legacy_tables(conn: &Connection) -> Result<()> {
 fn drop_coverage_tables(conn: &Connection) -> Result<()> {
     conn.execute("DROP TABLE IF EXISTS test_regions", [])?;
     conn.execute("DROP INDEX IF EXISTS idx_test_regions_lookup", [])?;
+    conn.execute("DROP TABLE IF EXISTS retired_ranges", [])?;
     conn.execute("DROP TABLE IF EXISTS fingerprints", [])?;
     conn.execute("DROP TABLE IF EXISTS fingerprint_components", [])?;
     Ok(())
@@ -1545,6 +1613,59 @@ mod tests {
             BTreeSet::from([tid(BIN_A, "test_c")]),
         );
 
+        Ok(())
+    }
+
+    /// Re-anchoring a test keeps its old range in force for the backstop at
+    /// the old sha (#94): a hunk there inside the moved test's range is a body
+    /// edit, not structural, so it doesn't drag in the test left behind. A
+    /// hunk overlapping no range ever recorded at that sha still fires.
+    #[test]
+    fn re_anchored_range_still_suppresses_backstop_at_old_sha() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = Db::open(dir.path())?;
+        db.store_coverage(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_A,
+            &[
+                (
+                    tid(BIN_A, "test_add"),
+                    BTreeSet::from([rng("src/math.rs", 1, 3)]),
+                ),
+                (
+                    tid(BIN_A, "test_mul"),
+                    BTreeSet::from([rng("src/math.rs", 9, 11)]),
+                ),
+            ],
+        )?;
+        db.update_coverage_for_tests(
+            FP_A,
+            &comps_for(FP_A),
+            SHA_B,
+            &[(
+                tid(BIN_A, "test_add"),
+                BTreeSet::from([rng("src/math.rs", 1, 3)]),
+            )],
+        )?;
+
+        assert!(db
+            .tests_covering_ranges(FP_A, SHA_A, "src/math.rs", &[hunk(2, 2)])?
+            .is_empty());
+        assert_eq!(
+            ids(db.tests_covering_ranges(FP_A, SHA_A, "src/math.rs", &[hunk(6, 6)])?),
+            BTreeSet::from([tid(BIN_A, "test_mul")]),
+        );
+
+        // Pruning the test left at SHA_A empties that sha; its retired
+        // ranges go with it.
+        db.prune_missing_tests(FP_A, &BTreeSet::from([tid(BIN_A, "test_add")]))?;
+        let retired: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM retired_ranges WHERE collect_sha = ?1",
+            [SHA_A],
+            |r| r.get(0),
+        )?;
+        assert_eq!(retired, 0);
         Ok(())
     }
 
