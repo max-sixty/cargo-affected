@@ -147,7 +147,19 @@ pub(crate) fn config_rule_hits(
     if rules.is_empty() {
         return Ok(BTreeMap::new());
     }
-    resolve_config_hits(&project.workspace_root, build_args, &rules, changed_paths)
+    // Rule globs are relative to the workspace; changed paths are relative to
+    // the Git root, which is the workspace or one of its ancestors.
+    let prefix = project
+        .workspace_root
+        .strip_prefix(&project.git_root)
+        .expect("git_root is derived as an ancestor of workspace_root");
+    resolve_config_hits(
+        &project.workspace_root,
+        prefix,
+        build_args,
+        &rules,
+        changed_paths,
+    )
 }
 
 /// Resolve compiled rules against the changed paths, returning a map from each
@@ -198,6 +210,7 @@ pub(crate) fn config_rule_hits(
 /// keep the set non-empty and the warning would never fire at all.
 pub(crate) fn resolve_config_hits(
     project_root: &Path,
+    workspace_prefix: &Path,
     build_args: &[String],
     rules: &[CompiledRule],
     changed_paths: &BTreeSet<String>,
@@ -207,7 +220,11 @@ pub(crate) fn resolve_config_hits(
     for rule in rules {
         let matched: Vec<&String> = changed_paths
             .iter()
-            .filter(|p| rule.matcher.is_match(p.as_str()))
+            .filter(|p| {
+                Path::new(p)
+                    .strip_prefix(workspace_prefix)
+                    .is_ok_and(|rel| rule.matcher.is_match(rel))
+            })
             .collect();
         if matched.is_empty() {
             continue;

@@ -226,6 +226,7 @@ mod tests {
 
     fn project_with(workspace_root: PathBuf, manifests: Vec<PathBuf>) -> ProjectRoot {
         ProjectRoot {
+            git_root: workspace_root.clone(),
             workspace_root,
             manifest_paths: manifests,
             metadata: serde_json::Value::Null,

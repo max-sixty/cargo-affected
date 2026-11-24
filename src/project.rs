@@ -87,6 +87,10 @@ pub(crate) struct ProjectRoot {
     /// Workspace root directory. Git operations and the DB live here.
     /// For single-crate projects this equals the crate root.
     pub(crate) workspace_root: PathBuf,
+    /// Git repository root, spelled as Cargo spells `workspace_root`: an
+    /// ancestor of it, or the same directory. Git reports paths relative to
+    /// it, so stored ranges are too, even when the workspace is nested.
+    pub(crate) git_root: PathBuf,
     /// All Cargo.toml files belonging to the workspace — the root manifest
     /// plus every member's manifest. Sorted, deduplicated. Used for
     /// environment fingerprinting.
@@ -142,6 +146,15 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
         .as_str()
         .context("cargo metadata missing workspace_root")?;
     let workspace_root = PathBuf::from(workspace_root);
+    // Pop git's prefix off Cargo's path rather than taking git's toplevel:
+    // on Windows the two spell the same directory differently (`RUNNER~1`
+    // against `runneradmin`), and every path compared against this root
+    // comes from Cargo or LLVM.
+    let prefix = run_git(&workspace_root, &["rev-parse", "--show-prefix"])?.concat();
+    let mut git_root = workspace_root.clone();
+    for _ in Path::new(prefix.trim()).components() {
+        git_root.pop();
+    }
 
     let mut manifest_paths: Vec<PathBuf> = meta["packages"]
         .as_array()
@@ -165,6 +178,7 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
 
     Ok(ProjectRoot {
         workspace_root,
+        git_root,
         manifest_paths,
         metadata: meta,
     })
@@ -199,13 +213,13 @@ impl ProjectRoot {
     pub(crate) fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
-        // No canonicalize: `workspace_root` and `target.src_path` both come
-        // from the same `cargo metadata` invocation and share whatever
-        // normalisation cargo applied. Calling `Path::canonicalize` here
+        // No canonicalize: `git_root` is derived from `workspace_root`, and
+        // it and `target.src_path` both come from the same `cargo metadata`
+        // invocation and share whatever normalisation cargo applied. Calling `Path::canonicalize` here
         // would diverge on Windows (verbatim `\\?\` prefix, 8.3 → long-name
         // expansion of `RUNNER~1` → `runneradmin`) and the strip_prefix
         // below would silently drop every target.
-        let root = &self.workspace_root;
+        let root = &self.git_root;
 
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
@@ -426,7 +440,7 @@ fn transitive_closure<'a>(
 /// List files changed in the working tree relative to HEAD: staged + unstaged
 /// + untracked.
 ///
-/// Returns paths relative to the project root. A non-zero git exit (corrupt
+/// Returns paths relative to the Git root. A non-zero git exit (corrupt
 /// repo, missing object, permissions) is a hard error: silently returning "no
 /// changed files" would look like a clean tree and select zero tests.
 pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
@@ -441,7 +455,13 @@ pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
             "--cached",
             "-z",
         ],
-        vec!["ls-files", "-z", "--others", "--exclude-standard"],
+        vec![
+            "ls-files",
+            "--full-name",
+            "-z",
+            "--others",
+            "--exclude-standard",
+        ],
     ] {
         for path in run_git(project_root, &args)? {
             if !files.contains(&path) {
@@ -601,7 +621,7 @@ pub(crate) fn git_changed_line_ranges(
 /// `git_changed_files` only sees uncommitted changes — so for committed
 /// additions, the diagnostic report needs this dedicated query to know
 /// the file existed in the diff at all. Returns paths relative to the
-/// project root.
+/// Git root.
 pub(crate) fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
     let mut out = run_git(
         project_root,
@@ -844,6 +864,19 @@ mod tests {
             files.iter().any(|f| f == "new.txt"),
             "expected new.txt in {files:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_repository_untracked_files_keep_git_root_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(member.join("src"))?;
+        std::fs::write(member.join("src/new.rs"), b"pub fn new() {}\n")?;
+
+        let paths = git_changed_files(&member)?;
+        assert_eq!(paths, vec!["member/src/new.rs"]);
         Ok(())
     }
 
@@ -1320,6 +1353,7 @@ mod tests {
 
         let project = ProjectRoot {
             workspace_root: root.clone(),
+            git_root: root.clone(),
             manifest_paths: vec![],
             metadata,
         };
@@ -1427,6 +1461,7 @@ mod tests {
 
         let project = ProjectRoot {
             workspace_root: root.clone(),
+            git_root: root.clone(),
             manifest_paths: vec![],
             metadata,
         };
@@ -1516,6 +1551,7 @@ mod tests {
 
         let project = ProjectRoot {
             workspace_root: root.clone(),
+            git_root: root.clone(),
             manifest_paths: vec![],
             metadata,
         };
