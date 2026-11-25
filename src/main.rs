@@ -9,6 +9,7 @@ mod coverage;
 mod db;
 mod fingerprint;
 mod plan;
+mod profile;
 mod project;
 mod report;
 mod run;
@@ -35,6 +36,10 @@ struct Cli {
     /// selected test name during `run`/`status`. Accepted at any position.
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// Persist LLVM counters continuously, including killed subprocesses.
+    /// Native Linux only; use the same mode for collect, run and status.
+    #[arg(long, global = true)]
+    continuous: bool,
     #[command(subcommand)]
     action: Action,
 }
@@ -142,8 +147,10 @@ fn main() {
     // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
     // via `--config target.<triple>.runner=…`. Dispatch before clap — its trailing
     // args include `--exact`/`--list`/etc. which clap would interpret if we let it.
-    if argv.get(1).map(String::as_str) == Some("runner-shim") {
-        shim::run(&argv[2..]);
+    match argv.get(1).map(String::as_str) {
+        Some("runner-shim") => shim::run(&argv[2..], profile::ProfileMode::Exit),
+        Some("runner-shim-continuous") => shim::run(&argv[2..], profile::ProfileMode::Continuous),
+        _ => {}
     }
 
     // Stop NEXTEST_BINARY_ID / NEXTEST_TEST_NAME from leaking into our inner
@@ -167,7 +174,11 @@ fn main() {
 
     let cli = Cli::parse_from(argv);
 
-    let exit_code = match run_action(cli.action, cli.verbose) {
+    let exit_code = match run_action(
+        cli.action,
+        cli.verbose,
+        profile::ProfileMode::from_flag(cli.continuous),
+    ) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
@@ -177,13 +188,14 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-fn run_action(action: Action, verbose: bool) -> Result<i32> {
+fn run_action(action: Action, verbose: bool, mode: profile::ProfileMode) -> Result<i32> {
+    mode.check_platform()?;
     match action {
         Action::Collect {
             diff,
             allow_dirty,
             nextest_args,
-        } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
+        } => collect::collect(diff, verbose, allow_dirty, mode, &nextest_args),
         Action::Run {
             all,
             report_json,
@@ -192,6 +204,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         } => run::run(
             all,
             verbose,
+            mode,
             report_json.as_deref(),
             report_detail,
             &nextest_args,
@@ -203,6 +216,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         } => {
             status::status(
                 verbose,
+                mode,
                 report_json.as_deref(),
                 report_detail,
                 &nextest_args,

@@ -2,6 +2,7 @@
 //!
 //! ```sh
 //! cargo bench --bench collect
+//! cargo bench --bench collect -- --collector /path/to/other/cargo-affected
 //! ```
 //!
 //! ## What it measures, and why the fixture is shaped the way it is
@@ -15,7 +16,8 @@
 //!
 //! So the fixture is deliberately wide rather than deep: [`MODULES`] ×
 //! [`FUNCTIONS_PER_MODULE`] trivial functions produce a coverage map of
-//! realistic size, while [`TESTS`] tests each touch only
+//! realistic size, linked into both a separate executable and an integration
+//! test binary, while [`TESTS`] tests each touch only
 //! [`MODULES_PER_TEST`] modules' worth of them.
 //!
 //! Real numbers for calibration: worktrunk's `integration` test binary carries
@@ -71,6 +73,17 @@ const MODULES_PER_TEST: usize = 4;
 const SAMPLES: usize = 3;
 
 fn main() {
+    let mut args = std::env::args_os().skip(1).filter(|arg| arg != "--bench");
+    let collector = match args.next() {
+        None => PathBuf::from(env!("CARGO_BIN_EXE_cargo-affected")),
+        Some(flag) if flag == "--collector" => {
+            PathBuf::from(args.next().expect("--collector requires a path"))
+                .canonicalize()
+                .expect("collector path must exist")
+        }
+        Some(other) => panic!("unknown benchmark argument {other:?}"),
+    };
+    assert!(args.next().is_none(), "unexpected benchmark argument");
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("affected-bench")
@@ -83,16 +96,20 @@ fn main() {
         MODULES * FUNCTIONS_PER_MODULE,
     );
 
-    let warm = collect(&fixture, &[]);
+    let warm = collect(&collector, &fixture, &[]);
     println!("warm-up:       {warm:.1}s (parallel, primes the build cache)");
 
     // `none()` matches no test, so this run pays everything a collect pays
     // except the per-test work: the listing, the function-map export, the
     // freshness check. `--no-tests=warn` keeps it a success.
-    let (fixed, fixed_spread) = best_of(&fixture, &["--", "--test-threads=1", "-E", "none()"]);
+    let (fixed, fixed_spread) = best_of(
+        &collector,
+        &fixture,
+        &["--", "--test-threads=1", "-E", "none()"],
+    );
     println!("fixed:         {fixed:.1}s list + map export, no tests — samples: {fixed_spread}");
 
-    let (total, total_spread) = best_of(&fixture, &["--", "--test-threads=1"]);
+    let (total, total_spread) = best_of(&collector, &fixture, &["--", "--test-threads=1"]);
     println!("collect:       {total:.1}s serial — samples: {total_spread}");
     println!(
         "per test:      {:.0} ms marginal, {:.0} ms amortized",
@@ -104,8 +121,10 @@ fn main() {
 /// Time [`SAMPLES`] collects; return the fastest and every sample formatted,
 /// so a spread between them shows the machine was busy and the run should be
 /// repeated.
-fn best_of(dir: &Path, extra: &[&str]) -> (f64, String) {
-    let samples: Vec<f64> = (0..SAMPLES).map(|_| collect(dir, extra)).collect();
+fn best_of(collector: &Path, dir: &Path, extra: &[&str]) -> (f64, String) {
+    let samples: Vec<f64> = (0..SAMPLES)
+        .map(|_| collect(collector, dir, extra))
+        .collect();
     let spread = samples
         .iter()
         .map(|s| format!("{s:.1}"))
@@ -118,9 +137,9 @@ fn best_of(dir: &Path, extra: &[&str]) -> (f64, String) {
 /// Run `cargo affected collect` in `dir`, returning wall-clock seconds. Its
 /// own progress output is suppressed; a failure is fatal, since a benchmark
 /// that silently times an error path is worse than no benchmark.
-fn collect(dir: &Path, extra: &[&str]) -> f64 {
+fn collect(collector: &Path, dir: &Path, extra: &[&str]) -> f64 {
     let start = Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-affected"))
+    let output = Command::new(collector)
         .args(["affected", "collect"])
         .args(extra)
         .current_dir(dir)
@@ -152,6 +171,10 @@ fn write_fixture(dir: &Path) {
          version = \"0.1.0\"\n\
          edition = \"2021\"\n\
          \n\
+         [[bin]]\n\
+         name = \"affected_bench_fixture\"\n\
+         path = \"src/main.rs\"\n\
+         test = false\n\
          [workspace]\n",
     );
     write_if_changed(&dir.join(".gitignore"), "/target\n/Cargo.lock\n");
@@ -160,7 +183,6 @@ fn write_fixture(dir: &Path) {
     for m in 0..MODULES {
         lib.push_str(&format!("pub mod m{m};\n"));
     }
-    lib.push_str("pub mod tests;\n");
     write_if_changed(&src.join("lib.rs"), &lib);
 
     for m in 0..MODULES {
@@ -210,18 +232,38 @@ fn write_fixture(dir: &Path) {
         }
     }
 
-    let mut tests = String::from("#![cfg(test)]\n\n");
+    // A non-test binary links the whole same library map, but none of these
+    // integration tests launches it. This exposes repeated executable-map
+    // loading and false launch evidence from shared library functions.
+    let mut binary = String::from("fn main() { let mut total = 0;\n");
+    for m in 0..MODULES {
+        binary.push_str(&format!(
+            "total += affected_bench_fixture::m{m}::all(std::hint::black_box(2));\n"
+        ));
+    }
+    binary.push_str("std::hint::black_box(total); }\n");
+    write_if_changed(&src.join("main.rs"), &binary);
+    let old_tests = src.join("tests.rs");
+    if old_tests.exists() {
+        std::fs::remove_file(old_tests).expect("remove old unit-test fixture");
+    }
+    let test_dir = dir.join("tests");
+    std::fs::create_dir_all(&test_dir).expect("create integration test fixture");
+    let mut tests = String::new();
     for t in 0..TESTS {
         tests.push_str(&format!("#[test]\nfn test_{t}() {{\n    let mut t = 0;\n"));
         for k in 0..MODULES_PER_TEST {
             let m = (t * MODULES_PER_TEST + k) % MODULES;
-            tests.push_str(&format!("    t += crate::m{m}::all({});\n", t as i64 % 7));
+            tests.push_str(&format!(
+                "    t += affected_bench_fixture::m{m}::all({});\n",
+                t as i64 % 7
+            ));
         }
         // The sum is never asserted on — the test exists to touch functions,
         // and black_box keeps the calls from being optimised away.
         tests.push_str("    std::hint::black_box(t);\n}\n\n");
     }
-    write_if_changed(&src.join("tests.rs"), &tests);
+    write_if_changed(&test_dir.join("wide.rs"), &tests);
 }
 
 /// Write `content` to `path` unless it's already there verbatim.

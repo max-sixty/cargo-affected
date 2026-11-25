@@ -47,6 +47,7 @@ use crate::selection::{self, DiagnosticDetail};
 pub(crate) fn run(
     all: bool,
     verbose: bool,
+    mode: crate::profile::ProfileMode,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,
     nextest_args: &[String],
@@ -62,7 +63,7 @@ pub(crate) fn run(
         // cache-aware selection, so an unrelated cache lock or schema
         // reset shouldn't be able to fail or mutate state on this path.
         if let Some(path) = report_json {
-            let fingerprint = fingerprint::compute(&project)?;
+            let fingerprint = fingerprint::compute(&project, mode)?;
             let stored = match open_db_if_present(project_root)? {
                 Some(d) => d.stored_fingerprint_snapshots()?,
                 None => vec![],
@@ -83,7 +84,7 @@ pub(crate) fn run(
         return run_tests(project_root, None, nextest_args);
     }
 
-    let fingerprint = fingerprint::compute(&project)?;
+    let fingerprint = fingerprint::compute(&project, mode)?;
     let db = Db::open(project_root)?;
     let assessment = plan::assess(project_root, &db, &fingerprint, report_json.is_some())?;
     let Assessment { stored, state, .. } = assessment;
