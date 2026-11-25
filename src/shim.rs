@@ -271,9 +271,20 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         }
     };
 
-    match coverage::hit_ranges(&executed, &map.functions)
-        .with_context(|| format!("joining against {}", binary.display()))
-    {
+    let ranges = (|| -> anyhow::Result<BTreeSet<HitRange>> {
+        // Validate the test binary's own map as before, then incorporate any
+        // child process's instrumented functions from the same profile bundle.
+        let path = executable_maps_path(&env.function_maps_dir);
+        let maps: Vec<coverage::ExecutableMap> = match std::fs::read(&path) {
+            Ok(raw) => serde_json::from_slice(&raw)
+                .with_context(|| format!("parsing executable maps {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error).context("reading executable coverage maps"),
+        };
+        coverage::test_and_executable_ranges(&executed, &map.functions, &maps)
+    })()
+    .with_context(|| format!("joining against {}", binary.display()));
+    match ranges {
         Ok(ranges) => TestOutcome::Collected { ranges },
         Err(e) => TestOutcome::Skipped {
             reason: format!("{e:#}"),
@@ -307,6 +318,10 @@ fn load_function_map(function_maps_dir: &Path, binary: &Path) -> Result<BinaryFu
         ));
     }
     Ok(map)
+}
+
+pub(crate) fn executable_maps_path(function_maps_dir: &Path) -> PathBuf {
+    function_maps_dir.join("executables.json")
 }
 
 /// Where a binary's function map lives under the function-maps directory.

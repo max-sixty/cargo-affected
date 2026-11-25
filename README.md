@@ -97,6 +97,25 @@ nextest run`: always at least as safe.
    the same package that links the lib (bins, integration tests), and every
    test in workspace packages that transitively depend on it.
 
+## Executable subprocess coverage
+
+Coverage collection uses Nextest's build metadata to include separately built
+Cargo executables (including `test = false` binaries). Tests and their
+instrumented descendants write LLVM profiles into the same test-specific
+directory. Function hits from those executables are attributed to the test
+that launched them, including grandchildren; crate-root dependencies are
+included for matching executable maps. Identical function names in multiple
+maps are conservatively unioned rather than assigned arbitrarily. Baselines
+created before executable support require a fresh collect.
+
+The executable must be built with coverage instrumentation and be identified
+in Nextest's build metadata. Descendants must inherit the per-test
+`LLVM_PROFILE_FILE` and flush their counters before the test ends. An
+executable built separately during the test, a process that discards the
+profile environment, or a daemon killed before it flushes cannot provide
+complete per-test coverage through this mechanism. Use explicit input rules
+for those cases until they can be instrumented and made to flush.
+
 ## Accuracy model
 
 `cargo affected run` is an approximation — it trades correctness for speed.

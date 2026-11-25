@@ -219,6 +219,58 @@ pub(crate) struct BinaryFunctionMap {
     pub(crate) functions: FunctionMap,
 }
 
+/// Coverage maps for Cargo-built, non-test executables that a test can
+/// launch. The path is retained to validate the mapped build, not inferred
+/// from a basename or the executable name in a profile.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ExecutableMap {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) map: BinaryFunctionMap,
+    pub(crate) sentinels: BTreeSet<HitRange>,
+}
+
+/// Include every matching executable's ranges. LLVM profile function names
+/// can coincide across binaries (e.g. shared library instantiations); union
+/// rather than choose arbitrarily. This is deliberately conservative.
+pub(crate) fn executable_hit_ranges(
+    executed: &[&str],
+    maps: &[ExecutableMap],
+    ranges: &mut BTreeSet<HitRange>,
+) -> Result<()> {
+    for executable in maps {
+        // Check every mapped executable even when no name matches: a rebuild
+        // can change all its symbol names, and would otherwise go unnoticed.
+        if BinaryStamp::of(&executable.path)? != executable.map.binary {
+            bail!(
+                "{} was rebuilt after its executable coverage map was exported",
+                executable.path.display()
+            );
+        }
+        let hits = matching_ranges(executed, &executable.map.functions);
+        if !hits.is_empty() {
+            ranges.extend(hits);
+            ranges.extend(executable.sentinels.iter().cloned());
+        }
+    }
+    Ok(())
+}
+
+/// Join the test profile to all known executable maps, permitting profiles
+/// containing only a replacement executable (e.g. Unix exec). A wholly
+/// unmatched profile is still a collection failure, not sentinel-only data.
+pub(crate) fn test_and_executable_ranges(
+    executed: &[&str],
+    test_map: &FunctionMap,
+    executable_maps: &[ExecutableMap],
+) -> Result<BTreeSet<HitRange>> {
+    let mut ranges = matching_ranges(executed, test_map);
+    executable_hit_ranges(executed, executable_maps, &mut ranges)?;
+    if ranges.is_empty() {
+        return hit_ranges(executed, test_map);
+    }
+    Ok(ranges)
+}
+
 /// Turns the absolute path of a source file, as cargo or llvm-cov spell it,
 /// into the path the database stores for it: the file's path relative to the
 /// Git root, which is how every git query in [`crate::project`] reports it.
@@ -403,13 +455,18 @@ pub(crate) fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
 /// the row count looks healthy, and the stored coverage quietly degrades to
 /// "only crate-root edits select anything" — under-selection across the whole
 /// binary, from a collect that exited 0.
-pub(crate) fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
+fn matching_ranges(executed: &[&str], map: &FunctionMap) -> BTreeSet<HitRange> {
     let mut ranges = BTreeSet::new();
     for name in executed {
         if let Some(function) = map.get(*name) {
             ranges.extend(function.iter().cloned());
         }
     }
+    ranges
+}
+
+pub(crate) fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
+    let ranges = matching_ranges(executed, map);
     if ranges.is_empty() {
         bail!(
             "none of the {} functions this test executed appear among the {} \

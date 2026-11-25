@@ -39,7 +39,7 @@ pub(crate) struct Fingerprint {
 /// A single named input contributing to the composite fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FingerprintComponent {
-    /// Stable label (`cargo_lock`, `manifest:Cargo.toml`, `rustc`,
+    /// Stable label (`coverage_mapping`, `cargo_lock`, `manifest:Cargo.toml`, `rustc`,
     /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
     pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
@@ -81,7 +81,14 @@ pub(crate) fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
 /// the hex digest of an otherwise unchanged environment.
 fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
     let mut inputs: Vec<(String, Vec<u8>)> =
-        Vec::with_capacity(2 + project.manifest_paths.len() + 3);
+        Vec::with_capacity(3 + project.manifest_paths.len() + 3);
+
+    // Older baselines omit separately built executable coverage. They
+    // cannot be used to safely select tests after upgrading this collector.
+    inputs.push((
+        "coverage_mapping".to_string(),
+        b"executable-maps-v1".to_vec(),
+    ));
 
     inputs.push((
         "cargo_lock".to_string(),
@@ -378,6 +385,7 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "coverage_mapping",
                 "cargo_lock",
                 "manifest:Cargo.toml",
                 "manifest:crates/foo/Cargo.toml",

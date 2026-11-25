@@ -230,7 +230,7 @@ impl ProjectRoot {
             .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
             .collect();
 
-        // Per-package: lib src_path (if any), test-producing targets, and
+        // Per-package: lib src_path (if any), test-producing targets and executable targets, and
         // workspace-package deps (normal + dev — both compile into tests).
         let mut lib_src: BTreeMap<&str, Utf8PathBuf> = BTreeMap::new();
         let mut targets_by_pkg: BTreeMap<&str, Vec<TestTarget>> = BTreeMap::new();
@@ -257,7 +257,7 @@ impl ProjectRoot {
                         if matches!(parsed.kind, TargetKind::Lib | TargetKind::ProcMacro) {
                             lib_src.insert(name, parsed.src_path.clone());
                         }
-                        if parsed.runs_tests {
+                        if parsed.runs_tests || matches!(parsed.kind, TargetKind::Bin) {
                             targets_by_pkg.entry(name).or_default().push(parsed);
                         }
                     }
@@ -340,8 +340,8 @@ struct TestTarget {
     /// Cargo's `test` flag for this target — whether cargo builds a test
     /// harness for it, so nextest gets a binary with tests in it. False for
     /// `[lib] test = false` and its `[[bin]]`/`[[test]]` equivalents. Such a
-    /// target contributes no `binary_id` of its own but is still a
-    /// compile-time input to the ones that do.
+    /// target may have no test harness of its own but a binary can still
+    /// be executed by integration tests.
     runs_tests: bool,
 }
 

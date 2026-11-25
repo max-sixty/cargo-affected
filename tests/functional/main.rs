@@ -29,6 +29,7 @@ mod diff_collect;
 mod dirty;
 mod drift;
 mod duplicate_target_names;
+mod executable_coverage;
 mod fingerprint;
 mod lib_bin_collision;
 mod narrowing;

@@ -274,9 +274,16 @@ pub(crate) fn collect(
         "exporting coverage maps for {}...",
         binaries_phrase(mapped.len())
     );
+    let executables = listing.executables(&project)?;
+    eprintln!(
+        "exporting coverage maps for {} non-test executable(s)...",
+        executables.len()
+    );
     write_function_maps(
         &function_maps_dir,
         &mapped,
+        &executables,
+        &crate_root_ranges_by_binary_id,
         &llvm_profdata,
         &llvm_cov,
         &coverage::DbKeys {
@@ -553,6 +560,8 @@ fn binaries_for_run<'a>(
 fn write_function_maps(
     function_maps_dir: &Path,
     binaries: &[&BinaryEntry],
+    executables: &[BinaryEntry],
+    sentinels: &BTreeMap<String, BTreeSet<HitRange>>,
     llvm_profdata: &Path,
     llvm_cov: &Path,
     keys: &coverage::DbKeys,
@@ -577,42 +586,7 @@ fn write_function_maps(
     }
 
     for binary in binaries {
-        // POSIX ERE — no negative lookahead, so the regex enumerates prefixes
-        // to drop. It shrinks `files[]` but leaves `functions[]` (the bulk of
-        // the JSON) intact; `coverage::build_function_map` filters
-        // authoritatively by giving each path a key (`coverage::DbKeys`).
-        let export = Command::new(llvm_cov)
-            .arg("export")
-            .arg("--format=text")
-            .arg(format!("--instr-profile={}", profdata.display()))
-            .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
-            .arg(&binary.binary_path)
-            .output()
-            .with_context(|| format!("failed to run llvm-cov export for {}", binary.binary_id))?;
-        if !export.status.success() {
-            bail!(
-                "llvm-cov export failed for {}: {}",
-                binary.binary_id,
-                String::from_utf8_lossy(&export.stderr).trim(),
-            );
-        }
-        let json = String::from_utf8_lossy(&export.stdout);
-        let functions = coverage::build_function_map(&json, keys)
-            .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
-        if functions.is_empty() {
-            bail!(
-                "{} has no instrumented functions under {} — every test in it \
-                 would collect nothing. Check that the project root is a \
-                 prefix of the paths the compiler recorded (a \
-                 --remap-path-prefix in RUSTFLAGS is the usual cause).",
-                binary.binary_id,
-                keys.root.display(),
-            );
-        }
-        let map = coverage::BinaryFunctionMap {
-            binary: coverage::BinaryStamp::of(&binary.binary_path)?,
-            functions,
-        };
+        let map = export_function_map(binary, llvm_cov, &profdata, keys)?;
         let path = shim::map_path(function_maps_dir, &binary.binary_path).with_context(|| {
             format!(
                 "{} has no file name to key its map by",
@@ -623,6 +597,31 @@ fn write_function_maps(
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
+    if !executables.is_empty() {
+        let maps = executables
+            .iter()
+            .map(|binary| {
+                Ok(coverage::ExecutableMap {
+                    path: binary.binary_path.clone(),
+                    map: export_function_map(binary, llvm_cov, &profdata, keys)?,
+                    sentinels: sentinels
+                        .get(&binary.binary_id)
+                        .with_context(|| {
+                            format!(
+                                "no crate-root sentinels for executable {}",
+                                binary.binary_id
+                            )
+                        })?
+                        .clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        std::fs::write(
+            shim::executable_maps_path(function_maps_dir),
+            serde_json::to_vec(&maps)?,
+        )?;
+    }
+
     // Leave the directory holding nothing but maps, so anything that later
     // walks it doesn't have to know about the scaffolding.
     for scratch in [&proftext, &profdata] {
@@ -630,6 +629,50 @@ fn write_function_maps(
             .with_context(|| format!("failed to remove {}", scratch.display()))?;
     }
     Ok(())
+}
+
+fn export_function_map(
+    binary: &BinaryEntry,
+    llvm_cov: &Path,
+    profdata: &Path,
+    keys: &coverage::DbKeys,
+) -> Result<coverage::BinaryFunctionMap> {
+    // POSIX ERE — no negative lookahead, so the regex enumerates prefixes
+    // to drop. It shrinks `files[]` but leaves `functions[]` (the bulk of
+    // the JSON) intact; `coverage::build_function_map` filters
+    // authoritatively by giving each path a key (`coverage::DbKeys`).
+    let export = Command::new(llvm_cov)
+        .arg("export")
+        .arg("--format=text")
+        .arg(format!("--instr-profile={}", profdata.display()))
+        .arg("--ignore-filename-regex=/rustc/|/\\.cargo/|/target/")
+        .arg(&binary.binary_path)
+        .output()
+        .with_context(|| format!("failed to run llvm-cov export for {}", binary.binary_id))?;
+    if !export.status.success() {
+        bail!(
+            "llvm-cov export failed for {}: {}",
+            binary.binary_id,
+            String::from_utf8_lossy(&export.stderr).trim(),
+        );
+    }
+    let json = String::from_utf8_lossy(&export.stdout);
+    let functions = coverage::build_function_map(&json, keys)
+        .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
+    if functions.is_empty() {
+        bail!(
+            "{} has no instrumented functions under {} — every test in it \
+             would collect nothing. Check that the project root is a \
+             prefix of the paths the compiler recorded (a \
+             --remap-path-prefix in RUSTFLAGS is the usual cause).",
+            binary.binary_id,
+            keys.root.display(),
+        );
+    }
+    Ok(coverage::BinaryFunctionMap {
+        binary: coverage::BinaryStamp::of(&binary.binary_path)?,
+        functions,
+    })
 }
 
 /// Drop this collect's staging directories. The shim has already removed each
@@ -1202,6 +1245,84 @@ pub(crate) struct Listing {
     /// (`reason: "expression"`), and the project's own `default-filter`.
     pub(crate) excluded: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
+}
+
+impl Listing {
+    /// Nextest reports exact Cargo-built executable paths, relative to its
+    /// target directory. Package IDs distinguish similarly named targets and
+    /// allow mapping back to the workspace crate-root sentinel graph.
+    fn executables(&self, project: &ProjectRoot) -> Result<Vec<BinaryEntry>> {
+        let Some(packages) = self
+            .build_meta
+            .get("non-test-binaries")
+            .and_then(|v| v.as_object())
+        else {
+            return Ok(Vec::new());
+        };
+        let target = self
+            .build_meta
+            .get("target-directory")
+            .and_then(|v| v.as_str())
+            .context("nextest build metadata missing target-directory")?;
+        let names: BTreeMap<_, _> = project.metadata["packages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pkg| Some((pkg["id"].as_str()?, pkg["name"].as_str()?)))
+            .collect();
+        let mut entries = Vec::new();
+        let mut paths = BTreeMap::new();
+        for (package_id, binaries) in packages {
+            let Some(package_name) = names.get(package_id.as_str()) else {
+                continue;
+            };
+            for binary in binaries
+                .as_array()
+                .context("nextest non-test-binaries entry is not an array")?
+            {
+                if binary["kind"].as_str() != Some("bin-exe") {
+                    continue;
+                }
+                let name = binary["name"]
+                    .as_str()
+                    .context("nextest executable missing name")?;
+                let path = Path::new(
+                    binary["path"]
+                        .as_str()
+                        .context("nextest executable missing path")?,
+                );
+                if path.is_absolute()
+                    || path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir
+                                | std::path::Component::Prefix(_)
+                                | std::path::Component::RootDir
+                        )
+                    })
+                {
+                    bail!(
+                        "nextest executable path is not target-relative: {}",
+                        path.display()
+                    );
+                }
+                let binary_path = Path::new(target).join(path);
+                let binary_id = format!("{package_name}::bin/{name}");
+                match paths.insert(binary_path.clone(), binary_id.clone()) {
+                    None => entries.push(BinaryEntry {
+                        binary_id,
+                        binary_path,
+                    }),
+                    Some(previous) if previous == binary_id => {}
+                    Some(previous) => bail!(
+                        "executables {previous} and {binary_id} share {}",
+                        binary_path.display()
+                    ),
+                }
+            }
+        }
+        Ok(entries)
+    }
 }
 
 /// One binary in nextest's listing. `binary_path` is where its coverage map
