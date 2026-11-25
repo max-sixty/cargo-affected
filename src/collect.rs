@@ -661,8 +661,8 @@ fn export_function_map(
         .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
     if functions.is_empty() {
         bail!(
-            "{} has no instrumented functions under {} — every test in it \
-             would collect nothing. Check that the project root is a \
+            "{} has no instrumented functions under {} — coverage from this binary \
+             would map to nothing. Check that the project root is a \
              prefix of the paths the compiler recorded (a \
              --remap-path-prefix in RUSTFLAGS is the usual cause).",
             binary.binary_id,

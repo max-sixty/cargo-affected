@@ -685,6 +685,45 @@ mod tests {
         assert!(hit_ranges(&["mine"], &FunctionMap::new()).is_err());
     }
 
+    #[test]
+    fn executable_maps_union_shared_names_and_check_stale_unmatched_binaries() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let make_map = |name: &str, symbol: &str| -> Result<ExecutableMap> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, name)?;
+            let range = HitRange {
+                file: Utf8PathBuf::from(format!("src/{name}.rs")),
+                line_start: 3,
+                line_end: 6,
+            };
+            Ok(ExecutableMap {
+                map: BinaryFunctionMap {
+                    binary: BinaryStamp::of(&path)?,
+                    functions: [(symbol.to_string(), vec![range.clone()])]
+                        .into_iter()
+                        .collect(),
+                },
+                path,
+                sentinels: [HitRange::sentinel(range.file)].into_iter().collect(),
+            })
+        };
+        let maps = [
+            make_map("first", "shared")?,
+            make_map("second", "shared")?,
+            make_map("third", "unrelated")?,
+        ];
+        let result = test_and_executable_ranges(&["shared"], &FunctionMap::new(), &maps)?;
+        assert_eq!(result.len(), 4);
+        assert!(result
+            .iter()
+            .all(|range| !range.file.as_str().contains("third")));
+        std::fs::write(&maps[2].path, "different build")?;
+        let error =
+            test_and_executable_ranges(&["shared"], &FunctionMap::new(), &maps).unwrap_err();
+        assert!(error.to_string().contains("rebuilt after"));
+        Ok(())
+    }
+
     /// The `--text` profile shape llvm-profdata emits: labelled sections, one
     /// blank-separated record per function. Only functions with a non-zero
     /// counter come back.

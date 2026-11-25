@@ -1,7 +1,7 @@
 use crate::{cargo_affected, combined_output, git, init_git_with_initial_commit, replace_in_file};
 use std::{fs, path::Path};
 
-fn write_project(dir: &Path) {
+fn write_project(dir: &Path, package: &str) {
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::create_dir_all(dir.join("tests")).unwrap();
     fs::write(dir.join(".gitignore"), "/target\n/Cargo.lock\n").unwrap();
@@ -9,7 +9,7 @@ fn write_project(dir: &Path) {
         dir.join("Cargo.toml"),
         r#"
 [package]
-name = "sample_executable_coverage"
+name = "PACKAGE_NAME"
 version = "0.1.0"
 edition = "2021"
 [[bin]]
@@ -24,7 +24,8 @@ test = false
 name = "other"
 path = "src/other.rs"
 test = false
-"#,
+"#
+        .replace("PACKAGE_NAME", package),
     )
     .unwrap();
     fs::write(
@@ -65,6 +66,12 @@ fn launches_other() {
     assert!(std::process::Command::new(env!("CARGO_BIN_EXE_other"))
         .status().unwrap().success());
 }
+#[cfg(unix)]
+#[test]
+fn replaces_test_process() {
+    use std::os::unix::process::CommandExt;
+    panic!("exec failed: {}", std::process::Command::new(env!("CARGO_BIN_EXE_other")).exec());
+}
 #[test]
 fn no_subprocess() { assert_eq!(2 + 2, 4); }
 "#,
@@ -101,7 +108,7 @@ fn selection(dir: &Path) -> Vec<String> {
 fn executable_and_grandchild_coverage_selects_only_the_calling_test() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write_project(dir);
+    write_project(dir, "sample_executable_coverage");
     let result = cargo_affected(dir, &["affected", "collect", "--", "--no-fail-fast"]);
     assert!(result.status.success(), "{}", combined_output(&result));
     assert!(combined_output(&result).contains("3 non-test executable(s)"));
@@ -120,4 +127,23 @@ fn executable_and_grandchild_coverage_selects_only_the_calling_test() {
     git(dir, &["add", "src/child.rs"]);
     git(dir, &["commit", "-m", "change executable root"]);
     assert_eq!(selection(dir), ["launches_child"]);
+}
+
+#[test]
+fn direct_and_exec_replacement_profiles_select_the_executable_callers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project(dir, "sample_exec_replacement");
+    let result = cargo_affected(dir, &["affected", "collect", "--", "--no-fail-fast"]);
+    assert!(result.status.success(), "{}", combined_output(&result));
+    replace_in_file(&dir.join("src/other.rs"), "other", "other changed");
+    git(dir, &["add", "src/other.rs"]);
+    git(dir, &["commit", "-m", "change second executable"]);
+    let mut selected = selection(dir);
+    selected.sort();
+    if cfg!(unix) {
+        assert_eq!(selected, ["launches_other", "replaces_test_process"]);
+    } else {
+        assert_eq!(selected, ["launches_other"]);
+    }
 }
