@@ -4,11 +4,10 @@
 //! small runner shim (`cargo-affected runner-shim`) via
 //! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at a
 //! per-test subdirectory, then spawns and waits for the real test binary and
-//! turns its profile into line ranges on the spot — merging profraws, joining
-//! them against the binary's function map, and writing a small per-test result
-//! file — before exiting. Each binary's function map — the expensive,
+//! merges its profraws, writes the executed names, and deletes the raw files
+//! before exiting. Each binary's function map — the expensive,
 //! test-invariant half of that translation — is exported once, before the run.
-//! After nextest finishes we read those per-test result files back and write
+//! After nextest finishes we stream the results, join the in-memory maps, and write
 //! per-(test, file) line ranges to SQLite. See the Approach section below and
 //! [`crate::shim`] for the in-shim extraction details.
 //!
@@ -33,8 +32,8 @@
 //!    in RUSTFLAGS, to enumerate every binary and every testcase. This builds
 //!    the instrumented binaries, so the `run` below is a cache hit.
 //! 4. Export each participating binary's coverage map **once**, with
-//!    `llvm-cov export` against an empty profile, and leave it under
-//!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
+//!    `llvm-cov export` against an empty profile. Keep it in memory and write
+//!    only a stamp under `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
 //!    and it doesn't vary per test — see [`write_function_maps`].
 //! 5. `cargo nextest run` with the same RUSTFLAGS and the runner wired in via
 //!    `--config`. nextest handles parallelism and progress. Each test
@@ -42,15 +41,15 @@
 //!    runner shim doesn't need to map paths.
 //! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
-//!    profraw to text with `llvm-profdata`, joins the functions it names
-//!    against the binary's map, writes a small per-test result file under
+//!    profraw to text with `llvm-profdata`, writes the executed names to a file under
 //!    `CARGO_AFFECTED_RESULTS_DIR`, and **deletes the per-test profraw dir
 //!    before exiting**. Extraction runs in the process that ran the test, so
 //!    peak disk usage is bounded by nextest's own concurrency
 //!    (O(test-threads × per-test bundle) instead of O(whole-suite)) with no
 //!    external watcher or completion heuristic — the completion signal is the
 //!    test process exiting. See [`crate::shim`].
-//! 7. After nextest exits, read the per-test result files and store mappings
+//! 7. After nextest exits, stream the per-test results, join the retained maps
+//!    and the once-built executable index, and store mappings
 //!    + collect_sha in the DB keyed by (binary_id, test_name).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -301,7 +300,7 @@ pub(crate) fn collect(
         "exporting coverage maps for {} non-test executable(s)...",
         executables.len()
     );
-    write_function_maps(
+    let maps = write_function_maps(
         &function_maps_dir,
         &mapped,
         &executables,
@@ -369,10 +368,45 @@ pub(crate) fn collect(
         let _ = std::fs::remove_file(config);
     }
 
-    // The shim already merged/exported/parsed each test's profraw and deleted
-    // the bundle; here we just read back the small result files it left.
-    let results = read_results(&results_dir)?;
-    if results.is_empty() {
+    // Resolve the function-name joins in one process. Every map and executable
+    // index is built once; read one result at a time rather than retaining
+    // the whole suite's executed-symbol lists.
+    let executable_index = coverage::ExecutableIndex::new(&maps.executables)?;
+    let mut mappings: Vec<(TestId, BTreeSet<HitRange>)> = Vec::new();
+    let mut unknown_binaries: BTreeSet<String> = BTreeSet::new();
+    let mut skipped_tests = Vec::new();
+    let count = read_results(&results_dir, |result| {
+        let test_id = TestId::new(result.binary_id, result.test_name);
+        let ranges = match result.outcome {
+            TestOutcome::Collected {
+                functions,
+                profile_count,
+            } => {
+                let Some(map) = maps.tests.get(&test_id.binary_id) else {
+                    unknown_binaries.insert(test_id.binary_id);
+                    return;
+                };
+                let executed: Vec<_> = functions.iter().map(String::as_str).collect();
+                executable_index.ranges(&executed, &map.functions, profile_count)
+            }
+            TestOutcome::Skipped { reason } => Err(anyhow::anyhow!("{reason}")),
+        };
+        match ranges {
+            Ok(mut ranges) => {
+                let Some(pkg_ranges) = crate_root_ranges_by_binary_id.get(&test_id.binary_id)
+                else {
+                    unknown_binaries.insert(test_id.binary_id);
+                    return;
+                };
+                ranges.extend(pkg_ranges.iter().cloned());
+                mappings.push((test_id, ranges));
+            }
+            Err(reason) => {
+                skipped_tests.push((test_id, format!("{reason:#}")));
+            }
+        }
+    })?;
+    if count == 0 {
         let exit = handle_no_results(
             &mut db,
             env_fingerprint,
@@ -383,33 +417,11 @@ pub(crate) fn collect(
         remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
         return Ok(exit);
     }
-
-    // Fold each test's crate-root sentinels into its ranges. An unknown
-    // binary_id means `cargo metadata` and the nextest listing diverged — a
-    // real invariant break — so surface it rather than dropping coverage.
-    let mut mappings: Vec<(TestId, BTreeSet<HitRange>)> = Vec::new();
-    let mut unknown_binaries: BTreeSet<String> = BTreeSet::new();
-    let mut skipped = 0usize;
-    for result in results {
-        match result.outcome {
-            TestOutcome::Collected { mut ranges } => {
-                let test_id = TestId::new(result.binary_id, result.test_name);
-                let Some(pkg_ranges) = crate_root_ranges_by_binary_id.get(&test_id.binary_id)
-                else {
-                    unknown_binaries.insert(test_id.binary_id);
-                    continue;
-                };
-                ranges.extend(pkg_ranges.iter().cloned());
-                mappings.push((test_id, ranges));
-            }
-            TestOutcome::Skipped { reason } => {
-                skipped += 1;
-                eprintln!(
-                    "  skipped {}::{}: {reason}",
-                    result.binary_id, result.test_name
-                );
-            }
-        }
+    mappings.sort_by(|a, b| a.0.cmp(&b.0));
+    skipped_tests.sort_by(|a, b| a.0.cmp(&b.0));
+    let skipped = skipped_tests.len();
+    for (id, reason) in skipped_tests {
+        eprintln!("  skipped {}::{}: {reason}", id.binary_id, id.test_name);
     }
     if !unknown_binaries.is_empty() {
         bail!(
@@ -558,8 +570,8 @@ fn binaries_for_run<'a>(
         .collect()
 }
 
-/// Export each binary's function map into `function_maps_dir`, where the
-/// runner shim reads it back (see [`shim::map_path`] for the naming).
+/// Export each binary's function map once into memory, and write only its
+/// stamp into `function_maps_dir` (see [`shim::stamp_path`]).
 ///
 /// The export is run against a deliberately empty profile: `llvm-cov export`
 /// needs one, but every count it produces is discarded here. What survives is
@@ -579,6 +591,11 @@ fn binaries_for_run<'a>(
 /// (`--remap-path-prefix`, a root that isn't a prefix of the sources) and
 /// every test in that binary would silently collect nothing but crate-root
 /// sentinels. Better to say so before running the suite than after.
+struct CollectionMaps {
+    tests: BTreeMap<String, coverage::BinaryFunctionMap>,
+    executables: Vec<coverage::ExecutableMap>,
+}
+
 fn write_function_maps(
     function_maps_dir: &Path,
     binaries: &[&BinaryEntry],
@@ -587,7 +604,7 @@ fn write_function_maps(
     llvm_profdata: &Path,
     llvm_cov: &Path,
     keys: &coverage::DbKeys,
-) -> Result<()> {
+) -> Result<CollectionMaps> {
     // An empty text profile merges into a valid profile containing no records,
     // which is exactly what "report every function as unexecuted" needs.
     let proftext = function_maps_dir.join("empty.proftext");
@@ -607,50 +624,41 @@ fn write_function_maps(
         );
     }
 
+    let mut tests = BTreeMap::new();
     for binary in binaries {
         let map = export_function_map(binary, llvm_cov, &profdata, keys)?;
-        let path = shim::map_path(function_maps_dir, &binary.binary_path).with_context(|| {
-            format!(
-                "{} has no file name to key its map by",
-                binary.binary_path.display(),
-            )
-        })?;
-        std::fs::write(&path, serde_json::to_vec(&map)?)
+        let path = shim::stamp_path(function_maps_dir, &binary.binary_id);
+        std::fs::write(&path, serde_json::to_vec(&map.binary)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
+        tests.insert(binary.binary_id.clone(), map);
     }
 
-    if !executables.is_empty() {
-        let maps = executables
-            .iter()
-            .map(|binary| {
-                Ok(coverage::ExecutableMap {
-                    path: binary.binary_path.clone(),
-                    map: export_function_map(binary, llvm_cov, &profdata, keys)?,
-                    sentinels: sentinels
-                        .get(&binary.binary_id)
-                        .with_context(|| {
-                            format!(
-                                "no crate-root sentinels for executable {}",
-                                binary.binary_id
-                            )
-                        })?
-                        .clone(),
-                })
+    let executables = executables
+        .iter()
+        .map(|binary| {
+            Ok(coverage::ExecutableMap {
+                path: binary.binary_path.clone(),
+                map: export_function_map(binary, llvm_cov, &profdata, keys)?,
+                sentinels: sentinels
+                    .get(&binary.binary_id)
+                    .with_context(|| {
+                        format!(
+                            "no crate-root sentinels for executable {}",
+                            binary.binary_id
+                        )
+                    })?
+                    .clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
-        std::fs::write(
-            shim::executable_maps_path(function_maps_dir),
-            serde_json::to_vec(&maps)?,
-        )?;
-    }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    // Leave the directory holding nothing but maps, so anything that later
+    // Leave the directory holding nothing but stamps, so anything that later
     // walks it doesn't have to know about the scaffolding.
     for scratch in [&proftext, &profdata] {
         std::fs::remove_file(scratch)
             .with_context(|| format!("failed to remove {}", scratch.display()))?;
     }
-    Ok(())
+    Ok(CollectionMaps { tests, executables })
 }
 
 fn export_function_map(
@@ -747,18 +755,18 @@ pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
 /// layout mirrors the profraw tree — one directory per binary, one `.json` per
 /// test, both named by the shim's SHA-256 `storage_key` of the ID rather than
 /// the ID itself — so two levels of walking find them all. The real IDs come
-/// from each file's contents. Sorted by `(binary_id, test_name)` so the
-/// skip log and stored rows come out in a stable order.
+/// from each file's contents. Consume one result at a time so the executed
+/// names for the whole suite need not coexist in memory.
 ///
 /// An unreadable or unparsable result file is skipped with a warning, not a
 /// hard error: the shim writes atomically (`.tmp` + rename), so a torn file
 /// shouldn't occur, but if one does (e.g. the shim was SIGKILL'd at just the
 /// wrong moment, or the disk filled), losing one test's coverage — it
 /// re-selects next `--diff` — beats discarding every other test's.
-fn read_results(results_dir: &Path) -> Result<Vec<TestResult>> {
-    let mut results = Vec::new();
+fn read_results(results_dir: &Path, mut consume: impl FnMut(TestResult)) -> Result<usize> {
+    let mut count = 0;
     if !results_dir.exists() {
-        return Ok(results);
+        return Ok(count);
     }
     for binary_entry in std::fs::read_dir(results_dir).context("scanning results dir")? {
         let binary_path = binary_entry?.path();
@@ -772,7 +780,10 @@ fn read_results(results_dir: &Path) -> Result<Vec<TestResult>> {
                     .map_err(anyhow::Error::from)
                     .and_then(|raw| Ok(serde_json::from_str::<TestResult>(&raw)?))
                 {
-                    Ok(result) => results.push(result),
+                    Ok(result) => {
+                        count += 1;
+                        consume(result);
+                    }
                     Err(e) => eprintln!(
                         "warning: ignoring unreadable coverage result {}: {e:#}",
                         path.display()
@@ -781,8 +792,7 @@ fn read_results(results_dir: &Path) -> Result<Vec<TestResult>> {
             }
         }
     }
-    results.sort_by(|a, b| (&a.binary_id, &a.test_name).cmp(&(&b.binary_id, &b.test_name)));
-    Ok(results)
+    Ok(count)
 }
 
 /// Plan for the rerun side of `collect --diff`: which tests to invoke
@@ -2139,7 +2149,9 @@ mod tests {
         std::fs::write(dir.join("t_torn.json"), b"{ not valid json").unwrap();
         std::fs::write(dir.join("t_partial.json.tmp"), b"{").unwrap();
 
-        let got = read_results(results).unwrap();
+        let mut got = Vec::new();
+        let count = read_results(results, |result| got.push(result)).unwrap();
+        assert_eq!(count, 1);
         assert_eq!(got.len(), 1, "only the parseable result survives");
         assert_eq!(got[0].test_name, "t_ok");
     }

@@ -32,8 +32,8 @@ impl ProfileMode {
 
     pub(crate) fn fingerprint(self) -> &'static [u8] {
         match self {
-            Self::Exit => b"executable-maps-v1",
-            Self::Continuous => b"executable-maps-v1-continuous",
+            Self::Exit => b"executable-maps-v2",
+            Self::Continuous => b"executable-maps-v2-continuous",
         }
     }
 

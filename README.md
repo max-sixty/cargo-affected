@@ -71,17 +71,20 @@ nextest run`: always at least as safe.
 `collect`:
 
 1. `cargo nextest list` enumerates every test.
-2. `llvm-cov export` reads each test binary's coverage map once — where every
+2. `llvm-cov export` reads each test binary and Cargo-built executable's coverage map once — where every
    instrumented function lives in the source. That doesn't vary per test, and
    it's the expensive part.
 3. `cargo nextest run` runs the tests with `-C instrument-coverage` and a
    per-test `LLVM_PROFILE_FILE`.
-4. For each test, `llvm-profdata` merges its profraw into the list of
-   functions it executed, and those are looked up in the map from step 2.
+4. Each test shim merges its raw profiles with `llvm-profdata`, verifies
+   the binary stamp, writes the executed names, and removes the raw profiles.
+   The collector streams those results and looks up names in the in-memory
+   harness maps and one executable index.
 5. Per `(test, file, function)`, the min/max line span is stored in
    `target/affected/coverage.db` (SQLite), keyed by a fingerprint of
    `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
-   `CARGO_BUILD_TARGET`. The git HEAD sha is recorded alongside.
+   `CARGO_BUILD_TARGET`, and the coverage-mapping/persistence-mode version.
+   The git HEAD sha is recorded alongside.
 
 `run`:
 
@@ -104,9 +107,15 @@ Cargo executables (including `test = false` binaries). Tests and their
 instrumented descendants write LLVM profiles into the same test-specific
 directory. Function hits from those executables are attributed to the test
 that launched them, including grandchildren; crate-root dependencies are
-included for matching executable maps. Identical function names in multiple
-maps are conservatively unioned rather than assigned arbitrarily. Baselines
-created before executable support require a fresh collect.
+included when an executable launch is evidenced or the profile is ambiguous.
+Identical function names in multiple maps are conservatively unioned rather
+than assigned arbitrarily. A direct library call in a single harness profile
+does not acquire the executable's structural sentinel just because the
+executable links the same library. Multiple raw profiles can include a
+child killed before its own entry point; ambiguous matches retain sentinels.
+The executable index is built once per collection, not parsed in each
+runner shim. Existing baselines require a fresh collect when the mapping
+version changes.
 
 The executable must be built with coverage instrumentation and be identified
 in Nextest's build metadata. Descendants must inherit the per-test

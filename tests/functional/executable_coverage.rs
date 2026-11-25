@@ -49,8 +49,13 @@ fn main() {
     )
     .unwrap();
     fs::write(
+        dir.join("src/lib.rs"),
+        "#[inline(never)]\npub fn shared() -> u32 { std::hint::black_box(42) }\n",
+    )
+    .unwrap();
+    fs::write(
         dir.join("src/other.rs"),
-        "fn main() { println!(\"other\"); }\n",
+        format!("fn main() {{ assert_eq!({package}::shared(), 42); println!(\"other\"); }}\n"),
     )
     .unwrap();
     fs::write(
@@ -74,7 +79,10 @@ fn replaces_test_process() {
 }
 #[test]
 fn no_subprocess() { assert_eq!(2 + 2, 4); }
-"#,
+#[test]
+fn direct_library() { assert_eq!(PACKAGE_NAME::shared(), 42); }
+"#
+        .replace("PACKAGE_NAME", package),
     )
     .unwrap();
     init_git_with_initial_commit(dir);
@@ -139,6 +147,29 @@ fn direct_and_exec_replacement_profiles_select_the_executable_callers() {
     replace_in_file(&dir.join("src/other.rs"), "other", "other changed");
     git(dir, &["add", "src/other.rs"]);
     git(dir, &["commit", "-m", "change second executable"]);
+    let mut selected = selection(dir);
+    selected.sort();
+    if cfg!(unix) {
+        assert_eq!(selected, ["launches_other", "replaces_test_process"]);
+    } else {
+        assert_eq!(selected, ["launches_other"]);
+    }
+}
+
+#[test]
+fn library_call_does_not_acquire_executable_root_sentinel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project(dir, "sample_shared_library");
+    let result = cargo_affected(dir, &["affected", "collect", "--", "--no-fail-fast"]);
+    assert!(result.status.success(), "{}", combined_output(&result));
+    // An edit outside main's previously executed extent tests the sentinel
+    // itself, not just whether its body appeared in coverage.
+    let path = dir.join("src/other.rs");
+    let old = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{old}\nfn newly_added_function() {{}}\n")).unwrap();
+    git(dir, &["add", "src/other.rs"]);
+    git(dir, &["commit", "-m", "structural executable root edit"]);
     let mut selected = selection(dir);
     selected.sort();
     if cfg!(unix) {
