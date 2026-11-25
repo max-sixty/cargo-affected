@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use crate::collect::{
     args_for_listing, nextest_filter_expr, plural_s, require_nextest, write_nextest_config,
 };
-use crate::db::{warn_untracked_rs_files, Db, TestId};
+use crate::db::{warn_untracked_rs_files, Db, StateDir, TestId};
 use crate::fingerprint;
 use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
 use crate::project::{find_project_root, git_changed_files};
@@ -47,12 +47,14 @@ use crate::selection::{self, DiagnosticDetail};
 pub(crate) fn run(
     all: bool,
     verbose: bool,
+    state_dir: Option<&Path>,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,
     nextest_args: &[String],
 ) -> Result<i32> {
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
+    let state_dir = StateDir::new(project_root, state_dir);
     require_nextest(project_root)?;
 
     if all {
@@ -63,7 +65,7 @@ pub(crate) fn run(
         // reset shouldn't be able to fail or mutate state on this path.
         if let Some(path) = report_json {
             let fingerprint = fingerprint::compute(&project)?;
-            let stored = match open_db_if_present(project_root)? {
+            let stored = match open_db_if_present(&state_dir)? {
                 Some(d) => d.stored_fingerprint_snapshots()?,
                 None => vec![],
             };
@@ -80,11 +82,11 @@ pub(crate) fn run(
             "{}",
             report::summary_line(CacheStatus::ForcedAll, None, 0, 0)
         );
-        return run_tests(project_root, None, nextest_args);
+        return run_tests(project_root, &state_dir, None, nextest_args);
     }
 
     let fingerprint = fingerprint::compute(&project)?;
-    let db = Db::open(project_root)?;
+    let db = Db::open(&state_dir)?;
     let assessment = plan::assess(project_root, &db, &fingerprint, report_json.is_some())?;
     let Assessment { stored, state, .. } = assessment;
 
@@ -146,7 +148,7 @@ pub(crate) fn run(
                 )?;
             }
             eprintln!("{}", report::summary_line(status, None, missing, 0));
-            return run_tests(project_root, None, nextest_args);
+            return run_tests(project_root, &state_dir, None, nextest_args);
         }
     };
 
@@ -261,17 +263,17 @@ pub(crate) fn run(
     }
 
     let tests: Vec<TestId> = live.into_iter().collect();
-    run_tests(project_root, Some(&tests), nextest_args)
+    run_tests(project_root, &state_dir, Some(&tests), nextest_args)
 }
 
 /// `--all` doesn't require an existing DB; gracefully skip the open if
 /// none exists rather than erroring on the user's first run.
-fn open_db_if_present(project_root: &Path) -> Result<Option<Db>> {
-    let path = crate::db::db_path(project_root);
+fn open_db_if_present(state: &StateDir) -> Result<Option<Db>> {
+    let path = state.database();
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(Db::open(project_root)?))
+    Ok(Some(Db::open(state)?))
 }
 
 /// Run tests via `cargo nextest run`. `tests == None` runs all tests;
@@ -291,6 +293,7 @@ fn open_db_if_present(project_root: &Path) -> Result<Option<Db>> {
 /// `run_forwards_fail_fast_flags_to_nextest` anchors that contract.
 fn run_tests(
     project_root: &Path,
+    state: &StateDir,
     tests: Option<&[TestId]>,
     nextest_args: &[String],
 ) -> Result<i32> {
@@ -303,7 +306,7 @@ fn run_tests(
                 ts.len(),
                 plural_s(ts.len())
             );
-            let config = write_nextest_config(project_root, &nextest_filter_expr(ts))?;
+            let config = write_nextest_config(project_root, state, &nextest_filter_expr(ts))?;
             cmd.arg("--config-file").arg(&config);
             Some(config)
         }

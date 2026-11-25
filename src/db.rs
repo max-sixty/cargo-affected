@@ -77,16 +77,26 @@ fn translate_busy(err: rusqlite::Error, ctx: &'static str) -> anyhow::Error {
     }
 }
 
-/// Umbrella directory for all cargo-affected artifacts (DB, profraw files).
-/// Lives under `target/` so it shares the gitignore and lifecycle
-/// (cargo clean wipes it) of other build artifacts.
-pub(crate) fn affected_dir(project_root: &Path) -> PathBuf {
-    project_root.join("target").join("affected")
-}
+/// State for one independently configured test scope. The default remains
+/// workspace-local; callers may give independent scopes their own directory,
+/// including their coverage database, instrumented build and staging files.
+pub(crate) struct StateDir(PathBuf);
 
-/// Canonical DB location within the affected dir.
-pub(crate) fn db_path(project_root: &Path) -> PathBuf {
-    affected_dir(project_root).join("coverage.db")
+impl StateDir {
+    pub(crate) fn new(project_root: &Path, override_path: Option<&Path>) -> Self {
+        Self(match override_path {
+            Some(path) => project_root.join(path),
+            None => project_root.join("target").join("affected"),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub(crate) fn database(&self) -> PathBuf {
+        self.0.join("coverage.db")
+    }
 }
 
 const SCHEMA: &str = "\
@@ -414,8 +424,8 @@ impl Db {
     /// shape is wrong. Old rows can't be retroactively tagged with missing
     /// columns, and `target/affected/` is cargo-clean territory, so the
     /// reset is safe — the user re-collects.
-    pub(crate) fn open(project_root: &Path) -> Result<Self> {
-        let path = db_path(project_root);
+    pub(crate) fn open(state: &StateDir) -> Result<Self> {
+        let path = state.database();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1192,7 +1202,7 @@ mod tests {
     #[test]
     fn roundtrip_with_range_overlap() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let a_ranges = BTreeSet::from([rng("src/lib.rs", 10, 20), rng("src/utils.rs", 5, 15)]);
         let b_ranges = BTreeSet::from([rng("src/lib.rs", 50, 60)]);
@@ -1240,7 +1250,7 @@ mod tests {
     #[test]
     fn structural_edit_backstop() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         // test_a covers lines 10-20; test_b covers lines 50-60. Nothing
         // touches line 25 (the "struct field" edit zone).
@@ -1290,7 +1300,7 @@ mod tests {
     #[test]
     fn crate_root_sentinel_overlaps_any_hunk() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let mappings = vec![
             (
@@ -1315,7 +1325,7 @@ mod tests {
     #[test]
     fn different_fingerprint_reads_empty() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1344,7 +1354,7 @@ mod tests {
     #[test]
     fn full_collect_preserves_other_fingerprints() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1397,7 +1407,7 @@ mod tests {
     #[test]
     fn same_test_name_in_different_binaries() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1428,7 +1438,7 @@ mod tests {
     #[test]
     fn clear_wipes_all_fingerprints() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let mappings = vec![(
             tid(BIN_A, "test_a"),
@@ -1453,7 +1463,7 @@ mod tests {
     #[test]
     fn gc_keeps_current_and_most_recent_others() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
@@ -1482,7 +1492,7 @@ mod tests {
     #[test]
     fn pre_range_schema_is_dropped() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = db_path(dir.path());
+        let path = StateDir::new(dir.path(), None).database();
         std::fs::create_dir_all(path.parent().unwrap())?;
 
         // Old file-level schema with rows.
@@ -1509,7 +1519,7 @@ mod tests {
         }
 
         // Open with new code: old `test_files` is gone, no rows survive.
-        let db = Db::open(dir.path())?;
+        let db = Db::open(&StateDir::new(dir.path(), None))?;
         assert!(!db.has_any_coverage()?);
         Ok(())
     }
@@ -1520,7 +1530,7 @@ mod tests {
     #[test]
     fn pre_diff_schema_is_dropped() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = db_path(dir.path());
+        let path = StateDir::new(dir.path(), None).database();
         std::fs::create_dir_all(path.parent().unwrap())?;
 
         {
@@ -1548,7 +1558,7 @@ mod tests {
             )?;
         }
 
-        let db = Db::open(dir.path())?;
+        let db = Db::open(&StateDir::new(dir.path(), None))?;
         assert!(!db.has_any_coverage()?);
         assert_eq!(db.fingerprint_count()?, 0);
         Ok(())
@@ -1560,7 +1570,7 @@ mod tests {
     #[test]
     fn diff_update_replaces_only_rerun_tests() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1630,7 +1640,7 @@ mod tests {
     #[test]
     fn re_anchored_range_still_suppresses_backstop_at_old_sha() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
         db.store_coverage(
             FP_A,
             &comps_for(FP_A),
@@ -1681,7 +1691,7 @@ mod tests {
     #[test]
     fn diff_prune_drops_absent_tests() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1722,7 +1732,7 @@ mod tests {
     #[test]
     fn region_count_scoped_by_shas() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1788,7 +1798,7 @@ mod tests {
     #[test]
     fn store_coverage_writes_components() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let comps = vec![
             FingerprintComponent {
@@ -1825,7 +1835,7 @@ mod tests {
     #[test]
     fn store_coverage_replaces_components_idempotently() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
@@ -1858,7 +1868,7 @@ mod tests {
     #[test]
     fn gc_evicts_components() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         let mappings = vec![(tid(BIN_A, "t"), BTreeSet::from([rng("src/lib.rs", 1, 5)]))];
 
@@ -1890,7 +1900,7 @@ mod tests {
     #[test]
     fn clear_wipes_components() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -1911,7 +1921,7 @@ mod tests {
     #[test]
     fn migration_resets_pre_components_db() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = db_path(dir.path());
+        let path = StateDir::new(dir.path(), None).database();
         std::fs::create_dir_all(path.parent().unwrap())?;
 
         // Build the pre-components schema by hand: same shape as the
@@ -1941,7 +1951,7 @@ mod tests {
             )?;
         }
 
-        let db = Db::open(dir.path())?;
+        let db = Db::open(&StateDir::new(dir.path(), None))?;
         assert!(!db.has_any_coverage()?);
         assert_eq!(db.fingerprint_count()?, 0);
         Ok(())
@@ -1953,7 +1963,7 @@ mod tests {
     #[test]
     fn migration_resets_on_components_column_mismatch() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = db_path(dir.path());
+        let path = StateDir::new(dir.path(), None).database();
         std::fs::create_dir_all(path.parent().unwrap())?;
 
         {
@@ -1981,7 +1991,7 @@ mod tests {
             )?;
         }
 
-        let db = Db::open(dir.path())?;
+        let db = Db::open(&StateDir::new(dir.path(), None))?;
         assert!(!db.has_any_coverage()?);
         Ok(())
     }
@@ -1992,7 +2002,7 @@ mod tests {
     #[test]
     fn migration_resets_on_orphan_test_regions_rows() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = db_path(dir.path());
+        let path = StateDir::new(dir.path(), None).database();
         std::fs::create_dir_all(path.parent().unwrap())?;
 
         {
@@ -2022,7 +2032,7 @@ mod tests {
             )?;
         }
 
-        let db = Db::open(dir.path())?;
+        let db = Db::open(&StateDir::new(dir.path(), None))?;
         assert!(!db.has_any_coverage()?);
         Ok(())
     }
@@ -2033,7 +2043,7 @@ mod tests {
     #[test]
     fn hits_classify_line_overlap() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -2061,7 +2071,7 @@ mod tests {
     #[test]
     fn hits_classify_crate_root_sentinel() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         db.store_coverage(
             FP_A,
@@ -2089,7 +2099,7 @@ mod tests {
     #[test]
     fn hits_classify_structural_backstop_dedupes_per_test() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut db = Db::open(dir.path())?;
+        let mut db = Db::open(&StateDir::new(dir.path(), None))?;
 
         // test_a has TWO rows in lib.rs (10-15 and 30-35); test_b has one
         // row (50-55). A hunk at line 25 overlaps NONE of them, so the

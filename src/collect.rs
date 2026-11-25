@@ -61,7 +61,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 
 use crate::coverage::{self, HitRange};
-use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
+use crate::db::{Db, StateDir, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint::{self, Fingerprint};
 use crate::plan::{self, CacheMiss, CacheState, PlanInputs, SelectionReport};
 use crate::project::{
@@ -84,6 +84,7 @@ pub(crate) struct CollectOptions<'a> {
     pub(crate) diff: bool,
     pub(crate) verbose: bool,
     pub(crate) allow_dirty: bool,
+    pub(crate) state_dir: Option<&'a Path>,
     pub(crate) aggregate_profile: Option<&'a Path>,
     pub(crate) build_info_json: Option<&'a Path>,
     pub(crate) report_json: Option<&'a Path>,
@@ -95,6 +96,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         diff,
         verbose,
         allow_dirty,
+        state_dir,
         aggregate_profile,
         build_info_json,
         report_json,
@@ -103,6 +105,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     let total_start = Instant::now();
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
+    let state = StateDir::new(project_root, state_dir);
     if verbose {
         eprintln!("project root: {}", project_root.display());
     }
@@ -161,7 +164,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     // The matching `cargo affected run` flow leaves --target-dir unset so
     // it reuses target/debug/ — the user's normal cache — since `run`
     // doesn't enable instrumentation.
-    let build_dir = affected_dir(project_root).join("build");
+    let build_dir = state.path().join("build");
     std::fs::create_dir_all(&build_dir).context("failed to create build dir")?;
     // Sweep stale build-script profraws from prior collects; they accumulate
     // every time a build.rs reruns under instrumentation and aren't useful
@@ -179,10 +182,11 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     // each PID-suffixed so concurrent `collect` invocations don't wipe each
     // other's staging.
     let pid = std::process::id();
-    let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
-    let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
-    let function_maps_dir =
-        affected_dir(project_root).join(format!("{FUNCTION_MAPS_DIR_PREFIX}{pid}"));
+    let profraw_dir = state.path().join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
+    let results_dir = state.path().join(format!("{RESULTS_DIR_PREFIX}{pid}"));
+    let function_maps_dir = state
+        .path()
+        .join(format!("{FUNCTION_MAPS_DIR_PREFIX}{pid}"));
     for dir in [&profraw_dir, &results_dir, &function_maps_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
@@ -263,7 +267,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.
-    let mut db = Db::open(project_root)?;
+    let mut db = Db::open(&state)?;
 
     if let Some(path) = report_json {
         let request = ShadowReport {
@@ -371,7 +375,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         .current_dir(project_root);
     let filter_config = match &diff_plan {
         Some(plan) => {
-            let config = write_nextest_config(project_root, &plan.filter_expr())?;
+            let config = write_nextest_config(project_root, &state, &plan.filter_expr())?;
             cmd.arg("--config-file").arg(&config);
             Some(config)
         }
@@ -515,11 +519,16 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     }
 
     eprintln!(
-        "done. {} test{}, {} range{} stored in target/affected/coverage.db ({:.1}s total)",
+        "done. {} test{}, {} range{} stored in {} ({:.1}s total)",
         mappings.len(),
         plural_s(mappings.len()),
         region_count,
         plural_s(region_count),
+        state
+            .database()
+            .strip_prefix(project_root)
+            .unwrap_or(&state.database())
+            .display(),
         total_elapsed.as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
@@ -790,13 +799,13 @@ fn remove_staging_dirs(dirs: &[&Path]) -> Result<()> {
 /// Only invoked from `clean` (an explicit, destructive user command), never at
 /// collect startup: the PID suffix lets concurrent collects coexist, and a
 /// blind sweep would delete a sibling collect's live staging.
-pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
-    let dir = affected_dir(project_root);
+pub(crate) fn clean_staging_dirs(state: &StateDir) -> Result<usize> {
+    let dir = state.path();
     if !dir.exists() {
         return Ok(0);
     }
     let mut removed = 0;
-    for entry in std::fs::read_dir(&dir).context("scanning target/affected")? {
+    for entry in std::fs::read_dir(dir).context("scanning target/affected")? {
         let path = entry?.path();
         let is_staging = path.is_dir()
             && path
@@ -1088,7 +1097,11 @@ pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
 /// project already sets `default-filter`, the selection is intersected with
 /// it so the effective set matches the old inline-`-E` behavior (`-E` was
 /// likewise intersected with the default filter).
-pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Result<PathBuf> {
+pub(crate) fn write_nextest_config(
+    project_root: &Path,
+    state: &StateDir,
+    filter_expr: &str,
+) -> Result<PathBuf> {
     let project_config = project_root.join(".config").join("nextest.toml");
     let existing = match std::fs::read_to_string(&project_config) {
         Ok(s) => s,
@@ -1112,8 +1125,8 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
     };
     doc["profile"]["default"]["default-filter"] = toml_edit::value(filter);
 
-    let dir = affected_dir(project_root);
-    std::fs::create_dir_all(&dir).context("failed to create target/affected dir")?;
+    let dir = state.path();
+    std::fs::create_dir_all(dir).context("failed to create target/affected dir")?;
     // PID-suffixed so two concurrent `cargo affected` runs can't overwrite
     // each other's selection between writing the file and nextest reading it
     // — the same reasoning as the `profraw-<pid>` staging dir. The caller
@@ -1947,7 +1960,8 @@ mod tests {
         // that lands on the command line is `--config-file <path>`, whose
         // length is bounded by the path, not the test count.
         let dir = tempfile::tempdir().unwrap();
-        let config = write_nextest_config(dir.path(), &expr).unwrap();
+        let config =
+            write_nextest_config(dir.path(), &StateDir::new(dir.path(), None), &expr).unwrap();
         assert!(config.starts_with(dir.path()));
         let written = std::fs::read_to_string(&config).unwrap();
         for n in &names {
@@ -1985,7 +1999,12 @@ mod tests {
              setup = \"build-bins\"\n",
         )
         .unwrap();
-        let config = write_nextest_config(dir.path(), "binary_id(=x) & test(=y)").unwrap();
+        let config = write_nextest_config(
+            dir.path(),
+            &StateDir::new(dir.path(), None),
+            "binary_id(=x) & test(=y)",
+        )
+        .unwrap();
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         // Our selection landed under [profile.default].
@@ -2025,7 +2044,8 @@ mod tests {
             "[profile.default]\ndefault-filter = \"not test(slow)\"\n",
         )
         .unwrap();
-        let config = write_nextest_config(dir.path(), "test(=y)").unwrap();
+        let config =
+            write_nextest_config(dir.path(), &StateDir::new(dir.path(), None), "test(=y)").unwrap();
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
@@ -2042,7 +2062,9 @@ mod tests {
     #[test]
     fn write_nextest_config_without_project_config() {
         let dir = tempfile::tempdir().unwrap();
-        let config = write_nextest_config(dir.path(), "test(=solo)").unwrap();
+        let config =
+            write_nextest_config(dir.path(), &StateDir::new(dir.path(), None), "test(=solo)")
+                .unwrap();
         assert!(config
             .file_name()
             .unwrap()
@@ -2145,7 +2167,7 @@ mod tests {
         std::fs::create_dir_all(affected.join("build")).unwrap();
         std::fs::write(affected.join("coverage.db"), b"db").unwrap();
 
-        let removed = clean_staging_dirs(root).unwrap();
+        let removed = clean_staging_dirs(&StateDir::new(root, None)).unwrap();
         assert_eq!(removed, 3);
         assert!(!affected.join("profraw-123").exists());
         assert!(!affected.join("results-456").exists());

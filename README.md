@@ -277,3 +277,16 @@ against the instrumented executables in `target/affected/build`; no second
 test execution is necessary. `--build-info-json PATH` additionally exports
 Nextest’s actual target and build directories for external reporting tools. Neither full-suite output option is accepted
 with `--diff`, since an incremental run is not a fresh full-suite report.
+
+For multiple independently configured suites in a CI job, use a distinct
+global `--state-dir` for each build/filter scope. It selects the database,
+instrumented build, and temporary staging directory together, without
+modifying Cargo's usual target directory. Relative paths are resolved from
+the workspace root. Use the same directory for `collect`, `run`, `status`,
+and `clean`. The default remains `target/affected`.
+
+```sh
+cargo affected collect --state-dir target/affected-unit -- --lib
+cargo affected collect --state-dir target/affected-integration -- --test integration
+cargo affected status --state-dir target/affected-unit -- --lib
+```

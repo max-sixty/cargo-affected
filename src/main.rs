@@ -36,6 +36,10 @@ struct Cli {
     /// selected test name during `run`/`status`. Accepted at any position.
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// Directory for this test scope's coverage database, instrumented
+    /// build and staging files. Relative paths are workspace-root-relative.
+    #[arg(long, global = true, value_name = "PATH")]
+    state_dir: Option<PathBuf>,
     #[command(subcommand)]
     action: Action,
 }
@@ -127,26 +131,27 @@ enum Action {
     Clean,
 }
 
-fn clean() -> Result<()> {
+fn clean(state_dir: Option<&std::path::Path>) -> Result<()> {
     let project = project::find_project_root()?;
+    let state = db::StateDir::new(&project.workspace_root, state_dir);
 
     // Reclaim any leftover profraw/results staging from crashed or cancelled
     // collects (a successful collect removes its own). Done first so it runs
     // even when there's no DB to clear.
-    let swept = collect::clean_staging_dirs(&project.workspace_root)?;
+    let swept = collect::clean_staging_dirs(&state)?;
     if swept > 0 {
         let s = collect::plural_s(swept);
         eprintln!("removed {swept} leftover staging dir{s}");
     }
 
-    let path = db::db_path(&project.workspace_root);
+    let path = state.database();
     if !path.exists() {
         eprintln!("no coverage database found");
         return Ok(());
     }
     // Clear via SQL rather than unlinking: the open + write lock waits out any
     // concurrent `collect`, so we can't silently orphan a mid-flight commit.
-    let mut db = db::Db::open(&project.workspace_root)?;
+    let mut db = db::Db::open(&state)?;
     db.clear()?;
     eprintln!("cleared {}", path.display());
     Ok(())
@@ -183,7 +188,7 @@ fn main() {
 
     let cli = Cli::parse_from(argv);
 
-    let exit_code = match run_action(cli.action, cli.verbose) {
+    let exit_code = match run_action(cli.action, cli.verbose, cli.state_dir.as_deref()) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
@@ -193,7 +198,7 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-fn run_action(action: Action, verbose: bool) -> Result<i32> {
+fn run_action(action: Action, verbose: bool, state_dir: Option<&std::path::Path>) -> Result<i32> {
     match action {
         Action::Collect {
             diff,
@@ -208,6 +213,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
                 diff,
                 verbose,
                 allow_dirty,
+                state_dir,
                 aggregate_profile: aggregate_profile.as_deref(),
                 build_info_json: build_info_json.as_deref(),
                 report_json: report_json.as_deref(),
@@ -223,6 +229,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         } => run::run(
             all,
             verbose,
+            state_dir,
             report_json.as_deref(),
             report_detail,
             &nextest_args,
@@ -234,6 +241,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         } => {
             status::status(
                 verbose,
+                state_dir,
                 report_json.as_deref(),
                 report_detail,
                 &nextest_args,
@@ -241,7 +249,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
             Ok(0)
         }
         Action::Clean => {
-            clean()?;
+            clean(state_dir)?;
             Ok(0)
         }
     }

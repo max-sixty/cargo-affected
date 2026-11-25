@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::collect::{args_for_listing, plural_s, require_nextest};
-use crate::db::{db_path, warn_untracked_rs_files, Db};
+use crate::db::{warn_untracked_rs_files, Db, StateDir};
 use crate::fingerprint;
 use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
 use crate::project::{find_project_root, git_changed_files};
@@ -35,6 +35,7 @@ use crate::selection::{self, DiagnosticDetail};
 /// under-report against a `run -- --features …`.
 pub(crate) fn status(
     verbose: bool,
+    state_dir: Option<&Path>,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,
     nextest_args: &[String],
@@ -42,7 +43,8 @@ pub(crate) fn status(
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
-    let path = db_path(project_root);
+    let state_dir = StateDir::new(project_root, state_dir);
+    let path = state_dir.database();
     if !path.exists() {
         println!(
             "no coverage data found — would run all tests; \
@@ -69,7 +71,7 @@ pub(crate) fn status(
     }
 
     let fingerprint = fingerprint::compute(&project)?;
-    let db = Db::open(project_root)?;
+    let db = Db::open(&state_dir)?;
     let Assessment {
         test_count,
         collect_shas,

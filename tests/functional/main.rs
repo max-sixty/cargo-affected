@@ -40,6 +40,7 @@ mod partition;
 mod remapped_paths;
 mod report_json;
 mod run;
+mod state_dir;
 mod structural;
 mod workspace;
 
