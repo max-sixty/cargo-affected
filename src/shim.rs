@@ -104,7 +104,7 @@ pub(crate) enum TestOutcome {
 ///
 /// Never returns — runs the test binary, extracts its coverage, and exits with
 /// the test's exit code.
-pub(crate) fn run(args: &[String]) -> ! {
+pub(crate) fn run(args: &[String], mode: crate::profile::ProfileMode) -> ! {
     let Some((binary, rest)) = args.split_first() else {
         eprintln!("cargo-affected runner-shim: missing test binary argument");
         std::process::exit(2);
@@ -132,7 +132,7 @@ pub(crate) fn run(args: &[String]) -> ! {
         );
         std::process::exit(2);
     }
-    std::env::set_var("LLVM_PROFILE_FILE", dir.join("%p-%m.profraw"));
+    std::env::set_var("LLVM_PROFILE_FILE", dir.join(mode.profile_name()));
 
     let code = run_test(binary, rest);
 

@@ -80,7 +80,7 @@ nextest run`: always at least as safe.
    functions it executed, and those are looked up in the map from step 2.
 5. Per `(test, file, function)`, the min/max line span is stored in
    `target/affected/coverage.db` (SQLite), keyed by a fingerprint of
-   `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
+   `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
    `CARGO_BUILD_TARGET`. The git HEAD sha is recorded alongside.
 
 `run`:
@@ -116,6 +116,36 @@ profile environment, or a daemon killed before it flushes cannot provide
 complete per-test coverage through this mechanism. Use explicit input rules
 for those cases until they can be instrumented and made to flush.
 
+### Retain coverage after forced process termination
+
+On native Linux, use `cargo affected collect --continuous -- ...` to build
+with LLVM counter relocation and map counters into per-test raw profiles.
+A dependency-free capability probe verifies that the current toolchain
+actually persists counters after forced termination before starting collection.
+Use `--continuous` for `status`, `run`, and incremental collection against
+that database. Exit-mode and continuous-mode fingerprints are distinct.
+
+If a test sanitizes a subprocess environment with `Command::env_clear()`,
+explicitly preserve only the profiling destination when it is present:
+
+```rust
+let mut command = std::process::Command::new(executable);
+command.env_clear();
+if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+    command.env("LLVM_PROFILE_FILE", profile);
+}
+// Add the test's ordinary allowlisted environment here.
+```
+
+The LLVM runtime itself may set `__LLVM_PROFILE_RT_INIT_ONCE` during startup.
+Do not reintroduce the entire parent environment. The profiling destination
+must be accessible to the child, including inside any sandbox, and all
+descendants must stop before their test's coverage is consumed. Continuous
+mode captures counters before SIGKILL, abort, or other abrupt termination;
+it does not infer the test identity of a process that deliberately removes
+all inherited profiling context. Keep explicit input rules or separate full
+test gates for opaque subprocesses (including privilege-boundary cases).
+
 ## Accuracy model
 
 `cargo affected run` is an approximation — it trades correctness for speed.
@@ -142,7 +172,7 @@ CI should still run the full suite.
   llvm-cov — a change confined to one selects no test. [Input
   rules](#input-rules) close this for inputs you can name.
 - **Build-time inputs not in the fingerprint.** The fingerprint covers
-  `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
+  `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
   `CARGO_BUILD_TARGET`. Changes to `build.rs`, `rust-toolchain.toml`, or
   `.cargo/config.toml` don't currently invalidate the cache.
 - **Proc-macro crate source.** A proc-macro's own source files compile into

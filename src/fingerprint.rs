@@ -24,7 +24,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::project::ProjectRoot;
+use crate::{profile::ProfileMode, project::ProjectRoot};
 
 /// Composite fingerprint plus the per-component hashes that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub(crate) struct Fingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FingerprintComponent {
     /// Stable label (`coverage_mapping`, `cargo_lock`, `manifest:Cargo.toml`, `rustc`,
-    /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
+    /// `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_TARGET`).
     pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
     pub(crate) hash: String,
@@ -56,8 +56,8 @@ pub(crate) struct FingerprintComponent {
 /// Inputs are read once into memory; the composite digest and per-component
 /// digests are computed from the same byte buffers. A file changing on disk
 /// after the read still produces a self-consistent `Fingerprint`.
-pub(crate) fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
-    let inputs = collect_inputs(project)?;
+pub(crate) fn compute(project: &ProjectRoot, mode: ProfileMode) -> Result<Fingerprint> {
+    let inputs = collect_inputs(project, mode)?;
 
     let mut hasher = Sha256::new();
     let mut components = Vec::with_capacity(inputs.len());
@@ -79,16 +79,13 @@ pub(crate) fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
 ///
 /// Order matters for the composite digest: changing the order would change
 /// the hex digest of an otherwise unchanged environment.
-fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
+fn collect_inputs(project: &ProjectRoot, mode: ProfileMode) -> Result<Vec<(String, Vec<u8>)>> {
     let mut inputs: Vec<(String, Vec<u8>)> =
-        Vec::with_capacity(3 + project.manifest_paths.len() + 3);
+        Vec::with_capacity(4 + project.manifest_paths.len() + 3);
 
     // Older baselines omit separately built executable coverage. They
     // cannot be used to safely select tests after upgrading this collector.
-    inputs.push((
-        "coverage_mapping".to_string(),
-        b"executable-maps-v1".to_vec(),
-    ));
+    inputs.push(("coverage_mapping".to_string(), mode.fingerprint().to_vec()));
 
     inputs.push((
         "cargo_lock".to_string(),
@@ -108,6 +105,10 @@ fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
 
     inputs.push(("rustc".to_string(), rustc_version_bytes()?));
     inputs.push(("RUSTFLAGS".to_string(), env_var("RUSTFLAGS").into_bytes()));
+    inputs.push((
+        "CARGO_ENCODED_RUSTFLAGS".to_string(),
+        env_var("CARGO_ENCODED_RUSTFLAGS").into_bytes(),
+    ));
     inputs.push((
         "CARGO_BUILD_TARGET".to_string(),
         env_var("CARGO_BUILD_TARGET").into_bytes(),
@@ -248,8 +249,8 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n")?;
         let project = project_with(root.clone(), vec![root.join("Cargo.toml")]);
 
-        let a = compute(&project)?;
-        let b = compute(&project)?;
+        let a = compute(&project, ProfileMode::Exit)?;
+        let b = compute(&project, ProfileMode::Exit)?;
         assert_eq!(a, b);
         assert_eq!(a.hex.len(), 64); // SHA-256 hex
         Ok(())
@@ -264,9 +265,9 @@ mod tests {
         let project = project_with(root.clone(), vec![root.join("Cargo.toml")]);
 
         std::fs::write(root.join("Cargo.lock"), b"v1")?;
-        let a = compute(&project)?;
+        let a = compute(&project, ProfileMode::Exit)?;
         std::fs::write(root.join("Cargo.lock"), b"v2")?;
-        let b = compute(&project)?;
+        let b = compute(&project, ProfileMode::Exit)?;
         assert_ne!(a.hex, b.hex);
         // Components diverge only in the cargo_lock entry; everything else is unchanged.
         let differing: Vec<&str> = a
@@ -289,9 +290,9 @@ mod tests {
         let project = project_with(root.clone(), vec![manifest.clone()]);
 
         std::fs::write(&manifest, b"[package]\nname = \"a\"\n")?;
-        let a = compute(&project)?;
+        let a = compute(&project, ProfileMode::Exit)?;
         std::fs::write(&manifest, b"[package]\nname = \"b\"\n")?;
-        let b = compute(&project)?;
+        let b = compute(&project, ProfileMode::Exit)?;
         assert_ne!(a.hex, b.hex);
         Ok(())
     }
@@ -310,19 +311,19 @@ mod tests {
 
         let bare = "[package]\nname = \"a\"\nedition = \"2021\"\n";
         std::fs::write(&manifest, bare)?;
-        let a = compute(&project)?;
+        let a = compute(&project, ProfileMode::Exit)?;
 
         // Add a rule, then change it. Neither may move the fingerprint.
         std::fs::write(
             &manifest,
             format!("{bare}\n[[package.metadata.affected.rule]]\nglobs = [\"x.snap\"]\nfilterset = \"test(=t)\"\n"),
         )?;
-        let with_rule = compute(&project)?;
+        let with_rule = compute(&project, ProfileMode::Exit)?;
         std::fs::write(
             &manifest,
             format!("{bare}\n[[package.metadata.affected.rule]]\nglobs = [\"y.snap\", \"docs/**\"]\nfilterset = \"test(=u)\"\n"),
         )?;
-        let edited = compute(&project)?;
+        let edited = compute(&project, ProfileMode::Exit)?;
 
         assert_eq!(
             with_rule.hex, edited.hex,
@@ -331,7 +332,7 @@ mod tests {
         // First-add may differ by at most the metadata text; the stable
         // guarantee is edit-invariance above. Build inputs still register:
         std::fs::write(&manifest, format!("{bare}edition2 = true\n"))?;
-        let real_change = compute(&project)?;
+        let real_change = compute(&project, ProfileMode::Exit)?;
         assert_ne!(
             a.hex, real_change.hex,
             "a non-metadata manifest edit must still register"
@@ -349,9 +350,9 @@ mod tests {
 
         let prior = std::env::var("RUSTFLAGS").ok();
         std::env::remove_var("RUSTFLAGS");
-        let a = compute(&project)?;
+        let a = compute(&project, ProfileMode::Exit)?;
         std::env::set_var("RUSTFLAGS", "-C opt-level=3");
-        let b = compute(&project)?;
+        let b = compute(&project, ProfileMode::Exit)?;
         match prior {
             Some(v) => std::env::set_var("RUSTFLAGS", v),
             None => std::env::remove_var("RUSTFLAGS"),
@@ -380,7 +381,7 @@ mod tests {
             vec![root.join("Cargo.toml"), root.join("crates/foo/Cargo.toml")],
         );
 
-        let fp = compute(&project)?;
+        let fp = compute(&project, ProfileMode::Exit)?;
         let labels: Vec<&str> = fp.components.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -391,6 +392,7 @@ mod tests {
                 "manifest:crates/foo/Cargo.toml",
                 "rustc",
                 "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
                 "CARGO_BUILD_TARGET",
             ],
         );

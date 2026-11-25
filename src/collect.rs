@@ -63,6 +63,7 @@ use anyhow::{bail, Context, Result};
 use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
+use crate::profile::{InstrumentFlags, ProfileMode};
 use crate::project::{
     canonicalize_no_verbatim, find_project_root, git_head_sha, git_prefix, git_working_tree_dirty,
 };
@@ -81,6 +82,7 @@ pub(crate) fn collect(
     diff: bool,
     verbose: bool,
     allow_dirty: bool,
+    mode: ProfileMode,
     nextest_args: &[String],
 ) -> Result<i32> {
     let total_start = Instant::now();
@@ -113,7 +115,7 @@ pub(crate) fn collect(
     require_nextest(project_root)?;
     let self_path = std::env::current_exe().context("failed to resolve current executable")?;
     let target_triple = current_target();
-    let runner_config = format_runner_config(&target_triple, &self_path);
+    let runner_config = format_runner_config(&target_triple, &self_path, mode);
 
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
@@ -201,11 +203,14 @@ pub(crate) fn collect(
         })
         .collect();
 
-    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    if !rustflags.is_empty() {
-        rustflags.push(' ');
-    }
-    rustflags.push_str("-C instrument-coverage");
+    let rustflags = InstrumentFlags::new(mode);
+    mode.verify(
+        project_root,
+        &affected_dir(project_root),
+        &target_triple,
+        &rustflags,
+        &llvm_profdata,
+    )?;
 
     // List first. Gives us the stable (package, target, kind) → binary_id map
     // we'll use to disambiguate same-basename binaries (e.g. two crates with
@@ -221,13 +226,29 @@ pub(crate) fn collect(
         &args_for_listing(nextest_args),
         None,
     )?;
+    if mode == ProfileMode::Continuous {
+        let platforms = listing
+            .build_meta
+            .get("platforms")
+            .and_then(|value| value.get("targets"))
+            .and_then(|value| value.as_array())
+            .context("continuous mode requires Nextest target platform metadata")?;
+        for platform in platforms {
+            let triple = platform["platform"]["triple"]
+                .as_str()
+                .context("continuous mode requires a known native target triple")?;
+            if triple != target_triple {
+                bail!("continuous mode requires native Linux target {target_triple}, not {triple}");
+            }
+        }
+    }
     eprintln!(
         "found {} test{} across {}",
         listing.tests.len(),
         plural_s(listing.tests.len()),
         binaries_phrase(listing.binaries.len())
     );
-    let fingerprint = fingerprint::compute(&project)?;
+    let fingerprint = fingerprint::compute(&project, mode)?;
     let env_fingerprint = &fingerprint.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
@@ -315,7 +336,6 @@ pub(crate) fn collect(
         // failure in `handle_no_results` using the diff plan's live-vs-phantom
         // split, not nextest's exit code.
         .arg("--no-tests=warn")
-        .env("RUSTFLAGS", &rustflags)
         // The runner shim extracts each test's coverage in-process and writes
         // a result file; it needs the staging locations, llvm-profdata, and
         // the function maps exported above. Names are shared constants so the
@@ -327,6 +347,7 @@ pub(crate) fn collect(
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
+    rustflags.apply(&mut cmd);
     let filter_config = match &diff_plan {
         Some(plan) => {
             let config = write_nextest_config(project_root, &plan.filter_expr())?;
@@ -1360,7 +1381,7 @@ pub(crate) struct BinaryEntry {
 /// in `list_args` by [`splice_filter_expr`]. Leave `None` for a full listing.
 pub(crate) fn nextest_list(
     project_root: &Path,
-    rustflags_override: Option<&str>,
+    rustflags_override: Option<&InstrumentFlags>,
     build_dir: Option<&Path>,
     list_args: &[String],
     filter_expr: Option<&str>,
@@ -1374,7 +1395,7 @@ pub(crate) fn nextest_list(
         .stderr(Stdio::inherit())
         .current_dir(project_root);
     if let Some(rf) = rustflags_override {
-        cmd.env("RUSTFLAGS", rf);
+        rf.apply(&mut cmd);
     }
     if let Some(dir) = build_dir {
         cmd.arg("--target-dir").arg(dir);
@@ -1574,12 +1595,15 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
 /// (`~/Library/Application Support/…`). Inside the array each element is a
 /// TOML basic string, so `\` and `"` need escaping; nothing else realistic
 /// in a filesystem path does.
-fn format_runner_config(target_triple: &str, self_path: &Path) -> String {
+fn format_runner_config(target_triple: &str, self_path: &Path, mode: ProfileMode) -> String {
     let escaped = self_path
         .to_string_lossy()
         .replace('\\', r"\\")
         .replace('"', "\\\"");
-    format!(r#"target.{target_triple}.runner=["{escaped}", "runner-shim"]"#)
+    format!(
+        r#"target.{target_triple}.runner=["{escaped}", "{}"]"#,
+        mode.runner()
+    )
 }
 
 /// Get the current rustc target triple.
@@ -2044,7 +2068,7 @@ mod tests {
     fn runner_config_uses_toml_array_form() {
         let path = PathBuf::from("/usr/local/bin/cargo-affected");
         assert_eq!(
-            format_runner_config("aarch64-apple-darwin", &path),
+            format_runner_config("aarch64-apple-darwin", &path, ProfileMode::Exit),
             r#"target.aarch64-apple-darwin.runner=["/usr/local/bin/cargo-affected", "runner-shim"]"#,
         );
     }
@@ -2056,7 +2080,7 @@ mod tests {
     fn runner_config_preserves_spaces_in_path() {
         let path = PathBuf::from("/Users/Joe Smith/.cargo/bin/cargo-affected");
         assert_eq!(
-            format_runner_config("aarch64-apple-darwin", &path),
+            format_runner_config("aarch64-apple-darwin", &path, ProfileMode::Exit),
             r#"target.aarch64-apple-darwin.runner=["/Users/Joe Smith/.cargo/bin/cargo-affected", "runner-shim"]"#,
         );
     }
@@ -2067,7 +2091,7 @@ mod tests {
     fn runner_config_escapes_backslashes_and_quotes() {
         let path = PathBuf::from(r#"C:\Users\Joe "Q" Smith\cargo-affected.exe"#);
         assert_eq!(
-            format_runner_config("x86_64-pc-windows-msvc", &path),
+            format_runner_config("x86_64-pc-windows-msvc", &path, ProfileMode::Exit),
             r#"target.x86_64-pc-windows-msvc.runner=["C:\\Users\\Joe \"Q\" Smith\\cargo-affected.exe", "runner-shim"]"#,
         );
     }
