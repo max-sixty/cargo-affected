@@ -254,3 +254,26 @@ VCS-agnostic and robust to whitespace and comment edits.
 ## License
 
 Dual-licensed under MIT or Apache-2.0 at your option.
+
+
+### Collect, compare, and report from the same full test execution
+
+For shadow-mode adoption, `collect` can predict affected tests from the
+previous database **before** replacing it with a fresh full-suite baseline:
+
+```sh
+cargo affected collect --report-json target/selection.json --report-detail full -- --no-fail-fast
+```
+
+The selection is advisory: every admitted Nextest test still runs. The report
+uses the instrumented test listing already prepared for collection, and
+configuration rules use the same build directory and flags.
+
+Add `--aggregate-profile target/coverage.profdata` to export an indexed LLVM
+profile of the same full run. This uses each test's existing LLVM counters,
+compacts them into bounded batches, and publishes the profile only when the
+full run succeeds. It can be used with `llvm-cov export` or `llvm-cov show`
+against the instrumented executables in `target/affected/build`; no second
+test execution is necessary. `--build-info-json PATH` additionally exports
+Nextest’s actual target and build directories for external reporting tools. Neither full-suite output option is accepted
+with `--diff`, since an incremental run is not a fresh full-suite report.

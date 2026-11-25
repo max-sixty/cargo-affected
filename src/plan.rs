@@ -34,7 +34,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::collect::nextest_list;
+use crate::collect::{nextest_list, Listing};
 use crate::config;
 use crate::db::{Db, StoredFingerprintRow};
 use crate::fingerprint::Fingerprint;
@@ -211,25 +211,60 @@ pub(crate) struct Plan {
 ///
 /// `changed_files` is the working tree alone; the full changed-path set is
 /// derived here once and carried on the [`Plan`].
-pub(crate) fn plan(
-    project: &ProjectRoot,
-    db: &Db,
-    fingerprint_hex: &str,
-    reach: &Reachability,
-    changed_files: &[String],
-    build_args: &[String],
-    detail: DiagnosticDetail,
+pub(crate) struct PlanInputs<'a> {
+    pub(crate) project: &'a ProjectRoot,
+    pub(crate) db: &'a Db,
+    pub(crate) fingerprint_hex: &'a str,
+    pub(crate) reach: &'a Reachability,
+    pub(crate) changed_files: &'a [String],
+    pub(crate) build_args: &'a [String],
+    pub(crate) detail: DiagnosticDetail,
+}
+
+pub(crate) fn plan(inputs: PlanInputs<'_>) -> Result<Plan> {
+    let listing = nextest_list(
+        &inputs.project.workspace_root,
+        None,
+        None,
+        inputs.build_args,
+        None,
+    )?;
+    plan_with_listing(inputs, &listing, None, None)
+}
+
+/// Reuse the collector's already-built instrumented test listing. Config
+/// rules must resolve filtersets against those same binaries, not trigger
+/// a second, non-instrumented build.
+pub(crate) fn plan_with_listing(
+    inputs: PlanInputs<'_>,
+    listing: &Listing,
+    rustflags: Option<&str>,
+    build_dir: Option<&Path>,
 ) -> Result<Plan> {
+    let PlanInputs {
+        project,
+        db,
+        fingerprint_hex,
+        reach,
+        changed_files,
+        build_args,
+        detail,
+    } = inputs;
     let project_root = &project.workspace_root;
-    let listing = nextest_list(project_root, None, None, build_args, None)?;
     let changed_ranges = selection::changed_ranges_per_sha(project_root, &reach.reachable)?;
     let changed_paths =
         selection::changed_paths_since(project_root, reach, &changed_ranges, changed_files)?;
-    let config_hits = config::config_rule_hits(project, build_args, &changed_paths.all)?;
+    let config_hits = config::config_rule_hits(
+        project,
+        build_args,
+        &changed_paths.all,
+        rustflags,
+        build_dir,
+    )?;
     let selection = selection::select_with_precomputed_ranges(
         db,
         fingerprint_hex,
-        &listing,
+        listing,
         reach,
         &changed_ranges,
         &config_hits,

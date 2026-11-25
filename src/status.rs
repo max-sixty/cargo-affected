@@ -186,15 +186,15 @@ pub(crate) fn status(
 
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");
-    let plan = plan::plan(
-        &project,
-        &db,
-        &fingerprint.hex,
-        &reach,
-        &changed_files,
-        &args_for_listing(nextest_args),
+    let plan = plan::plan(plan::PlanInputs {
+        project: &project,
+        db: &db,
+        fingerprint_hex: &fingerprint.hex,
+        reach: &reach,
+        changed_files: &changed_files,
+        build_args: &args_for_listing(nextest_args),
         detail,
-    )?;
+    })?;
     let sel = &plan.selection;
 
     if let Some(report_path) = report_json {

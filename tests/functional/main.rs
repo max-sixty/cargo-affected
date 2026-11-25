@@ -21,6 +21,7 @@
 //! we're not yet sharing a `target/` across scenarios, keeping names unique
 //! avoids the foot-gun preemptively.
 
+mod aggregate_profile;
 mod cache_miss;
 mod clean;
 mod config_rule;

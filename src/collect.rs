@@ -62,10 +62,13 @@ use anyhow::{bail, Context, Result};
 
 use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
-use crate::fingerprint;
+use crate::fingerprint::{self, Fingerprint};
+use crate::plan::{self, CacheMiss, CacheState, PlanInputs, SelectionReport};
 use crate::project::{
-    canonicalize_no_verbatim, find_project_root, git_head_sha, git_prefix, git_working_tree_dirty,
+    canonicalize_no_verbatim, find_project_root, git_changed_files, git_head_sha, git_prefix,
+    git_working_tree_dirty, ProjectRoot,
 };
+use crate::report;
 use crate::selection;
 use crate::shim::{self, TestOutcome, TestResult};
 
@@ -77,12 +80,26 @@ use crate::shim::{self, TestOutcome, TestResult};
 /// new HEAD. Other tests' rows stay put. Errors out if there's no prior
 /// collect for the current environment, or if any stored sha is no longer
 /// reachable from HEAD.
-pub(crate) fn collect(
-    diff: bool,
-    verbose: bool,
-    allow_dirty: bool,
-    nextest_args: &[String],
-) -> Result<i32> {
+pub(crate) struct CollectOptions<'a> {
+    pub(crate) diff: bool,
+    pub(crate) verbose: bool,
+    pub(crate) allow_dirty: bool,
+    pub(crate) aggregate_profile: Option<&'a Path>,
+    pub(crate) build_info_json: Option<&'a Path>,
+    pub(crate) report_json: Option<&'a Path>,
+    pub(crate) report_detail: selection::DiagnosticDetail,
+}
+
+pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> Result<i32> {
+    let CollectOptions {
+        diff,
+        verbose,
+        allow_dirty,
+        aggregate_profile,
+        build_info_json,
+        report_json,
+        report_detail,
+    } = options;
     let total_start = Instant::now();
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
@@ -175,6 +192,11 @@ pub(crate) fn collect(
             .with_context(|| format!("failed to create {}", dir.display()))?;
     }
 
+    let aggregate_dir = crate::aggregate::directory(&results_dir);
+    if aggregate_profile.is_some() {
+        std::fs::create_dir(&aggregate_dir)?;
+    }
+
     // Per-target sentinel set keyed by nextest's `binary_id`. Each test's
     // sentinel ranges cover its own crate root, its package's lib (if it's
     // not the lib itself), and the libs of any workspace packages it
@@ -214,11 +236,12 @@ pub(crate) fn collect(
     // cache hit. Fingerprint is taken now so Cargo.lock is in its final
     // state — status/run will compare against that same state.
     eprintln!("listing tests with cargo nextest list...");
+    let build_args = args_for_listing(nextest_args);
     let listing = nextest_list(
         project_root,
         Some(&rustflags),
         Some(&build_dir),
-        &args_for_listing(nextest_args),
+        &build_args,
         None,
     )?;
     eprintln!(
@@ -227,12 +250,38 @@ pub(crate) fn collect(
         plural_s(listing.tests.len()),
         binaries_phrase(listing.binaries.len())
     );
+    if let Some(path) = build_info_json {
+        let info = serde_json::json!({
+            "workspace-root": project_root,
+            "rust-build-meta": listing.build_meta,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&info)?)
+            .with_context(|| format!("writing build information to {}", path.display()))?;
+    }
     let fingerprint = fingerprint::compute(&project)?;
     let env_fingerprint = &fingerprint.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.
     let mut db = Db::open(project_root)?;
+
+    if let Some(path) = report_json {
+        let request = ShadowReport {
+            project: &project,
+            db: &db,
+            fingerprint: &fingerprint,
+            listing: &listing,
+            build_args: &build_args,
+            rustflags: &rustflags,
+            build_dir: &build_dir,
+            detail: report_detail,
+        };
+        if let Err(error) = request.write(path) {
+            // Shadow diagnostics are advisory. Even an invalid configuration
+            // rule or unavailable report path must not suppress full testing.
+            eprintln!("warning: pre-collection selection unavailable: {error:#}");
+        }
+    }
 
     // Diff mode: validate prior collect, run selection, build the
     // nextest filter expression for the rerun set. Done after the listing
@@ -400,6 +449,23 @@ pub(crate) fn collect(
     // legitimately empty suite, which `handle_no_results` already handled
     // above. Bail instead of storing nothing, which for a full collect would
     // `DELETE` and wipe the prior coverage.
+    if let Some(output) = aggregate_profile {
+        if nextest_exit == 0 {
+            if skipped != 0 {
+                bail!("aggregate profile unavailable: {skipped} tests had incomplete coverage");
+            }
+            // Include profiles produced by setup scripts and discovery
+            // outside the per-test shim. Keep them out of later report
+            // merging: the aggregate already contains their counters.
+            for entry in std::fs::read_dir(&build_dir)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "profraw") {
+                    crate::aggregate::add(&aggregate_dir, &llvm_profdata, &path)?;
+                }
+            }
+            crate::aggregate::finish(&aggregate_dir, &llvm_profdata, output)?;
+        }
+    }
     if mappings.is_empty() {
         bail!(
             "nextest ran but coverage extraction yielded no ranges for any of \
@@ -458,6 +524,74 @@ pub(crate) fn collect(
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
     Ok(nextest_exit)
+}
+
+/// Selection against the prior baseline, using precisely the test listing
+/// and build configuration of the full instrumented run that will follow.
+struct ShadowReport<'a> {
+    project: &'a ProjectRoot,
+    db: &'a Db,
+    fingerprint: &'a Fingerprint,
+    listing: &'a Listing,
+    build_args: &'a [String],
+    rustflags: &'a str,
+    build_dir: &'a Path,
+    detail: selection::DiagnosticDetail,
+}
+
+impl ShadowReport<'_> {
+    fn write(&self, path: &Path) -> Result<()> {
+        let root = &self.project.workspace_root;
+        let assessment = plan::assess(root, self.db, self.fingerprint, true)?;
+        match assessment.state {
+            CacheState::Usable(reach) => {
+                let changed_files = git_changed_files(root)?;
+                crate::db::warn_untracked_rs_files(self.db, &self.fingerprint.hex, &changed_files)?;
+                let plan = plan::plan_with_listing(
+                    PlanInputs {
+                        project: self.project,
+                        db: self.db,
+                        fingerprint_hex: &self.fingerprint.hex,
+                        reach: &reach,
+                        changed_files: &changed_files,
+                        build_args: self.build_args,
+                        detail: self.detail,
+                    },
+                    self.listing,
+                    Some(self.rustflags),
+                    Some(self.build_dir),
+                )?;
+                plan::write_selection_report(
+                    SelectionReport {
+                        command: "collect",
+                        db: self.db,
+                        fingerprint: self.fingerprint,
+                        stored: assessment.stored,
+                        reach: &reach,
+                        plan: &plan,
+                    },
+                    path,
+                )
+            }
+            CacheState::Miss(miss) => {
+                let snapshots = match &miss {
+                    CacheMiss::NoReachableSha(reach) => {
+                        let row_counts = self.db.row_counts_by_sha(&self.fingerprint.hex)?;
+                        report::collect_sha_snapshots(reach, &row_counts)
+                    }
+                    _ => Vec::new(),
+                };
+                plan::write_full_suite_report(
+                    "collect",
+                    miss.status(),
+                    Some(self.fingerprint.clone()),
+                    assessment.stored,
+                    snapshots,
+                    path,
+                )
+            }
+        }
+    }
 }
 
 /// Per-collect staging-dir name prefixes under `target/affected/`, each
@@ -1202,6 +1336,7 @@ pub(crate) struct Listing {
     /// (`reason: "expression"`), and the project's own `default-filter`.
     pub(crate) excluded: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
+    pub(crate) build_meta: serde_json::Value,
 }
 
 /// One binary in nextest's listing. `binary_path` is where its coverage map
@@ -1320,6 +1455,10 @@ pub(crate) fn nextest_list(
         tests: tests.into_iter().collect(),
         excluded,
         binaries,
+        build_meta: json
+            .get("rust-build-meta")
+            .context("nextest list missing rust-build-meta")?
+            .clone(),
     })
 }
 
@@ -1492,6 +1631,7 @@ mod tests {
         Listing {
             tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
             excluded: BTreeSet::new(),
+            build_meta: serde_json::Value::Null,
             binaries: binaries
                 .iter()
                 .map(|(id, path)| BinaryEntry {

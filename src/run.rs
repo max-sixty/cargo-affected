@@ -177,15 +177,15 @@ pub(crate) fn run(
     // through so each testcase is tagged with the same `filter-match`
     // status `nextest run` will apply.
     let build_args = args_for_listing(nextest_args);
-    let plan = plan::plan(
-        &project,
-        &db,
-        &fingerprint.hex,
-        &reach,
-        &changed_files,
-        &build_args,
+    let plan = plan::plan(plan::PlanInputs {
+        project: &project,
+        db: &db,
+        fingerprint_hex: &fingerprint.hex,
+        reach: &reach,
+        changed_files: &changed_files,
+        build_args: &build_args,
         detail,
-    )?;
+    })?;
     let sel = &plan.selection;
 
     if let Some(path) = report_json {

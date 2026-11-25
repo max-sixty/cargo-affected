@@ -225,11 +225,6 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
-    let map = match load_function_map(&env.function_maps_dir, binary) {
-        Ok(map) => map,
-        Err(e) => return TestOutcome::Skipped { reason: e },
-    };
-
     let proftext_path = dir.join("coverage.proftext");
     let mut merge_cmd = Command::new(&env.llvm_profdata);
     merge_cmd.arg("merge").arg("--sparse").arg("--text");
@@ -254,6 +249,11 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
+    let map = match load_function_map(&env.function_maps_dir, binary) {
+        Ok(map) => map,
+        Err(e) => return TestOutcome::Skipped { reason: e },
+    };
+
     let proftext = match std::fs::read_to_string(&proftext_path) {
         Ok(text) => text,
         Err(e) => {
@@ -262,6 +262,17 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
             }
         }
     };
+    let aggregate_dir = crate::aggregate::directory(&env.results_dir);
+    if aggregate_dir.is_dir() {
+        if let Err(error) =
+            crate::aggregate::add(&aggregate_dir, &env.llvm_profdata, &proftext_path)
+        {
+            return TestOutcome::Skipped {
+                reason: format!("aggregate profile: {error:#}"),
+            };
+        }
+    }
+
     let executed = match coverage::executed_functions(&proftext) {
         Ok(executed) => executed,
         Err(e) => {

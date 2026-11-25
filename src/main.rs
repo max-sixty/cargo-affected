@@ -3,6 +3,7 @@
 //! Uses LLVM coverage data to map each test to the source files it touches,
 //! then queries git for changed files to select which tests to rerun.
 
+mod aggregate;
 mod collect;
 mod config;
 mod coverage;
@@ -55,6 +56,21 @@ enum Action {
         /// and selection will silently mis-target. Use only for throwaway runs.
         #[arg(long)]
         allow_dirty: bool,
+        /// Also write an indexed LLVM profile for the full test run, suitable
+        /// for llvm-cov reports without executing the tests a second time.
+        #[arg(long, value_name = "PATH", conflicts_with = "diff")]
+        aggregate_profile: Option<PathBuf>,
+        /// Export the exact instrumented Nextest build metadata for external
+        /// coverage-report generators.
+        #[arg(long, value_name = "PATH", requires = "aggregate_profile")]
+        build_info_json: Option<PathBuf>,
+        /// Predict affected tests from the previous database before this
+        /// full collect updates it. The prediction does not filter the run.
+        #[arg(long, value_name = "PATH", conflicts_with = "diff")]
+        report_json: Option<PathBuf>,
+        /// Detail level for the pre-collection selection report.
+        #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
+        report_detail: selection::DiagnosticDetail,
         /// Extra args forwarded to `cargo nextest run`. Must be preceded by
         /// `--` (e.g. `cargo affected collect -- --features foo`); otherwise
         /// clap rejects unknown flags rather than risk swallowing one of
@@ -182,8 +198,23 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         Action::Collect {
             diff,
             allow_dirty,
+            aggregate_profile,
+            build_info_json,
+            report_json,
+            report_detail,
             nextest_args,
-        } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
+        } => collect::collect(
+            collect::CollectOptions {
+                diff,
+                verbose,
+                allow_dirty,
+                aggregate_profile: aggregate_profile.as_deref(),
+                build_info_json: build_info_json.as_deref(),
+                report_json: report_json.as_deref(),
+                report_detail,
+            },
+            &nextest_args,
+        ),
         Action::Run {
             all,
             report_json,
@@ -274,6 +305,10 @@ mod tests {
         let Action::Collect {
             diff,
             allow_dirty,
+            aggregate_profile,
+            build_info_json,
+            report_json,
+            report_detail: _,
             nextest_args,
         } = cli.action
         else {
@@ -281,6 +316,9 @@ mod tests {
         };
         assert!(!diff);
         assert!(!allow_dirty);
+        assert!(aggregate_profile.is_none());
+        assert!(build_info_json.is_none());
+        assert!(report_json.is_none());
         assert_eq!(nextest_args, vec!["--features", "foo"]);
     }
 
