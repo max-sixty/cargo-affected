@@ -12,8 +12,8 @@
 //! runs as normal.
 
 use crate::{
-    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit,
-    write_two_module_project,
+    cargo_affected, cargo_affected_with_env, combined_output, git, git_head,
+    init_git_with_initial_commit, write_two_module_project,
 };
 
 #[test]
@@ -55,6 +55,28 @@ fn run_executes_full_suite_when_no_coverage_data() {
             "expected nextest to PASS {t}, got:\n{combined}"
         );
     }
+}
+
+/// With no coverage data, `run` needs no Git repository either: a source
+/// archive or a container build that leaves out `.git` still runs every test.
+#[test]
+fn run_executes_full_suite_outside_a_git_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_cache_miss_no_git");
+
+    let ceiling = dir.parent().unwrap().to_string_lossy();
+    let run = cargo_affected_with_env(
+        dir,
+        &["affected", "run"],
+        &[("GIT_CEILING_DIRECTORIES", ceiling.as_ref())],
+    );
+    let combined = combined_output(&run);
+    assert!(run.status.success(), "run outside git failed:\n{combined}");
+    assert!(
+        combined.contains("running all tests"),
+        "expected cache-miss notice, got:\n{combined}"
+    );
 }
 
 #[test]

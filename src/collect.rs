@@ -64,7 +64,7 @@ use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::project::{
-    canonicalize_no_verbatim, find_project_root, git_head_sha, git_working_tree_dirty,
+    canonicalize_no_verbatim, find_project_root, git_head_sha, git_prefix, git_working_tree_dirty,
 };
 use crate::selection;
 use crate::shim::{self, TestOutcome, TestResult};
@@ -90,6 +90,7 @@ pub(crate) fn collect(
         eprintln!("project root: {}", project_root.display());
     }
     let canonical_root = canonicalize_no_verbatim(project_root)?;
+    let git_prefix = git_prefix(project_root)?;
 
     // Refuse to collect on a dirty tree by default: ranges would be filed
     // under HEAD but reflect working-tree line numbers, knocking the DB out
@@ -179,7 +180,7 @@ pub(crate) fn collect(
     // not the lib itself), and the libs of any workspace packages it
     // transitively depends on. See `crate_root_sentinels_by_binary_id` for
     // the reasoning.
-    let crate_root_sentinels = project.crate_root_sentinels_by_binary_id()?;
+    let crate_root_sentinels = project.crate_root_sentinels_by_binary_id(&git_prefix)?;
     if verbose {
         for (binary_id, paths) in &crate_root_sentinels {
             eprintln!(
@@ -278,7 +279,10 @@ pub(crate) fn collect(
         &mapped,
         &llvm_profdata,
         &llvm_cov,
-        &canonical_root,
+        &coverage::DbKeys {
+            root: &canonical_root,
+            git_prefix: &git_prefix,
+        },
     )?;
 
     // Build (or cache-hit) and run, with the runner shim wired up so each
@@ -551,7 +555,7 @@ fn write_function_maps(
     binaries: &[&BinaryEntry],
     llvm_profdata: &Path,
     llvm_cov: &Path,
-    canonical_root: &Path,
+    keys: &coverage::DbKeys,
 ) -> Result<()> {
     // An empty text profile merges into a valid profile containing no records,
     // which is exactly what "report every function as unexecuted" needs.
@@ -576,7 +580,7 @@ fn write_function_maps(
         // POSIX ERE — no negative lookahead, so the regex enumerates prefixes
         // to drop. It shrinks `files[]` but leaves `functions[]` (the bulk of
         // the JSON) intact; `coverage::build_function_map` filters
-        // authoritatively via `strip_prefix(canonical_root)`.
+        // authoritatively by giving each path a key (`coverage::DbKeys`).
         let export = Command::new(llvm_cov)
             .arg("export")
             .arg("--format=text")
@@ -593,7 +597,7 @@ fn write_function_maps(
             );
         }
         let json = String::from_utf8_lossy(&export.stdout);
-        let functions = coverage::build_function_map(&json, canonical_root)
+        let functions = coverage::build_function_map(&json, keys)
             .with_context(|| format!("failed to read the coverage map of {}", binary.binary_id))?;
         if functions.is_empty() {
             bail!(
@@ -602,7 +606,7 @@ fn write_function_maps(
                  prefix of the paths the compiler recorded (a \
                  --remap-path-prefix in RUSTFLAGS is the usual cause).",
                 binary.binary_id,
-                canonical_root.display(),
+                keys.root.display(),
             );
         }
         let map = coverage::BinaryFunctionMap {

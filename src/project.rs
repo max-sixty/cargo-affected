@@ -48,7 +48,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
-use crate::coverage::to_db_relative;
+use crate::coverage::DbKeys;
 
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -170,6 +170,16 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
     })
 }
 
+/// The workspace's directory relative to the Git root, as git spells it:
+/// `member` for a workspace in `<repo>/member`, empty for one at the root.
+/// Every path git reports starts from the Git root, so stored paths do too
+/// ([`DbKeys`]), and config rules strip this prefix to match their
+/// workspace-relative globs.
+pub(crate) fn git_prefix(project_root: &Path) -> Result<PathBuf> {
+    let prefix = run_git(project_root, &["rev-parse", "--show-prefix"])?.concat();
+    Ok(Path::new(prefix.trim_end()).components().collect())
+}
+
 impl ProjectRoot {
     /// Build the per-target sentinel map: `binary_id → {crate_root paths}`.
     ///
@@ -198,14 +208,18 @@ impl ProjectRoot {
     /// Reads from the cached `metadata` JSON — no cargo spawn.
     pub(crate) fn crate_root_sentinels_by_binary_id(
         &self,
+        git_prefix: &Path,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
         // No canonicalize: `workspace_root` and `target.src_path` both come
         // from the same `cargo metadata` invocation and share whatever
         // normalisation cargo applied. Calling `Path::canonicalize` here
         // would diverge on Windows (verbatim `\\?\` prefix, 8.3 → long-name
-        // expansion of `RUNNER~1` → `runneradmin`) and the strip_prefix
-        // below would silently drop every target.
-        let root = &self.workspace_root;
+        // expansion of `RUNNER~1` → `runneradmin`) and no target would get
+        // a key.
+        let keys = DbKeys {
+            root: &self.workspace_root,
+            git_prefix,
+        };
 
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
@@ -228,7 +242,7 @@ impl ProjectRoot {
             };
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
-                    if let Some(parsed) = parse_target(target, root) {
+                    if let Some(parsed) = parse_target(target, &keys) {
                         // Recorded regardless of `runs_tests`, because the two
                         // roles are independent: a `[lib] test = false` lib
                         // builds no test harness of its own, but every other
@@ -321,7 +335,7 @@ enum TargetKind {
 struct TestTarget {
     name: String,
     kind: TargetKind,
-    /// Path relative to the workspace root.
+    /// The crate root's key in the database ([`DbKeys`]).
     src_path: Utf8PathBuf,
     /// Cargo's `test` flag for this target — whether cargo builds a test
     /// harness for it, so nextest gets a binary with tests in it. False for
@@ -350,7 +364,7 @@ const LIB_CRATE_TYPES: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib"
 /// Cargo's `test` flag is carried through rather than filtered on: a target
 /// with `test = false` still compiles into its package's other targets, so
 /// dropping it here would lose its crate root as a sentinel.
-fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
+fn parse_target(target: &serde_json::Value, keys: &DbKeys) -> Option<TestTarget> {
     let kinds: Vec<&str> = target
         .get("kind")
         .and_then(|v| v.as_array())
@@ -369,8 +383,7 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     };
     let name = target.get("name").and_then(|v| v.as_str())?.to_string();
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
-    let rel = Path::new(abs).strip_prefix(root).ok()?;
-    let src_path = to_db_relative(rel)?;
+    let src_path = keys.key(Path::new(abs))?;
     let runs_tests = target
         .get("test")
         .and_then(|v| v.as_bool())
@@ -426,9 +439,11 @@ fn transitive_closure<'a>(
 /// List files changed in the working tree relative to HEAD: staged + unstaged
 /// + untracked.
 ///
-/// Returns paths relative to the project root. A non-zero git exit (corrupt
-/// repo, missing object, permissions) is a hard error: silently returning "no
-/// changed files" would look like a clean tree and select zero tests.
+/// Returns paths relative to the Git root, across the whole repository even
+/// when the workspace is nested (`:/` widens `ls-files` to match the diffs).
+/// A non-zero git exit (corrupt repo, missing object, permissions) is a hard
+/// error: silently returning "no changed files" would look like a clean tree
+/// and select zero tests.
 pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for args in [
@@ -441,7 +456,15 @@ pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
             "--cached",
             "-z",
         ],
-        vec!["ls-files", "-z", "--others", "--exclude-standard"],
+        vec![
+            "ls-files",
+            "--full-name",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":/",
+        ],
     ] {
         for path in run_git(project_root, &args)? {
             if !files.contains(&path) {
@@ -563,11 +586,13 @@ pub(crate) fn git_changed_line_ranges(
     // backslashes, control characters) stay unparsed and their ranges are
     // dropped — accepted, since such names essentially never reach rustc,
     // and config-rule matching still sees them verbatim via
-    // `git_changed_files`' `-z`.
+    // `git_changed_files`' `-z`. `diff.relative=false` as in [`run_git`].
     let output = Command::new("git")
         .args([
             "-c",
             "core.quotePath=false",
+            "-c",
+            "diff.relative=false",
             "diff",
             "-U0",
             "--no-color",
@@ -601,7 +626,7 @@ pub(crate) fn git_changed_line_ranges(
 /// `git_changed_files` only sees uncommitted changes — so for committed
 /// additions, the diagnostic report needs this dedicated query to know
 /// the file existed in the diff at all. Returns paths relative to the
-/// project root.
+/// Git root.
 pub(crate) fn git_added_files_since(project_root: &Path, collect_sha: &str) -> Result<Vec<String>> {
     let mut out = run_git(
         project_root,
@@ -773,8 +798,13 @@ fn parse_hunk_header(line: &str) -> Option<Hunk> {
 /// newline would be split into two phantom entries. Errors include the full
 /// command, exit code, and stderr; silent skips here would mask repo
 /// corruption, bad refs, or missing objects as a clean tree.
+///
+/// `diff.relative=false` overrides a user's config that would make `git diff`
+/// print paths relative to the workspace rather than the Git root, which
+/// would match no stored path in a nested workspace.
 fn run_git(project_root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let output = Command::new("git")
+        .args(["-c", "diff.relative=false"])
         .args(args)
         .current_dir(project_root)
         .output()
@@ -844,6 +874,19 @@ mod tests {
             files.iter().any(|f| f == "new.txt"),
             "expected new.txt in {files:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_repository_untracked_files_keep_git_root_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(member.join("src"))?;
+        std::fs::write(member.join("src/new.rs"), b"pub fn new() {}\n")?;
+
+        let paths = git_changed_files(&member)?;
+        assert_eq!(paths, vec!["member/src/new.rs"]);
         Ok(())
     }
 
@@ -1323,7 +1366,7 @@ mod tests {
             manifest_paths: vec![],
             metadata,
         };
-        let map = project.crate_root_sentinels_by_binary_id()?;
+        let map = project.crate_root_sentinels_by_binary_id(Path::new(""))?;
 
         let p = |s: &str| Utf8PathBuf::from(s);
 
@@ -1430,7 +1473,7 @@ mod tests {
             manifest_paths: vec![],
             metadata,
         };
-        let map = project.crate_root_sentinels_by_binary_id()?;
+        let map = project.crate_root_sentinels_by_binary_id(Path::new(""))?;
 
         let p = |s: &str| Utf8PathBuf::from(s);
 
@@ -1519,7 +1562,7 @@ mod tests {
             manifest_paths: vec![],
             metadata,
         };
-        let map = project.crate_root_sentinels_by_binary_id()?;
+        let map = project.crate_root_sentinels_by_binary_id(Path::new(""))?;
 
         let p = |s: &str| Utf8PathBuf::from(s);
 
