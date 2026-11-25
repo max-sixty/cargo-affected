@@ -414,7 +414,15 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     let mut mappings: Vec<(TestId, BTreeSet<HitRange>)> = Vec::new();
     let mut unknown_binaries: BTreeSet<String> = BTreeSet::new();
     let mut skipped = 0usize;
+    let mut aggregate_error = None;
     for result in results {
+        if let Some(error) = result.aggregate_error {
+            eprintln!(
+                "  aggregate profile for {}::{}: {error}",
+                result.binary_id, result.test_name
+            );
+            aggregate_error.get_or_insert(error);
+        }
         match result.outcome {
             TestOutcome::Collected { mut ranges } => {
                 let test_id = TestId::new(result.binary_id, result.test_name);
@@ -453,23 +461,6 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     // legitimately empty suite, which `handle_no_results` already handled
     // above. Bail instead of storing nothing, which for a full collect would
     // `DELETE` and wipe the prior coverage.
-    if let Some(output) = aggregate_profile {
-        if nextest_exit == 0 {
-            if skipped != 0 {
-                bail!("aggregate profile unavailable: {skipped} tests had incomplete coverage");
-            }
-            // Include profiles produced by setup scripts and discovery
-            // outside the per-test shim. Keep them out of later report
-            // merging: the aggregate already contains their counters.
-            for entry in std::fs::read_dir(&build_dir)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|ext| ext == "profraw") {
-                    crate::aggregate::add(&aggregate_dir, &llvm_profdata, &path)?;
-                }
-            }
-            crate::aggregate::finish(&aggregate_dir, &llvm_profdata, output)?;
-        }
-    }
     if mappings.is_empty() {
         bail!(
             "nextest ran but coverage extraction yielded no ranges for any of \
@@ -479,7 +470,6 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         );
     }
 
-    let total_elapsed = total_start.elapsed();
     let region_count: usize = mappings.iter().map(|(_, r)| r.len()).sum();
 
     if let Some(plan) = diff_plan {
@@ -518,6 +508,30 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
+    if let Some(output) = aggregate_profile {
+        if nextest_exit == 0 {
+            let publish = || -> Result<()> {
+                if skipped != 0 {
+                    bail!("{skipped} tests had incomplete coverage");
+                }
+                if let Some(error) = aggregate_error {
+                    bail!("{error}");
+                }
+                // Include setup and discovery profiles outside the test shim.
+                for entry in std::fs::read_dir(&build_dir)? {
+                    let path = entry?.path();
+                    if path.extension().is_some_and(|ext| ext == "profraw") {
+                        crate::aggregate::add(&aggregate_dir, &llvm_profdata, &path)?;
+                    }
+                }
+                crate::aggregate::finish(&aggregate_dir, &llvm_profdata, output)
+            };
+            if let Err(error) = publish() {
+                eprintln!("warning: aggregate profile unavailable: {error:#}");
+            }
+        }
+    }
+
     eprintln!(
         "done. {} test{}, {} range{} stored in {} ({:.1}s total)",
         mappings.len(),
@@ -529,7 +543,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
             .strip_prefix(project_root)
             .unwrap_or(&state.database())
             .display(),
-        total_elapsed.as_secs_f64(),
+        total_start.elapsed().as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
     Ok(nextest_exit)
@@ -805,7 +819,7 @@ pub(crate) fn clean_staging_dirs(state: &StateDir) -> Result<usize> {
         return Ok(0);
     }
     let mut removed = 0;
-    for entry in std::fs::read_dir(dir).context("scanning target/affected")? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("scanning {}", dir.display()))? {
         let path = entry?.path();
         let is_staging = path.is_dir()
             && path
@@ -1126,7 +1140,7 @@ pub(crate) fn write_nextest_config(
     doc["profile"]["default"]["default-filter"] = toml_edit::value(filter);
 
     let dir = state.path();
-    std::fs::create_dir_all(dir).context("failed to create target/affected dir")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     // PID-suffixed so two concurrent `cargo affected` runs can't overwrite
     // each other's selection between writing the file and nextest reading it
     // — the same reasoning as the `profraw-<pid>` staging dir. The caller
@@ -2141,6 +2155,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let good = TestResult {
+            aggregate_error: None,
             binary_id: "crate-a".into(),
             test_name: "t_ok".into(),
             outcome: TestOutcome::Skipped { reason: "x".into() },

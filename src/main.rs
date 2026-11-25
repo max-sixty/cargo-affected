@@ -38,6 +38,7 @@ struct Cli {
     verbose: bool,
     /// Directory for this test scope's coverage database, instrumented
     /// build and staging files. Relative paths are workspace-root-relative.
+    /// Choose a Git-ignored directory or a path outside the checkout.
     #[arg(long, global = true, value_name = "PATH")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -62,6 +63,7 @@ enum Action {
         allow_dirty: bool,
         /// Also write an indexed LLVM profile for the full test run, suitable
         /// for llvm-cov reports without executing the tests a second time.
+        /// Optional report failures warn without discarding the baseline.
         #[arg(long, value_name = "PATH", conflicts_with = "diff")]
         aggregate_profile: Option<PathBuf>,
         /// Export the exact instrumented Nextest build metadata for external
@@ -127,7 +129,7 @@ enum Action {
         #[arg(last = true)]
         nextest_args: Vec<String>,
     },
-    /// Clear stored coverage data from target/affected/coverage.db.
+    /// Clear stored coverage data in the selected state directory.
     Clean,
 }
 

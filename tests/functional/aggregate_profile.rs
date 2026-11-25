@@ -35,8 +35,8 @@ fn aggregate_keeps_exact_counts_across_compaction_batches() {
     let mut source = String::from(
         "#[inline(never)]\npub fn choose(value: bool) -> u32 {\n    if value { 1 } else { 2 }\n}\n",
     );
-    // Cross more than two aggregate batches, including an incomplete batch.
-    for i in 0..70 {
+    // Cross more than four aggregate batches, including an incomplete batch.
+    for i in 0..150 {
         let value = i % 2 == 0;
         source.push_str(&format!(
             "#[test]\nfn case_{i}() {{ assert_eq!(choose({value}), {}); }}\n",
@@ -55,6 +55,8 @@ fn aggregate_keeps_exact_counts_across_compaction_batches() {
             profile.to_str().unwrap(),
             "--",
             "--no-fail-fast",
+            "--test-threads",
+            "8",
         ],
     );
     assert!(result.status.success(), "{}", combined_output(&result));
@@ -108,14 +110,14 @@ fn aggregate_keeps_exact_counts_across_compaction_batches() {
                 .is_some_and(|name| name.contains("choose"))
         })
         .expect("choose coverage");
-    assert_eq!(function["count"], 70);
+    assert_eq!(function["count"], 150);
     let counts = function["regions"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|region| region[4].as_u64())
         .collect::<Vec<_>>();
-    assert!(counts.contains(&35), "{function}");
+    assert!(counts.contains(&75), "{function}");
 }
 
 #[test]
@@ -169,4 +171,37 @@ fn collect_predicts_before_overwriting_baseline_and_runs_every_test() {
                 .as_str()
                 .is_some_and(|name| name.contains("multiply"))));
     assert_no_staging_dirs(dir, "shadow collect");
+}
+
+#[test]
+fn failed_optional_profile_keeps_the_baseline_and_test_exit_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_aggregate_failure");
+    init_git_with_initial_commit(dir);
+    // Atomic publication cannot replace a directory with the indexed profile.
+    // Exercise a real final-output error after successful per-test collection.
+    let output = dir.join("target/unwritable-profile");
+    std::fs::create_dir_all(&output).unwrap();
+    let result = cargo_affected(
+        dir,
+        &[
+            "affected",
+            "collect",
+            "--aggregate-profile",
+            output.to_str().unwrap(),
+        ],
+    );
+    let log = combined_output(&result);
+    assert!(result.status.success(), "{log}");
+    assert!(
+        log.contains("warning: aggregate profile unavailable"),
+        "{log}"
+    );
+    assert_no_staging_dirs(dir, "failed aggregate publish");
+    let status = cargo_affected(dir, &["affected", "status"]);
+    let log = combined_output(&status);
+    assert!(status.status.success(), "{log}");
+    assert!(log.contains("cache=hit-exact"), "{log}");
+    assert!(log.contains("nothing would run"), "{log}");
 }

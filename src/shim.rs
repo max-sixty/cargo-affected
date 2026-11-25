@@ -83,6 +83,7 @@ pub(crate) struct TestResult {
     pub(crate) binary_id: String,
     pub(crate) test_name: String,
     pub(crate) outcome: TestOutcome,
+    pub(crate) aggregate_error: Option<String>,
 }
 
 /// Outcome of extracting one test's coverage. `Skipped` covers every soft
@@ -139,8 +140,26 @@ pub(crate) fn run(args: &[String]) -> ! {
     // The test has exited, so its profile is flushed. Extract now, record the
     // result, and free the bundle — the delete is what keeps peak disk
     // bounded to nextest's concurrency.
-    let outcome = extract(&dir, Path::new(binary), &env);
-    write_result(&env.results_dir, &binary_id, &test_name, outcome);
+    let mut result = TestResult {
+        binary_id,
+        test_name,
+        outcome: extract(&dir, Path::new(binary), &env),
+        aggregate_error: None,
+    };
+    // Record the per-test coverage before optional compaction. Even if a
+    // compactor is killed by a timeout, its valid per-test map survives.
+    write_result(&env.results_dir, &result);
+    let aggregate_dir = crate::aggregate::directory(&env.results_dir);
+    if aggregate_dir.is_dir() && matches!(result.outcome, TestOutcome::Collected { .. }) {
+        if let Err(error) = crate::aggregate::add(
+            &aggregate_dir,
+            &env.llvm_profdata,
+            &dir.join("coverage.proftext"),
+        ) {
+            result.aggregate_error = Some(format!("{error:#}"));
+            write_result(&env.results_dir, &result);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 
     std::process::exit(code);
@@ -225,6 +244,11 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
+    let map = match load_function_map(&env.function_maps_dir, binary) {
+        Ok(map) => map,
+        Err(e) => return TestOutcome::Skipped { reason: e },
+    };
+
     let proftext_path = dir.join("coverage.proftext");
     let mut merge_cmd = Command::new(&env.llvm_profdata);
     merge_cmd.arg("merge").arg("--sparse").arg("--text");
@@ -249,11 +273,6 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
         };
     }
 
-    let map = match load_function_map(&env.function_maps_dir, binary) {
-        Ok(map) => map,
-        Err(e) => return TestOutcome::Skipped { reason: e },
-    };
-
     let proftext = match std::fs::read_to_string(&proftext_path) {
         Ok(text) => text,
         Err(e) => {
@@ -262,17 +281,6 @@ fn extract(dir: &Path, binary: &Path, env: &CoverageEnv) -> TestOutcome {
             }
         }
     };
-    let aggregate_dir = crate::aggregate::directory(&env.results_dir);
-    if aggregate_dir.is_dir() {
-        if let Err(error) =
-            crate::aggregate::add(&aggregate_dir, &env.llvm_profdata, &proftext_path)
-        {
-            return TestOutcome::Skipped {
-                reason: format!("aggregate profile: {error:#}"),
-            };
-        }
-    }
-
     let executed = match coverage::executed_functions(&proftext) {
         Ok(executed) => executed,
         Err(e) => {
@@ -345,18 +353,13 @@ pub(crate) fn map_path(function_maps_dir: &Path, binary: &Path) -> Option<PathBu
 ///
 /// Best-effort: a failure here costs this test one collect (it's re-selected
 /// next `--diff`), so we warn rather than abort the test.
-fn write_result(results_dir: &Path, binary_id: &str, test_name: &str, outcome: TestOutcome) {
-    let dir = results_dir.join(storage_key(binary_id));
-    let path = dir.join(format!("{}.json", storage_key(test_name)));
+fn write_result(results_dir: &Path, result: &TestResult) {
+    let dir = results_dir.join(storage_key(&result.binary_id));
+    let path = dir.join(format!("{}.json", storage_key(&result.test_name)));
     let tmp = path.with_extension("json.tmp");
-    let result = TestResult {
-        binary_id: binary_id.to_string(),
-        test_name: test_name.to_string(),
-        outcome,
-    };
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(&tmp, serde_json::to_vec(&result)?)?;
+        std::fs::write(&tmp, serde_json::to_vec(result)?)?;
         std::fs::rename(&tmp, &path)
     };
     if let Err(e) = write() {
@@ -440,10 +443,13 @@ mod tests {
         for name in names {
             write_result(
                 tmp.path(),
-                "sample",
-                name,
-                TestOutcome::Skipped {
-                    reason: name.into(),
+                &TestResult {
+                    binary_id: "sample".into(),
+                    test_name: name.into(),
+                    outcome: TestOutcome::Skipped {
+                        reason: name.into(),
+                    },
+                    aggregate_error: None,
                 },
             );
         }
@@ -563,9 +569,12 @@ mod tests {
         .collect();
         write_result(
             results,
-            "my-crate::tests",
-            "math::adds",
-            TestOutcome::Collected { ranges },
+            &TestResult {
+                binary_id: "my-crate::tests".into(),
+                test_name: "math::adds".into(),
+                outcome: TestOutcome::Collected { ranges },
+                aggregate_error: Some("optional aggregate failed".into()),
+            },
         );
 
         let path = results
@@ -575,6 +584,10 @@ mod tests {
         let parsed: TestResult = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.binary_id, "my-crate::tests");
         assert_eq!(parsed.test_name, "math::adds");
+        assert_eq!(
+            parsed.aggregate_error.as_deref(),
+            Some("optional aggregate failed")
+        );
         match parsed.outcome {
             TestOutcome::Collected { ranges } => {
                 assert_eq!(ranges.len(), 1);
