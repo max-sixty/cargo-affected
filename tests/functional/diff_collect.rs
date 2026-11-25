@@ -99,9 +99,10 @@ fn diff_collect_re_anchors_only_affected_tests() {
 
 /// Three modules, one test each: lets us drive the multi-sha test below
 /// without the structural-edit backstop pulling extra tests in. The shared
-/// `write_two_module_project` puts both `add` and `multiply` in `math.rs`,
-/// which causes round-2 hunks against the round-1 sha to fire the backstop
-/// on the test that's still anchored at sha0. One-test-per-file isolates
+/// `write_two_module_project` puts both `add` and `multiply` in `math.rs`:
+/// round 1's sha holds only `test_add`'s rows, so a round-2 edit to
+/// `multiply` overlaps nothing recorded there and the backstop reruns
+/// `test_add` alongside `test_multiply`. One-test-per-file isolates
 /// each test's row set per file, so each round's diff selects exactly its
 /// intended rerun.
 fn write_three_one_test_modules(dir: &std::path::Path, crate_name: &str) {
@@ -235,20 +236,12 @@ fn diff_collect_accumulates_distinct_shas_across_rounds() {
 /// `write_two_module_project` keeps `add` and `multiply` in the same
 /// `src/math.rs`, so after `--diff` re-anchors `test_add` at the new HEAD the
 /// rows left at the initial sha no longer cover `add`'s lines. The initial
-/// sha's diff still shows the committed edit to `add`, that hunk now overlaps
-/// no stored range there, and the structural-edit backstop broadens to every
-/// test with rows for `src/math.rs` at that sha — `test_multiply`. It reruns
-/// on every `run` until the next `collect`, even though nothing changed and
-/// `test_multiply` never touches `add`.
-///
-/// **This test fails today** — #94 is unfixed, so it is `#[ignore]`d to keep
-/// the suite green rather than turning `main` red for a defect no PR here
-/// introduced. It still runs on demand (`cargo test -- --ignored`), and the
-/// fix for #94 should remove the attribute in the same commit; the reason
-/// lives here rather than only in the attribute string so it survives an
-/// edit to either.
+/// sha's diff still shows the committed edit to `add`. Were that hunk to
+/// overlap no stored range there, the structural-edit backstop would broaden to every
+/// test with rows for `src/math.rs` at that sha — `test_multiply`, which
+/// never touches `add`. `retired_ranges` keeps `test_add`'s old range at the
+/// initial sha, so the hunk still reads as a body edit there.
 #[test]
-#[ignore = "reproduction for #94 — fails today; un-ignore with the fix"]
 fn run_after_diff_collect_selects_nothing_on_a_clean_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
