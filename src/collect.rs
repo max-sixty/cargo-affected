@@ -64,6 +64,7 @@ use crate::coverage::{self, HitRange};
 use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint;
 use crate::profile::{InstrumentFlags, ProfileMode};
+use crate::project::ProjectRoot;
 use crate::project::{
     canonicalize_no_verbatim, find_project_root, git_head_sha, git_prefix, git_working_tree_dirty,
 };
@@ -1266,6 +1267,7 @@ pub(crate) struct Listing {
     /// (`reason: "expression"`), and the project's own `default-filter`.
     pub(crate) excluded: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
+    build_meta: serde_json::Value,
 }
 
 impl Listing {
@@ -1462,6 +1464,10 @@ pub(crate) fn nextest_list(
         tests: tests.into_iter().collect(),
         excluded,
         binaries,
+        build_meta: json
+            .get("rust-build-meta")
+            .cloned()
+            .context("nextest list missing rust-build-meta")?,
     })
 }
 
@@ -1635,6 +1641,7 @@ mod tests {
 
     fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
         Listing {
+            build_meta: serde_json::Value::Null,
             tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
             excluded: BTreeSet::new(),
             binaries: binaries
