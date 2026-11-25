@@ -63,7 +63,7 @@ enum Action {
         allow_dirty: bool,
         /// Also write an indexed LLVM profile for the full test run, suitable
         /// for llvm-cov reports without executing the tests a second time.
-        /// Optional report failures warn without discarding the baseline.
+        /// Report failures fail collection without discarding the baseline.
         #[arg(long, value_name = "PATH", conflicts_with = "diff")]
         aggregate_profile: Option<PathBuf>,
         /// Export the exact instrumented Nextest build metadata for external

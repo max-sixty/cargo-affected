@@ -130,6 +130,17 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         }
     }
 
+    // Invalidate any cached output before starting the run. Keep a failure
+    // here separate from per-test collection, just like a publication error.
+    let aggregate_reset =
+        aggregate_profile.map_or(Ok(()), |output| match std::fs::remove_file(output) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("removing stale profile {}", output.display()))
+            }
+        });
+
     require_nextest(project_root)?;
     let self_path = std::env::current_exe().context("failed to resolve current executable")?;
     let target_triple = current_target();
@@ -403,8 +414,13 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
             diff_plan.as_ref(),
             nextest_exit,
             &results_dir,
-        )?;
+        );
         remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
+        let exit = exit?;
+        if aggregate_profile.is_some() {
+            aggregate_reset.context("aggregate profile unavailable")?;
+            bail!("aggregate profile unavailable: no coverage results");
+        }
         return Ok(exit);
     }
 
@@ -508,29 +524,26 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
-    if let Some(output) = aggregate_profile {
-        if nextest_exit == 0 {
-            let publish = || -> Result<()> {
-                if skipped != 0 {
-                    bail!("{skipped} tests had incomplete coverage");
-                }
-                if let Some(error) = aggregate_error {
-                    bail!("{error}");
-                }
-                // Include setup and discovery profiles outside the test shim.
-                for entry in std::fs::read_dir(&build_dir)? {
-                    let path = entry?.path();
-                    if path.extension().is_some_and(|ext| ext == "profraw") {
-                        crate::aggregate::add(&aggregate_dir, &llvm_profdata, &path)?;
-                    }
-                }
-                crate::aggregate::finish(&aggregate_dir, &llvm_profdata, output)
-            };
-            if let Err(error) = publish() {
-                eprintln!("warning: aggregate profile unavailable: {error:#}");
+    let aggregate_result = aggregate_profile.map_or(Ok(()), |output| {
+        aggregate_reset?;
+        if nextest_exit != 0 {
+            bail!("nextest exited with code {nextest_exit}; no profile published");
+        }
+        if skipped != 0 {
+            bail!("{skipped} tests had incomplete coverage");
+        }
+        if let Some(error) = aggregate_error {
+            bail!("{error}");
+        }
+        // Include setup and discovery profiles outside the test shim.
+        for entry in std::fs::read_dir(&build_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "profraw") {
+                crate::aggregate::add(&aggregate_dir, &llvm_profdata, &path)?;
             }
         }
-    }
+        crate::aggregate::finish(&aggregate_dir, &llvm_profdata, output)
+    });
 
     eprintln!(
         "done. {} test{}, {} range{} stored in {} ({:.1}s total)",
@@ -546,6 +559,15 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         total_start.elapsed().as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
+    // Preserve nextest's failure code, but never report success if the
+    // requested aggregate could not be produced. The DB is already stored.
+    if nextest_exit != 0 {
+        if let Err(error) = aggregate_result {
+            eprintln!("aggregate profile unavailable: {error:#}");
+        }
+    } else {
+        aggregate_result.context("aggregate profile unavailable")?;
+    }
     Ok(nextest_exit)
 }
 

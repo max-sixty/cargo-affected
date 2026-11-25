@@ -174,7 +174,7 @@ fn collect_predicts_before_overwriting_baseline_and_runs_every_test() {
 }
 
 #[test]
-fn failed_optional_profile_keeps_the_baseline_and_test_exit_status() {
+fn failed_aggregate_publish_keeps_the_baseline_but_fails_collect() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     write_two_module_project(dir, "sample_aggregate_failure");
@@ -182,7 +182,16 @@ fn failed_optional_profile_keeps_the_baseline_and_test_exit_status() {
     // Atomic publication cannot replace a directory with the indexed profile.
     // Exercise a real final-output error after successful per-test collection.
     let output = dir.join("target/unwritable-profile");
-    std::fs::create_dir_all(&output).unwrap();
+    // Create the conflicting directory during the test run, so this tests
+    // publication rather than the initial removal of a stale profile.
+    let source = dir.join("src/lib.rs");
+    let mut contents = std::fs::read_to_string(&source).unwrap();
+    contents.push_str(
+        "\n#[test]\nfn block_publish() { std::fs::create_dir_all(\"target/unwritable-profile\").unwrap(); }\n",
+    );
+    std::fs::write(&source, contents).unwrap();
+    git(dir, &["add", "src/lib.rs"]);
+    git(dir, &["commit", "-m", "block profile publication"]);
     let result = cargo_affected(
         dir,
         &[
@@ -193,15 +202,77 @@ fn failed_optional_profile_keeps_the_baseline_and_test_exit_status() {
         ],
     );
     let log = combined_output(&result);
-    assert!(result.status.success(), "{log}");
-    assert!(
-        log.contains("warning: aggregate profile unavailable"),
-        "{log}"
-    );
+    assert!(!result.status.success(), "{log}");
+    assert!(log.contains("aggregate profile unavailable"), "{log}");
+    assert!(output.is_dir());
     assert_no_staging_dirs(dir, "failed aggregate publish");
     let status = cargo_affected(dir, &["affected", "status"]);
     let log = combined_output(&status);
     assert!(status.status.success(), "{log}");
     assert!(log.contains("cache=hit-exact"), "{log}");
     assert!(log.contains("nothing would run"), "{log}");
+}
+
+#[test]
+fn failed_test_invalidates_stale_profile_and_preserves_nextest_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_aggregate_failed_test");
+    let source = dir.join("src/lib.rs");
+    let mut contents = std::fs::read_to_string(&source).unwrap();
+    contents.push_str("\n#[test]\nfn deliberately_fails() { panic!(\"test failure\"); }\n");
+    std::fs::write(source, contents).unwrap();
+    init_git_with_initial_commit(dir);
+
+    let output = dir.join("target/coverage.profdata");
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+    std::fs::write(&output, b"stale coverage from a previous run").unwrap();
+    let result = cargo_affected(
+        dir,
+        &[
+            "affected",
+            "collect",
+            "--aggregate-profile",
+            output.to_str().unwrap(),
+            "--",
+            "--no-fail-fast",
+        ],
+    );
+    let log = combined_output(&result);
+    assert_eq!(result.status.code(), Some(100), "{log}");
+    assert!(!output.exists(), "failed suite left a stale profile: {log}");
+    assert!(log.contains("aggregate profile unavailable"), "{log}");
+    assert_no_staging_dirs(dir, "failed test with aggregate");
+    let status = cargo_affected(dir, &["affected", "status"]);
+    let log = combined_output(&status);
+    assert!(status.status.success(), "{log}");
+    assert!(log.contains("cache=hit-exact"), "{log}");
+}
+
+#[test]
+fn empty_selection_cannot_report_success_with_a_stale_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_aggregate_empty_selection");
+    init_git_with_initial_commit(dir);
+    let output = dir.join("target/coverage.profdata");
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+    std::fs::write(&output, b"stale coverage").unwrap();
+    let result = cargo_affected(
+        dir,
+        &[
+            "affected",
+            "collect",
+            "--aggregate-profile",
+            output.to_str().unwrap(),
+            "--",
+            "-E",
+            "none()",
+        ],
+    );
+    let log = combined_output(&result);
+    assert!(!result.status.success(), "{log}");
+    assert!(log.contains("aggregate profile unavailable"), "{log}");
+    assert!(!output.exists(), "{log}");
+    assert_no_staging_dirs(dir, "empty selection with aggregate");
 }

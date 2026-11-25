@@ -82,9 +82,12 @@ configuration rules use the same build directory and flags.
 Add `--aggregate-profile target/coverage.profdata` to export an indexed LLVM
 profile of the same full run. This uses each test's existing LLVM counters,
 compacts them into bounded batches, and publishes the profile only when the
-full run succeeds and the aggregate is complete. A failed optional aggregate
-is reported as a warning; per-test coverage and the test exit status remain
-independent, and an existing profile is not replaced. It can be used with
+full run succeeds and the aggregate is complete. An existing output file is
+removed before collection starts so a failed run cannot leave a stale report.
+If the requested aggregate cannot be published, collection exits non-zero
+without discarding the per-test baseline. A failing test run retains its
+Nextest exit code. Use a dedicated output path for each concurrent collect.
+The profile can be used with
 `llvm-cov export` or `llvm-cov show`
 against the instrumented executables in `target/affected/build`; no second
 test execution is necessary. `--build-info-json PATH` additionally exports
