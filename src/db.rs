@@ -18,7 +18,7 @@
 //!   a test from them. Every path that deletes `test_regions` rows either
 //!   carries their ranges here (`batch_delete_tests`) or clears this table
 //!   for the same fingerprint.
-//! - `fingerprints` —`(fingerprint, last_seen)`. Last-seen drives LRU
+//! - `fingerprints` — `(fingerprint, last_seen)`. Last-seen drives LRU
 //!   eviction up to `FINGERPRINT_KEEP`.
 //! - `fingerprint_components` — `(env_fingerprint, label, content_hash)`. The
 //!   per-input decomposition of `env_fingerprint`, so a cache miss can be
