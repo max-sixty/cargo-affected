@@ -13,9 +13,9 @@
 //! no test at all — silent *under*-selection, the one failure this tool can't
 //! detect downstream.
 //!
-//! `build_function_map` and `hit_ranges` each refuse their own half of that at
-//! runtime; this scenario is the end-to-end check that real ranges come out
-//! the far end.
+//! `write_function_maps` (on an empty `build_function_map` result) and
+//! `hit_ranges` each refuse their own half of that at runtime; this scenario
+//! is the end-to-end check that real ranges come out the far end.
 //!
 //! Definition of `CRATE_ROOT_SENTINEL_END` lives in `src/coverage.rs`. It's
 //! `pub(crate)` — and `cargo-affected` ships only a `[[bin]]` target with no
