@@ -21,6 +21,7 @@
 //! we're not yet sharing a `target/` across scenarios, keeping names unique
 //! avoids the foot-gun preemptively.
 
+mod aggregate_profile;
 mod cache_miss;
 mod clean;
 mod config_rule;
@@ -39,6 +40,7 @@ mod partition;
 mod remapped_paths;
 mod report_json;
 mod run;
+mod state_dir;
 mod structural;
 mod workspace;
 

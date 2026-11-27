@@ -49,7 +49,7 @@ cargo affected run    --report-json target/affected/report.json --report-detail 
 |---|---|---|
 | `schema_version` | integer | Bumped on any incompatible change. |
 | `cargo_affected_version` | string | Crate version that produced the report. |
-| `command` | string | `"run"` or `"status"`. |
+| `command` | string | `"run"`, `"status"`, or `"collect"` (pre-collection prediction). |
 | `cache` | object | See [Cache](#cache). |
 | `selection` | object | See [Selection](#selection). |
 

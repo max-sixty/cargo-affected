@@ -66,6 +66,50 @@ HEAD` resolves either way and stored ranges live in the sha's coordinate
 system. `cargo affected run` is therefore a strict superset of `cargo
 nextest run`: always at least as safe.
 
+## Collect, compare, and report from the same full test execution
+
+For shadow-mode adoption, `collect` can predict affected tests from the
+previous database **before** replacing it with a fresh full-suite baseline:
+
+```sh
+cargo affected collect --report-json target/selection.json --report-detail full -- --no-fail-fast
+```
+
+The selection is advisory: every admitted Nextest test still runs. The report
+uses the instrumented test listing already prepared for collection, and
+configuration rules use the same build directory and flags.
+
+Add `--aggregate-profile target/coverage.profdata` to export an indexed LLVM
+profile of the same full run. This uses each test's existing LLVM counters,
+compacts them into bounded batches, and publishes the profile only when the
+full run succeeds and the aggregate is complete. An existing output file is
+removed before collection starts so a failed run cannot leave a stale report.
+If the requested aggregate cannot be published, collection exits non-zero
+without discarding the per-test baseline. A failing test run retains its
+Nextest exit code. Use a dedicated output path for each concurrent collect.
+The profile can be used with
+`llvm-cov export` or `llvm-cov show`
+against the instrumented executables in `target/affected/build`; no second
+test execution is necessary. `--build-info-json PATH` additionally exports
+Nextest’s actual target and build directories for external reporting tools.
+Neither full-suite output option is accepted with `--diff`, since an incremental run is not a fresh full-suite report.
+
+For multiple independently configured suites in a CI job, use a distinct
+global `--state-dir` for each build/filter scope. It selects the database,
+instrumented build, and temporary staging directory together, without
+modifying Cargo's usual target directory. Relative paths are resolved from
+the workspace root. Choose a directory ignored by Git or outside the
+checkout; otherwise generated files will make the next collect see a dirty
+working tree. Separate instrumented build directories also permit independent
+concurrent scopes without replacing each other's binaries. Use the same
+directory for `collect`, `run`, `status`, and `clean`. The default remains `target/affected`.
+
+```sh
+cargo affected collect --state-dir target/affected-unit -- --lib
+cargo affected collect --state-dir target/affected-integration -- --test integration
+cargo affected status --state-dir target/affected-unit -- --lib
+```
+
 ## How it works
 
 `collect`:

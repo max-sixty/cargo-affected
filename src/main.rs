@@ -3,6 +3,7 @@
 //! Uses LLVM coverage data to map each test to the source files it touches,
 //! then queries git for changed files to select which tests to rerun.
 
+mod aggregate;
 mod collect;
 mod config;
 mod coverage;
@@ -35,6 +36,11 @@ struct Cli {
     /// selected test name during `run`/`status`. Accepted at any position.
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// Directory for this test scope's coverage database, instrumented
+    /// build and staging files. Relative paths are workspace-root-relative.
+    /// Choose a Git-ignored directory or a path outside the checkout.
+    #[arg(long, global = true, value_name = "PATH")]
+    state_dir: Option<PathBuf>,
     #[command(subcommand)]
     action: Action,
 }
@@ -55,6 +61,22 @@ enum Action {
         /// and selection will silently mis-target. Use only for throwaway runs.
         #[arg(long)]
         allow_dirty: bool,
+        /// Also write an indexed LLVM profile for the full test run, suitable
+        /// for llvm-cov reports without executing the tests a second time.
+        /// Report failures fail collection without discarding the baseline.
+        #[arg(long, value_name = "PATH", conflicts_with = "diff")]
+        aggregate_profile: Option<PathBuf>,
+        /// Export the exact instrumented Nextest build metadata for external
+        /// coverage-report generators.
+        #[arg(long, value_name = "PATH", requires = "aggregate_profile")]
+        build_info_json: Option<PathBuf>,
+        /// Predict affected tests from the previous database before this
+        /// full collect updates it. The prediction does not filter the run.
+        #[arg(long, value_name = "PATH", conflicts_with = "diff")]
+        report_json: Option<PathBuf>,
+        /// Detail level for the pre-collection selection report.
+        #[arg(long, value_enum, default_value_t = selection::DiagnosticDetail::Summary)]
+        report_detail: selection::DiagnosticDetail,
         /// Extra args forwarded to `cargo nextest run`. Must be preceded by
         /// `--` (e.g. `cargo affected collect -- --features foo`); otherwise
         /// clap rejects unknown flags rather than risk swallowing one of
@@ -107,30 +129,31 @@ enum Action {
         #[arg(last = true)]
         nextest_args: Vec<String>,
     },
-    /// Clear stored coverage data from target/affected/coverage.db.
+    /// Clear stored coverage data in the selected state directory.
     Clean,
 }
 
-fn clean() -> Result<()> {
+fn clean(state_dir: Option<&std::path::Path>) -> Result<()> {
     let project = project::find_project_root()?;
+    let state = db::StateDir::new(&project.workspace_root, state_dir);
 
     // Reclaim any leftover profraw/results staging from crashed or cancelled
     // collects (a successful collect removes its own). Done first so it runs
     // even when there's no DB to clear.
-    let swept = collect::clean_staging_dirs(&project.workspace_root)?;
+    let swept = collect::clean_staging_dirs(&state)?;
     if swept > 0 {
         let s = collect::plural_s(swept);
         eprintln!("removed {swept} leftover staging dir{s}");
     }
 
-    let path = db::db_path(&project.workspace_root);
+    let path = state.database();
     if !path.exists() {
         eprintln!("no coverage database found");
         return Ok(());
     }
     // Clear via SQL rather than unlinking: the open + write lock waits out any
     // concurrent `collect`, so we can't silently orphan a mid-flight commit.
-    let mut db = db::Db::open(&project.workspace_root)?;
+    let mut db = db::Db::open(&state)?;
     db.clear()?;
     eprintln!("cleared {}", path.display());
     Ok(())
@@ -167,7 +190,7 @@ fn main() {
 
     let cli = Cli::parse_from(argv);
 
-    let exit_code = match run_action(cli.action, cli.verbose) {
+    let exit_code = match run_action(cli.action, cli.verbose, cli.state_dir.as_deref()) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
@@ -177,13 +200,29 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-fn run_action(action: Action, verbose: bool) -> Result<i32> {
+fn run_action(action: Action, verbose: bool, state_dir: Option<&std::path::Path>) -> Result<i32> {
     match action {
         Action::Collect {
             diff,
             allow_dirty,
+            aggregate_profile,
+            build_info_json,
+            report_json,
+            report_detail,
             nextest_args,
-        } => collect::collect(diff, verbose, allow_dirty, &nextest_args),
+        } => collect::collect(
+            collect::CollectOptions {
+                diff,
+                verbose,
+                allow_dirty,
+                state_dir,
+                aggregate_profile: aggregate_profile.as_deref(),
+                build_info_json: build_info_json.as_deref(),
+                report_json: report_json.as_deref(),
+                report_detail,
+            },
+            &nextest_args,
+        ),
         Action::Run {
             all,
             report_json,
@@ -192,6 +231,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         } => run::run(
             all,
             verbose,
+            state_dir,
             report_json.as_deref(),
             report_detail,
             &nextest_args,
@@ -203,6 +243,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
         } => {
             status::status(
                 verbose,
+                state_dir,
                 report_json.as_deref(),
                 report_detail,
                 &nextest_args,
@@ -210,7 +251,7 @@ fn run_action(action: Action, verbose: bool) -> Result<i32> {
             Ok(0)
         }
         Action::Clean => {
-            clean()?;
+            clean(state_dir)?;
             Ok(0)
         }
     }
@@ -274,6 +315,10 @@ mod tests {
         let Action::Collect {
             diff,
             allow_dirty,
+            aggregate_profile,
+            build_info_json,
+            report_json,
+            report_detail: _,
             nextest_args,
         } = cli.action
         else {
@@ -281,6 +326,9 @@ mod tests {
         };
         assert!(!diff);
         assert!(!allow_dirty);
+        assert!(aggregate_profile.is_none());
+        assert!(build_info_json.is_none());
+        assert!(report_json.is_none());
         assert_eq!(nextest_args, vec!["--features", "foo"]);
     }
 

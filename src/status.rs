@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::collect::{args_for_listing, plural_s, require_nextest};
-use crate::db::{db_path, warn_untracked_rs_files, Db};
+use crate::db::{warn_untracked_rs_files, Db, StateDir};
 use crate::fingerprint;
 use crate::plan::{self, Assessment, CacheMiss, CacheState, SelectionReport};
 use crate::project::{find_project_root, git_changed_files};
@@ -35,6 +35,7 @@ use crate::selection::{self, DiagnosticDetail};
 /// under-report against a `run -- --features …`.
 pub(crate) fn status(
     verbose: bool,
+    state_dir: Option<&Path>,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,
     nextest_args: &[String],
@@ -42,7 +43,8 @@ pub(crate) fn status(
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
 
-    let path = db_path(project_root);
+    let state_dir = StateDir::new(project_root, state_dir);
+    let path = state_dir.database();
     if !path.exists() {
         println!(
             "no coverage data found — would run all tests; \
@@ -69,7 +71,7 @@ pub(crate) fn status(
     }
 
     let fingerprint = fingerprint::compute(&project)?;
-    let db = Db::open(project_root)?;
+    let db = Db::open(&state_dir)?;
     let Assessment {
         test_count,
         collect_shas,
@@ -186,15 +188,15 @@ pub(crate) fn status(
 
     require_nextest(project_root)?;
     eprintln!("checking for new tests...");
-    let plan = plan::plan(
-        &project,
-        &db,
-        &fingerprint.hex,
-        &reach,
-        &changed_files,
-        &args_for_listing(nextest_args),
+    let plan = plan::plan(plan::PlanInputs {
+        project: &project,
+        db: &db,
+        fingerprint_hex: &fingerprint.hex,
+        reach: &reach,
+        changed_files: &changed_files,
+        build_args: &args_for_listing(nextest_args),
         detail,
-    )?;
+    })?;
     let sel = &plan.selection;
 
     if let Some(report_path) = report_json {
