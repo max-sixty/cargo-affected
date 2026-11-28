@@ -504,25 +504,11 @@ impl Db {
         fingerprint: &str,
         present: &BTreeSet<TestId>,
     ) -> Result<usize> {
-        // Read with a plain `&Connection` so the no-op case (everything in
+        // Read outside the transaction so the no-op case (everything in
         // the listing is already in the DB) doesn't open a write
         // transaction at all. WAL gives us a snapshot read that won't see
         // mid-flight changes from another collect.
-        let stored: BTreeSet<TestId> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT binary_id, test_name FROM test_regions \
-                 WHERE env_fingerprint = ?1",
-            )?;
-            let rows: BTreeSet<TestId> = stmt
-                .query_map([fingerprint], |row| {
-                    Ok(TestId::new(
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            rows
-        };
+        let stored = self.all_tests_for_fingerprint(fingerprint)?;
         let to_drop: Vec<TestId> = stored.difference(present).cloned().collect();
         if to_drop.is_empty() {
             return Ok(0);
@@ -804,6 +790,7 @@ impl Db {
     /// (in DB but only at currently-missing shas) from "genuinely new"
     /// tests (not in DB at all): if a listed test appears here but not
     /// in [`Db::all_tests_at_shas`] for the reachable subset, it's stranded.
+    /// Also the stored side of [`Db::prune_missing_tests`]'s set difference.
     pub(crate) fn all_tests_for_fingerprint(&self, fingerprint: &str) -> Result<BTreeSet<TestId>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT binary_id, test_name FROM test_regions \
